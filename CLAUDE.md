@@ -1,0 +1,28 @@
+# Linote — エージェント向け作業ガイド
+
+Windows 11 x64 向けの軽量テキストエディタ（Rust）。要件の正本は `docs/requirements.md`、計画と進捗は `docs/PLAN.md`、共通の取り決めは `docs/architecture.md`。
+
+## ビルドとテスト（Linux のクラウド環境から Windows 向けにクロスビルド）
+
+- 既定ターゲットは `.cargo/config.toml` で `x86_64-pc-windows-gnu`。テストは Wine（`wine64`）で実行される。
+- `cargo build` / `cargo build --release`
+- `cargo test`（Windows バイナリを Wine で実行）
+- `cargo fmt --check`
+- `cargo clippy --all-targets -- -D warnings`
+- `scripts/check-imports.sh target/x86_64-pc-windows-gnu/release/linote.exe` — EXE が Windows 標準以外の DLL を読み込まないことを確認する（単体 EXE 要件）。
+- GUI を起動する確認は仮想ディスプレイが必要: `xvfb-run -a wine64 target/x86_64-pc-windows-gnu/debug/linote.exe`
+- 画面に依存しない中核モジュールは Linux ネイティブでもテストできる: `cargo test --lib --target x86_64-unknown-linux-gnu`（Windows 専用コードは `#[cfg(windows)]` で分ける）。
+
+## 規約
+
+- 単体 EXE: 新しい依存を足すときは、EXE が DLL を必要としないことを `check-imports.sh` で確認する。`WebView2Loader.dll` は使わない（`docs/architecture.md` の WebView2 の節を参照）。
+- 起動を軽くする: WebView2、MCP、メモ一覧、Grep などは初めて使うときに初期化する。起動経路に重い処理を足さない。
+- 中核処理（文字コード、保存、メモ、復元、検索、巨大ファイル索引、コマンド定義）は `src/` 直下の GUI 非依存モジュールに置き、`windows` crate に依存させない。Win32 依存は `src/ui/` と `src/platform/` に閉じる。
+- 長時間の処理は UI スレッドで行わない。結果を反映する前に文書 ID と版を照合する。
+- データを失わない: 保存は一時ファイル経由の置換。黙って上書きしない。
+- `third_party/` は外部ソース。直接修正したら `third_party/VENDORED.md` の「ローカル修正」に記録する。
+- 文書・コメントは日本語でよい。識別子は英語。
+
+## 共有ファイル
+
+`Cargo.toml`、`build.rs`、`src/main.rs`、`src/lib.rs`、コマンド登録表は統括エージェントが管理する。ワーカーは担当パスだけを編集し、必要な変更は報告で依頼する。
