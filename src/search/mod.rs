@@ -18,3 +18,12 @@
 //! - 巨大モードの正規表現検索は行単位。長大な 1 行でもメモリ使用量に上限を設ける。
 //! - 文書に対する検索結果には [`crate::core::DocStamp`] を付け、UI は反映前に照合する。
 //! - 初めて使うまで初期化しない（正規表現の構築、スレッドの起動を起動経路に置かない）。
+
+mod grep;
+mod matcher;
+
+pub use grep::{
+    grep, grep_collect, GrepFile, GrepHit, GrepOptions, GrepSummary, DEFAULT_MAX_FILE_BYTES,
+    DEFAULT_MAX_HITS,
+};
+pub use matcher::{Direction, Hit, ReplaceSummary, SearchOptions, Searcher};
