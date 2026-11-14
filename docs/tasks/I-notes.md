@@ -45,3 +45,10 @@
 - 索引の進みと外部変更の反映のため、タイマーで `refresh()` を呼ぶ。検索は `find(Arc<SearchPattern>, Direction)`、`cancel_find`。
 - 巨大ファイルを開いたとき（`bigfile::large_mode_reason`）に BigView のタブを作る。
 - 実機確認: Direct2D 経路（Wine では GDI に代替）、全角の桁ずれ、数 GB での操作感、高 DPI、Ctrl+C。
+
+## H（プレビュー）
+- アプリは `Option<PreviewHost>` を持ち、プレビューを初めて開くときに `PreviewHost::new()`。右ペイン `PreviewPane::create(&host, main_hwnd, &palette)`、別ウィンドウ `PreviewWindow::create(&host, main_hwnd, title, &palette)`。
+- `set_bounds(RECT)`／`set_visible`、別ウィンドウは `show`／`hide`／`set_title`、`set_on_closed`。
+- 文書は `markdown::compose_document(...)` の結果を `Arc<str>` で `set_document`（`PreviewScheduler` で入力が落ち着いてから変換し、`accept` で照合）。テーマ変更で `set_palette` と再変換。`set_on_status` で状態。右ペインを閉じるときは `destroy()`。
+- 既知: 更新のたびにスクロール位置が先頭に戻る（`ExecuteScript` で scrollY を退避・復元する案）。WebView 内のキーはアプリに届かない（必要なら `AcceleratorKeyPressed`）。
+- 実機確認 9 項目（遅延初期化、`location`／`EBWebView` の値の形、環境作成の成功、表示とテーマ、外部リソースの遮断、リンク、右クリック・F12 の無効、ランタイムなし、2 画面・DPI）。
