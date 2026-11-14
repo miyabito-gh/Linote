@@ -193,6 +193,65 @@ impl App {
             .or_else(|| self.last_search.clone())
     }
 
+    /// 検索語にする文字列: 選択中の文字列（1 行で短いもの）、なければカーソル位置の単語。
+    /// 巨大モードでは選択だけ。
+    fn query_from_caret(&mut self) -> Option<String> {
+        if let Some(q) = self.find_prefill() {
+            if !q.is_empty() && !q.contains(['\n', '\r']) {
+                return Some(q);
+            }
+        }
+        let id = self.active_id()?;
+        if self.bigviews.contains_key(&id) {
+            return None;
+        }
+        self.with_text(id, |ed| {
+            let caret = ed.selection().caret;
+            ed.word_at(caret)
+        })
+        .ok()
+        .flatten()
+    }
+
+    /// F3／Shift+F3: 検索欄が閉じていても、直前の検索条件で次（前）へ。条件がなければ
+    /// 選択中の文字列（なければカーソル位置の単語）で始め、それもなければ検索欄を開く。
+    pub(super) fn find_again(&mut self, direction: Direction) -> Result<()> {
+        if let Some(o) = self.current_search_options() {
+            self.search_step(o, direction);
+        } else if self.query_from_caret().is_some() {
+            self.find_selection(direction)?;
+        } else {
+            self.show_find(false)?;
+        }
+        Ok(())
+    }
+
+    /// Ctrl+F3: 選択中の文字列（なければカーソル位置の単語）を検索語にして、次の一致へ。
+    pub(super) fn find_selection(&mut self, direction: Direction) -> Result<()> {
+        let Some(q) = self.query_from_caret() else {
+            self.find_message("検索する文字列が選択されていません", true);
+            return Ok(());
+        };
+        let mut options = self.current_search_options().unwrap_or_default();
+        options.regex = false;
+        options.query = q.clone();
+        if let Some(p) = self.find_panel {
+            // 検索欄の条件も更新する（検索欄が正規表現のときは、記号をそのまま探す）。
+            if let Some(panel_options) = p.options() {
+                options = SearchOptions {
+                    query: q.clone(),
+                    ..panel_options
+                };
+                if options.regex {
+                    options.query = regex::escape(&q);
+                }
+            }
+            p.set_query(&options.query);
+        }
+        self.search_step(options, direction);
+        Ok(())
+    }
+
     // ---------------------------------------------------------------- 検索欄の通知
 
     pub(super) fn on_find_event(&mut self, event: FindEvent) {
@@ -215,10 +274,16 @@ impl App {
             FindEvent::ReplaceAll {
                 options,
                 replacement,
+                in_selection,
             } => {
                 self.last_search = Some(options.clone());
-                self.replace_all(options, replacement);
+                if in_selection {
+                    self.replace_in_selection(options, replacement);
+                } else {
+                    self.replace_all(options, replacement);
+                }
             }
+            FindEvent::Changed(options) => self.on_query_changed(options),
             FindEvent::OpenHit { path, line, column } => self.open_hit(path, line, column),
             FindEvent::Closed => self.focus_active(),
         }
@@ -229,6 +294,7 @@ impl App {
     /// 次（前）の一致を探して選択する。端で反対側へ回り込む。
     pub fn search_step(&mut self, options: SearchOptions, direction: Direction) {
         let Some(id) = self.active_id() else { return };
+        self.last_search = Some(options.clone());
         if self.bigviews.contains_key(&id) {
             self.big_search(id, &options, direction);
             return;
@@ -339,6 +405,13 @@ impl App {
         });
         let Ok(line) = line else { return };
         self.refresh_status();
+        // 全一致の強調（検索欄が閉じていても付ける）と「n / 全 m 件」。
+        if let Some(options) = self.last_search.clone() {
+            self.ensure_highlight(&options);
+        }
+        if self.report_highlight(hit.wrapped) {
+            return;
+        }
         let text = if hit.wrapped {
             format!("{line} 行目（端で折り返しました）")
         } else {
@@ -481,6 +554,66 @@ impl App {
         }
     }
 
+    /// 選択範囲の中だけをすべて置換する。Undo は 1 回で元に戻る。選択範囲の本文だけを
+    /// 検索の対象にするので、`^`・`\b` などは選択範囲の端を文書の端として扱う。
+    pub fn replace_in_selection(&mut self, options: SearchOptions, replacement: String) {
+        let Some(id) = self.active_id() else { return };
+        if !self.can_replace(id) {
+            return;
+        }
+        let searcher = match options.compile() {
+            Ok(s) => s,
+            Err(e) => {
+                self.find_message(&describe(&e), true);
+                return;
+            }
+        };
+        let Ok(sel) = self.with_text(id, |ed| ed.selection().range()) else {
+            return;
+        };
+        if sel.is_empty() {
+            self.find_message(
+                "選択範囲がありません（置換する範囲を選んでから実行してください）",
+                true,
+            );
+            return;
+        }
+        let Ok(bytes) = self.with_text(id, |ed| ed.text_range(sel.start, sel.end)) else {
+            return;
+        };
+        let Ok(text) = String::from_utf8(bytes) else {
+            self.find_message("選択範囲を文字として読めませんでした", true);
+            return;
+        };
+        self.sync();
+        let Some(stamp) = self.state(id).map(|s| s.stamp()) else {
+            return;
+        };
+        let run = move |text: String| {
+            let ctx = TaskContext::detached().with_limits(Limits::items(MAX_REPLACEMENTS));
+            let mut rec = Recorder {
+                src: MemoryText::new(text),
+                edits: Vec::new(),
+            };
+            searcher
+                .replace_all(&mut rec, &replacement, &ctx)
+                .map(|outcome| (outcome, rec.edits))
+        };
+        if sel.len() as usize >= self.worker_search_bytes {
+            let sender = self.sender();
+            self.find_message("置換中...", false);
+            WorkerPool::global().spawn(move || {
+                let result = run(text);
+                sender.send(UiMessage::Run(Box::new(move |app| {
+                    app.finish_replace_all(stamp, Some(sel), result)
+                })));
+            });
+        } else {
+            let result = run(text);
+            self.finish_replace_all(stamp, Some(sel), result);
+        }
+    }
+
     fn replace_all_on_worker(&mut self, id: DocumentId, searcher: Searcher, replacement: String) {
         let (stamp, text) = match self.text_snapshot(id) {
             Ok(r) => r,
@@ -501,12 +634,17 @@ impl App {
                 .replace_all(&mut rec, &replacement, &ctx)
                 .map(|outcome| (outcome, rec.edits));
             sender.send(UiMessage::Run(Box::new(move |app| {
-                app.finish_replace_all(stamp, result)
+                app.finish_replace_all(stamp, None, result)
             })));
         });
     }
 
-    fn finish_replace_all(&mut self, stamp: DocStamp, result: Result<RecordedReplace>) {
+    fn finish_replace_all(
+        &mut self,
+        stamp: DocStamp,
+        scope: Option<TextRange>,
+        result: Result<RecordedReplace>,
+    ) {
         let (outcome, edits) = match result {
             Ok(r) => r,
             Err(e) => {
@@ -526,16 +664,33 @@ impl App {
             return;
         }
         let id = stamp.document;
+        let base = scope.map_or(0, |r| r.start);
         let applied = self.with_text(id, |ed| -> Result<()> {
             ed.begin_undo_action();
             let mut result = Ok(());
             for (range, text) in &edits {
-                result = EditTarget::replace(ed, *range, text);
+                let range = TextRange::new(range.start + base, range.end + base);
+                result = EditTarget::replace(ed, range, text);
                 if result.is_err() {
                     break;
                 }
             }
             ed.end_undo_action();
+            // 選択範囲内の置換は、置換後の範囲を選んだままにする。
+            if let (Some(scope), Ok(())) = (scope, &result) {
+                let delta: i64 = edits
+                    .iter()
+                    .map(|(r, t)| t.len() as i64 - r.len() as i64)
+                    .sum();
+                let end = (scope.end as i64 + delta).max(scope.start as i64) as u64;
+                EditTarget::set_selection(
+                    ed,
+                    Selection {
+                        anchor: scope.start,
+                        caret: end,
+                    },
+                );
+            }
             result
         });
         match applied {

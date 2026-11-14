@@ -7,6 +7,26 @@ use std::ffi::{c_char, c_int, c_void};
 
 // --- メッセージ ---
 pub const SCI_GETLENGTH: u32 = 2006;
+pub const SCI_INDICSETSTYLE: u32 = 2080;
+pub const SCI_INDICSETFORE: u32 = 2082;
+pub const SCI_INDICSETUNDER: u32 = 2510;
+pub const SCI_SETINDICATORCURRENT: u32 = 2500;
+pub const SCI_INDICATORFILLRANGE: u32 = 2504;
+pub const SCI_INDICATORCLEARRANGE: u32 = 2505;
+pub const SCI_INDICSETALPHA: u32 = 2523;
+pub const SCI_INDICSETOUTLINEALPHA: u32 = 2558;
+pub const INDIC_STRAIGHTBOX: usize = 8;
+pub const INDIC_FULLBOX: usize = 16;
+pub const SCI_DELETERANGE: u32 = 2645;
+pub const SCI_REPLACESEL: u32 = 2170;
+pub const SCI_LINEDUPLICATE: u32 = 2404;
+pub const SCI_SELECTIONDUPLICATE: u32 = 2469;
+pub const SCI_MOVESELECTEDLINESUP: u32 = 2620;
+pub const SCI_MOVESELECTEDLINESDOWN: u32 = 2621;
+pub const SCI_UPPERCASE: u32 = 2341;
+pub const SCI_LOWERCASE: u32 = 2340;
+pub const SCI_WORDSTARTPOSITION: u32 = 2266;
+pub const SCI_WORDENDPOSITION: u32 = 2267;
 pub const SCI_SELECTALL: u32 = 2013;
 pub const SCI_CANPASTE: u32 = 2173;
 pub const SCI_CUT: u32 = 2177;

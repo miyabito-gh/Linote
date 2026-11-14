@@ -272,6 +272,13 @@ pub const SEARCH_FIND_PREV: CommandDef = CommandDef::new(
 )
 .default_key("Shift+F3");
 
+pub const SEARCH_FIND_SELECTION: CommandDef = CommandDef::new(
+    CommandId::new("search.find_selection"),
+    "選択文字列を次へ検索",
+    "選択中の文字列（なければカーソル位置の単語）を検索語にして、次の一致へ移る。検索欄の条件も更新する。",
+)
+.default_key("Ctrl+F3");
+
 pub const SEARCH_GREP: CommandDef = CommandDef::new(
     CommandId::new("search.grep"),
     "フォルダー内を検索（Grep）...",
@@ -513,23 +520,22 @@ pub fn register(registry: &mut Registry<App>) -> Result<()> {
         Ok(Value::Null)
     })?;
     registry.register(SEARCH_FIND_NEXT, |app, _| {
-        match app.current_search_options() {
-            Some(options) => app.search_step(options, Direction::Forward),
-            None => app.show_find(false)?,
-        }
+        app.find_again(Direction::Forward)?;
         Ok(Value::Null)
     })?;
     registry.register(SEARCH_FIND_PREV, |app, _| {
-        match app.current_search_options() {
-            Some(options) => app.search_step(options, Direction::Backward),
-            None => app.show_find(false)?,
-        }
+        app.find_again(Direction::Backward)?;
+        Ok(Value::Null)
+    })?;
+    registry.register(SEARCH_FIND_SELECTION, |app, _| {
+        app.find_selection(Direction::Forward)?;
         Ok(Value::Null)
     })?;
     registry.register(SEARCH_GREP, |app, _| {
         app.show_find(true)?;
         Ok(Value::Null)
     })?;
+    super::editcmds::register(registry)?;
     registry.register(VIEW_PREVIEW_PANE, |app, _| {
         app.toggle_preview_pane()?;
         Ok(serde_json::json!({ "open": app.preview_pane_open() }))
@@ -716,7 +722,17 @@ impl App {
         if msg.hwnd != self.hwnd && !is_our_editor(msg.hwnd) {
             return false;
         }
-        let Some(chord) = chord_from_input(msg.wParam.0 as u32, current_modifiers()) else {
+        let modifiers = current_modifiers();
+        // Esc: 検索の強調を消す（強調がなければ何もしない）。
+        if msg.message == WM_KEYDOWN
+            && msg.wParam.0 == 0x1B
+            && modifiers == crate::command::Modifiers::default()
+            && self.highlight_doc().is_some()
+        {
+            self.clear_highlight_and_count();
+            return true;
+        }
+        let Some(chord) = chord_from_input(msg.wParam.0 as u32, modifiers) else {
             return false;
         };
         // 英語配列の「+」は Shift を伴う（Ctrl+Shift+=）。拡大の Ctrl+Plus の割り当てを

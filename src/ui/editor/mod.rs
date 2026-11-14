@@ -19,6 +19,8 @@
 
 pub mod language;
 pub mod sci;
+mod textcmds;
+pub mod transform;
 mod viewopts;
 
 use std::cell::RefCell;
@@ -235,6 +237,7 @@ impl Editor {
     }
 
     fn configure(&self) {
+        self.configure_match_indicators();
         // DirectWrite: DPI に沿った描画と、日本語の字形の代替書体。Wine の DirectWrite では
         // 何も描かれないので、Wine では GDI にする（試験環境のため）。
         let technology = if crate::platform::system::is_wine() {

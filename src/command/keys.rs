@@ -35,7 +35,7 @@ pub enum Key {
 
 impl Key {
     /// 名前付きのキーの一覧（正規の表記）。
-    pub const NAMED: [&'static str; 22] = [
+    pub const NAMED: [&'static str; 23] = [
         "Enter",
         "Escape",
         "Tab",
@@ -58,9 +58,13 @@ impl Key {
         "Slash",
         "Semicolon",
         "Backquote",
+        "BracketRight",
     ];
 
     fn parse(s: &str) -> Option<Key> {
+        if s == "]" {
+            return Some(Key::Named("BracketRight"));
+        }
         let mut chars = s.chars();
         if let (Some(c), None) = (chars.next(), chars.next()) {
             return (c.is_ascii_alphanumeric()).then(|| Key::Char(c.to_ascii_uppercase()));
@@ -155,6 +159,8 @@ mod tests {
             ("F3", "F3"),
             ("Ctrl+0", "Ctrl+0"),
             ("Ctrl+Plus", "Ctrl+Plus"),
+            ("ctrl+]", "Ctrl+BracketRight"),
+            ("Ctrl+BracketRight", "Ctrl+BracketRight"),
             ("escape", "Escape"),
         ] {
             let chord = KeyChord::parse(input).unwrap();

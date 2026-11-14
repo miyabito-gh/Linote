@@ -27,8 +27,10 @@
 mod bigdoc;
 mod closing;
 mod commands;
+mod editcmds;
 mod fileio;
 mod fileops;
+mod highlight;
 mod memos;
 mod preview;
 mod recover;
@@ -310,6 +312,8 @@ pub struct App {
     find_panel: Option<FindPanel>,
     /// 最後に使った検索条件（F3 用）。
     last_search: Option<SearchOptions>,
+    /// 検索の一致の強調表示（U3）。
+    highlight: highlight::Highlight,
     /// 実行中の検索（ワーカー）の中止。
     search_cancel: Option<CancelToken>,
     /// これ以上の大きさの文書は、検索・置換をワーカーで行う。
@@ -617,6 +621,7 @@ impl App {
             memo_panel: None,
             find_panel: None,
             last_search: None,
+            highlight: highlight::Highlight::default(),
             search_cancel: None,
             worker_search_bytes: search::WORKER_SEARCH_BYTES,
             pending_jumps: HashMap::new(),
@@ -741,6 +746,7 @@ impl App {
         let mut margin = false;
         let mut brace = false;
         let mut zoom = false;
+        let mut clear_highlight = false;
         let mut changed_docs: Vec<DocumentId> = Vec::new();
         for (doc, event) in events {
             let Some(i) = self
@@ -767,6 +773,7 @@ impl App {
                     tabs_changed |= before != (state.is_dirty(), state.has_ai_edits());
                     status_changed |= is_active;
                     margin |= is_active && lines_added != 0;
+                    clear_highlight |= self.highlight_doc() == Some(id);
                     if !changed_docs.contains(&id) {
                         changed_docs.push(id);
                     }
@@ -796,6 +803,9 @@ impl App {
         }
         if margin {
             self.editor.update_line_number_margin();
+        }
+        if clear_highlight {
+            self.clear_highlight_and_count();
         }
         if brace {
             self.editor.update_brace_highlight();
@@ -1032,6 +1042,9 @@ impl App {
             return Ok(());
         }
         self.sync();
+        if self.highlight_doc().is_some_and(|d| d != id) {
+            self.clear_highlight();
+        }
         if let Some(cur) = self.active {
             match self.docs[cur].view {
                 DocView::Scintilla(_) => self.docs[cur].view_state = self.editor.view_state(),

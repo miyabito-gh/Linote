@@ -280,6 +280,28 @@ static MENUS: &[MenuDef] = &[
             Item::Cmd(CommandId::new("edit.copy")),
             Item::Cmd(CommandId::new("edit.paste")),
             Item::Cmd(CommandId::new("edit.select_all")),
+            Item::Separator,
+            Item::Sub(
+                "行の操作(&L)",
+                &[
+                    Item::Cmd(CommandId::new("edit.duplicate_line")),
+                    Item::Cmd(CommandId::new("edit.delete_line")),
+                    Item::Cmd(CommandId::new("edit.move_line_up")),
+                    Item::Cmd(CommandId::new("edit.move_line_down")),
+                ],
+            ),
+            Item::Sub(
+                "変換(&T)",
+                &[
+                    Item::Cmd(CommandId::new("edit.uppercase")),
+                    Item::Cmd(CommandId::new("edit.lowercase")),
+                    Item::Separator,
+                    Item::Cmd(CommandId::new("edit.trim_trailing_whitespace")),
+                    Item::Cmd(CommandId::new("edit.tabs_to_spaces")),
+                    Item::Cmd(CommandId::new("edit.spaces_to_tabs")),
+                ],
+            ),
+            Item::Cmd(CommandId::new("edit.insert_datetime")),
         ],
     },
     MenuDef {
@@ -289,9 +311,11 @@ static MENUS: &[MenuDef] = &[
             Item::Cmd(CommandId::new("search.replace")),
             Item::Cmd(CommandId::new("search.find_next")),
             Item::Cmd(CommandId::new("search.find_prev")),
+            Item::Cmd(CommandId::new("search.find_selection")),
             Item::Cmd(CommandId::new("search.grep")),
             Item::Separator,
             Item::Cmd(CommandId::new("edit.goto_line")),
+            Item::Cmd(CommandId::new("edit.goto_matching_brace")),
         ],
     },
     MenuDef {

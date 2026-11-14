@@ -80,6 +80,7 @@ pub fn virtual_key(key: Key) -> Option<u32> {
             "Slash" => 0xBF,
             "Semicolon" => 0xBA,
             "Backquote" => 0xC0,
+            "BracketRight" => 0xDD,
             _ => return None,
         },
     })

@@ -324,6 +324,30 @@ impl Searcher {
             .collect()
     }
 
+    /// すべての一致の範囲（長さ 0 を除く）。`max` 件に達したら打ち切り、`true`
+    /// （打ち切った）を返す。中止されたら [`Completion::Cancelled`]。強調表示用。
+    pub fn find_all(
+        &self,
+        src: &dyn TextSource,
+        ctx: &TaskContext,
+        max: usize,
+    ) -> Result<Outcome<(Vec<TextRange>, bool)>> {
+        let mut out = Vec::new();
+        let mut truncated = false;
+        let completion = self.scan_forward(src, 0, ctx, |r, _| {
+            if r.start == r.end {
+                return true;
+            }
+            if out.len() >= max {
+                truncated = true;
+                return false;
+            }
+            out.push(TextRange::new(r.start, r.end));
+            true
+        })?;
+        Ok(Outcome::new((out, truncated), completion))
+    }
+
     /// 一致の数。`ctx.limits.max_items` に達したら [`Completion::ItemLimit`]。
     pub fn count(&self, src: &dyn TextSource, ctx: &TaskContext) -> Result<Outcome<u64>> {
         let cap = ctx.limits.max_items.unwrap_or(u64::MAX);
@@ -445,6 +469,19 @@ mod tests {
         s.find(&MemoryText::new(text), from, dir, wrap, &ctx())
             .unwrap()
             .value
+    }
+
+    #[test]
+    fn find_all_collects_and_truncates() {
+        let s = SearchOptions::literal("ab").compile().unwrap();
+        let src = MemoryText::new("ab cd ab ef AB");
+        let out = s.find_all(&src, &ctx(), 10).unwrap().value;
+        let spans: Vec<(u64, u64)> = out.0.iter().map(|r| (r.start, r.end)).collect();
+        assert_eq!(spans, vec![(0, 2), (6, 8), (12, 14)]);
+        assert!(!out.1);
+        let out = s.find_all(&src, &ctx(), 2).unwrap().value;
+        assert_eq!(out.0.len(), 2);
+        assert!(out.1);
     }
 
     #[test]

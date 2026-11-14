@@ -20,6 +20,13 @@ use windows::Win32::UI::HiDpi::{
 /// 96 DPI（拡大率 100%）。
 pub const BASE_DPI: u32 = 96;
 
+/// 現在のローカル時刻（年、月、日、時、分）。
+pub fn local_time() -> (u16, u16, u16, u16, u16) {
+    // SAFETY: 引数なしで現在時刻を読むだけ。
+    let t = unsafe { windows::Win32::System::SystemInformation::GetLocalTime() };
+    (t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute)
+}
+
 /// 文字列を NUL 終端の UTF-16 にする（Win32 の `PCWSTR` 引数用）。
 pub fn to_wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()

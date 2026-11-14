@@ -82,6 +82,7 @@ const ID_GREP: usize = 211;
 const ID_STOP: usize = 212;
 const ID_STATUS: usize = 213;
 const ID_LIST: usize = 214;
+const ID_INSEL: usize = 215;
 
 const EN_CHANGE: u32 = 0x0300;
 const BST_CHECKED: usize = 1;
@@ -103,7 +104,12 @@ pub enum FindEvent {
     ReplaceAll {
         options: SearchOptions,
         replacement: String,
+        /// 「選択範囲内のみ置換」: 選択範囲の中だけを置換する。
+        in_selection: bool,
     },
+    /// 検索欄の条件が変わった（入力・オプションの切り替え）。強調表示の更新に使う。
+    /// 空や無効なパターンでも届く。
+    Changed(SearchOptions),
     /// Grep の結果を開く。`line`・`column` は 1 始まり。
     OpenHit {
         path: PathBuf,
@@ -159,6 +165,7 @@ struct State {
     case: HWND,
     word: HWND,
     regex: HWND,
+    in_selection: HWND,
     buttons: [HWND; 6],
     status: HWND,
     list: HWND,
@@ -326,7 +333,7 @@ impl FindPanel {
             s.replace_enabled = enabled;
             // SAFETY: 自分の子ウィンドウ。
             unsafe {
-                for h in [s.replace, s.buttons[2], s.buttons[3]] {
+                for h in [s.replace, s.in_selection, s.buttons[2], s.buttons[3]] {
                     let _ = EnableWindow(h, enabled);
                 }
             }
@@ -334,6 +341,11 @@ impl FindPanel {
                 s.show_status(note, false);
             }
         });
+    }
+
+    /// 検索欄の文字列を差し替える（条件が変わった通知が届く）。
+    pub fn set_query(&self, text: &str) {
+        with_state(self.hwnd, |s| set_text(s.query, text));
     }
 
     /// Grep の起点のフォルダーの初期値（空のときだけ入れる）。
@@ -478,6 +490,7 @@ impl State {
             self.case,
             self.word,
             self.regex,
+            self.in_selection,
             self.status,
             self.list,
         ];
@@ -534,6 +547,8 @@ impl State {
         for (i, c) in [self.case, self.word, self.regex].into_iter().enumerate() {
             mv(c, m + cw * i as i32, y, cw, row);
         }
+        y += row + gap;
+        mv(self.in_selection, m, y, inner, row);
         y += row + gap;
         let bw = (inner - 5 * gap) / 6;
         for (i, b) in self.buttons.into_iter().enumerate() {
@@ -604,10 +619,12 @@ impl State {
         }
         let options = self.options();
         let replacement = text_of(self.replace);
+        let in_selection = is_checked(self.in_selection);
         self.emit(if all {
             FindEvent::ReplaceAll {
                 options,
                 replacement,
+                in_selection,
             }
         } else {
             FindEvent::Replace {
@@ -782,6 +799,7 @@ extern "system" fn panel_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPAR
                 check(w!("単語単位"), ID_WORD),
                 check(w!("正規表現"), ID_REGEX),
             );
+            let in_selection = check(w!("選択範囲内のみ置換（すべて置換）"), ID_INSEL);
             let buttons = [
                 button(w!("次へ"), ID_NEXT),
                 button(w!("前へ"), ID_PREV),
@@ -808,6 +826,7 @@ extern "system" fn panel_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPAR
                 case,
                 word,
                 regex,
+                in_selection,
                 buttons,
                 status,
                 list,
@@ -899,6 +918,7 @@ extern "system" fn panel_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPAR
             with_state(hwnd, |s| match (id, code) {
                 (ID_QUERY, EN_CHANGE) | (ID_CASE | ID_WORD | ID_REGEX, BN_CLICKED) => {
                     s.validate();
+                    s.emit(FindEvent::Changed(s.options()));
                 }
                 (ID_NEXT, BN_CLICKED) => s.find(true),
                 (ID_PREV, BN_CLICKED) => s.find(false),

@@ -95,6 +95,7 @@ pub(super) fn run(ctx: &Ctx) -> Check {
     super::integration_i2::run(ctx)?;
     super::integration_u1::run(ctx)?;
     super::integration_u2::run(ctx)?;
+    super::integration_u3::run(ctx)?;
     Ok(())
 }
 

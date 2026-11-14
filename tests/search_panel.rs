@@ -99,7 +99,14 @@ fn panel_greps_opens_hits_and_disables_replace() {
                 FindEvent::Next(o) => format!("next {}", o.query),
                 FindEvent::Prev(o) => format!("prev {}", o.query),
                 FindEvent::Replace { replacement, .. } => format!("replace {replacement}"),
-                FindEvent::ReplaceAll { .. } => "replace_all".into(),
+                FindEvent::ReplaceAll { in_selection, .. } => {
+                    if in_selection {
+                        "replace_all_in_selection".into()
+                    } else {
+                        "replace_all".into()
+                    }
+                }
+                FindEvent::Changed(o) => format!("changed {}", o.query),
                 FindEvent::OpenHit { path, line, column } => format!(
                     "open {} {line}:{column}",
                     path.file_name().unwrap().to_string_lossy()
@@ -148,6 +155,28 @@ fn panel_greps_opens_hits_and_disables_replace() {
     panel.set_replace_enabled(true, None);
     command(hwnd, 210, 0);
     assert_eq!(events.borrow().last().unwrap(), "replace_all");
+
+    // 「選択範囲内のみ置換」を入れると、すべて置換にその印が付く。
+    // SAFETY: 小窓の子のチェックボックスを探して印を付ける。
+    unsafe {
+        let check = FindWindowExW(
+            Some(hwnd),
+            None,
+            w!("BUTTON"),
+            w!("選択範囲内のみ置換（すべて置換）"),
+        )
+        .expect("選択範囲内の置換の項目");
+        SendMessageW(check, 0x00F1, Some(WPARAM(1)), None); // BM_SETCHECK
+    }
+    command(hwnd, 210, 0);
+    assert_eq!(events.borrow().last().unwrap(), "replace_all_in_selection");
+
+    // 検索欄の入力が変わると、条件の変更が届く（強調表示の更新用）。
+    panel.set_query("changed-query");
+    assert!(
+        pump(|| events.borrow().iter().any(|e| e == "changed changed-query")),
+        "条件の変更の通知"
+    );
 
     panel.hide();
     assert!(!panel.is_visible());
