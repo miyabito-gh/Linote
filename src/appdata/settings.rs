@@ -52,9 +52,11 @@ use crate::core::{Error, Result};
 use crate::printing::{Margins, MARGIN_MAX};
 
 mod items;
+pub mod keybind;
 
 pub use items::{
-    apply_edits, edited_items, pages, Choice, Item, ItemKind, ItemValue, Page, ParseNumberError,
+    apply_edits, edited_items, pages, Choice, Item, ItemKind, ItemValue, Page, PageKind,
+    ParseNumberError,
 };
 
 /// 現在の設定の形式の版。

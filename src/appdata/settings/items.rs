@@ -110,11 +110,22 @@ impl Item {
     }
 }
 
+/// ページの種類。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PageKind {
+    /// 項目の表（[`Page::items`]）から部品を作る。
+    Items,
+    /// キー割り当て（V4-2）。コマンドの一覧と割り当ての操作を持つ専用のページ。
+    /// 編集は設定の `keys` を直接変える（[`super::keybind`]）ので、項目の表は空。
+    Keys,
+}
+
 /// 設定画面のページ 1 つ。
 pub struct Page {
     pub id: &'static str,
     /// 左の一覧の表示名。
     pub title: &'static str,
+    pub kind: PageKind,
     pub items: &'static [Item],
 }
 
@@ -307,12 +318,20 @@ static PAGES: &[Page] = &[
     Page {
         id: "general",
         title: "一般",
+        kind: PageKind::Items,
         items: GENERAL_ITEMS,
     },
     Page {
         id: "view",
         title: "表示",
+        kind: PageKind::Items,
         items: VIEW_ITEMS,
+    },
+    Page {
+        id: "keys",
+        title: "キー",
+        kind: PageKind::Keys,
+        items: &[],
     },
 ];
 
@@ -343,6 +362,27 @@ pub fn apply_edits(
         item.set(target, &item.get(edited));
         changed.push(item.id);
     }
+    // キー割り当ては、コマンドごとに比べる（別のウィンドウが変えた別のコマンドを失わない）。
+    let mut keys_changed = false;
+    let ids: std::collections::BTreeSet<&String> =
+        initial.keys.keys().chain(edited.keys.keys()).collect();
+    for id in ids {
+        if initial.keys.get(id) == edited.keys.get(id) {
+            continue;
+        }
+        keys_changed = true;
+        match edited.keys.get(id) {
+            Some(v) => {
+                target.keys.insert(id.clone(), v.clone());
+            }
+            None => {
+                target.keys.remove(id);
+            }
+        }
+    }
+    if keys_changed {
+        changed.push("keys");
+    }
     target.view = target.view.clone().clamped();
     changed
 }
@@ -364,7 +404,7 @@ mod tests {
         let mut seen = std::collections::HashSet::new();
         let s = Settings::default();
         for page in PAGES {
-            assert!(!page.items.is_empty());
+            assert!(page.kind == PageKind::Keys || !page.items.is_empty());
             for it in page.items {
                 assert!(seen.insert(it.id), "重複: {}", it.id);
                 // 読んだ値をそのまま書いても変わらない。
@@ -480,6 +520,29 @@ mod tests {
         let mut same = latest.clone();
         assert!(apply_edits(&initial, &initial.clone(), &mut same).is_empty());
         assert_eq!(same, latest);
+    }
+
+    #[test]
+    fn key_edits_are_applied_per_command() {
+        let mut initial = Settings::default();
+        initial.keys.insert("edit.undo".into(), "F2".into());
+        initial.keys.insert("file.open".into(), String::new());
+        // 画面で file.save を変え、edit.undo を既定に戻した（file.open は触らない）。
+        let mut edited = initial.clone();
+        edited.keys.insert("file.save".into(), "Ctrl+Alt+S".into());
+        edited.keys.remove("edit.undo");
+        // そのあいだに別のウィンドウが file.open と view.zoom_in を変えた。
+        let mut latest = initial.clone();
+        latest.keys.insert("file.open".into(), "F4".into());
+        latest
+            .keys
+            .insert("view.zoom_in".into(), "Ctrl+Plus".into());
+        let changed = apply_edits(&initial, &edited, &mut latest);
+        assert_eq!(changed, vec!["keys"]);
+        assert_eq!(latest.keys["file.save"], "Ctrl+Alt+S");
+        assert!(!latest.keys.contains_key("edit.undo"));
+        assert_eq!(latest.keys["file.open"], "F4");
+        assert_eq!(latest.keys["view.zoom_in"], "Ctrl+Plus");
     }
 
     #[test]

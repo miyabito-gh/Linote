@@ -1,4 +1,4 @@
-//! 設定画面（V4-1）。モーダルのダイアログで、左にページの一覧、右にそのページの項目を出す。
+//! 設定画面（V4-1、V4-2 でキーのページを追加）。モーダルのダイアログで、左にページの一覧、右にそのページの項目を出す。
 //!
 //! - **ページと項目は表から作る**: [`crate::appdata::settings::pages`] の表を読み、項目の種類
 //!   （チェック、選択肢、数値、書体）ごとに部品を作る。ページや項目を足すときは、この
@@ -10,20 +10,31 @@
 //! - 試験用に、操作役（`driver`）を渡せる。ダイアログが開いた直後に呼ばれ、部品の操作と
 //!   ボタンの押下を行う（[`set_check`]、[`press`] など）。
 
-use windows::core::PCWSTR;
-use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+use windows::core::{PCWSTR, PWSTR};
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::UI::Controls::{
+    InitCommonControlsEx, ICC_LISTVIEW_CLASSES, INITCOMMONCONTROLSEX, LIST_VIEW_ITEM_STATE_FLAGS,
+    LVCFMT_LEFT, LVCF_FMT, LVCF_SUBITEM, LVCF_TEXT, LVCF_WIDTH, LVCOLUMNW, LVIF_TEXT, LVIS_FOCUSED,
+    LVIS_SELECTED, LVITEMW, LVM_DELETEALLITEMS, LVM_ENSUREVISIBLE, LVM_GETITEMCOUNT,
+    LVM_GETITEMTEXTW, LVM_GETNEXTITEM, LVM_INSERTCOLUMNW, LVM_INSERTITEMW,
+    LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETITEMSTATE, LVM_SETITEMTEXTW, LVNI_SELECTED,
+    LVS_EX_FULLROWSELECT, LVS_REPORT, LVS_SHOWSELALWAYS, LVS_SINGLESEL, NMHDR, WC_LISTVIEWW,
+};
 use windows::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, SetFocus};
+use windows::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DialogBoxIndirectParamW, EndDialog, GetClientRect, GetDlgItem,
-    GetWindowLongPtrW, GetWindowRect, GetWindowTextLengthW, GetWindowTextW, MessageBoxW,
-    PostMessageW, SendMessageW, SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow,
-    GWLP_USERDATA, HMENU, IDCANCEL, IDOK, MB_ICONWARNING, MB_OK, SWP_NOZORDER, SW_HIDE, SW_SHOW,
-    WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_COMMAND, WM_INITDIALOG, WM_SETFONT,
+    GetNextDlgTabItem, GetWindowLongPtrW, GetWindowRect, GetWindowTextLengthW, GetWindowTextW,
+    MessageBoxW, PostMessageW, SendMessageW, SetWindowLongPtrW, SetWindowPos, SetWindowTextW,
+    ShowWindow, GWLP_USERDATA, HMENU, IDCANCEL, IDOK, MB_ICONWARNING, MB_OK, SWP_NOZORDER, SW_HIDE,
+    SW_SHOW, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_COMMAND, WM_INITDIALOG, WM_SETFONT,
 };
 
-use crate::appdata::settings::{pages, Item, ItemKind, ItemValue};
+use crate::appdata::settings::keybind::{self, KeyRow};
+use crate::appdata::settings::{pages, Item, ItemKind, ItemValue, PageKind};
 use crate::appdata::Settings;
+use crate::command::{CommandDef, KeyChord};
 use crate::platform::system::{dpi_for_window, scale, to_wide};
 use crate::ui::dialogs::{blank_dialog_template, SettingsSession};
 use crate::ui::window::UiFont;
@@ -39,6 +50,19 @@ const SUB_MAIN: i32 = 0;
 const SUB_LABEL: i32 = 1;
 const SUB_FONT_CHOOSE: i32 = 2;
 const SUB_FONT_DEFAULT: i32 = 3;
+// 「キー」ページの部品の ID。
+pub const ID_KEY_FILTER: i32 = 3101;
+const ID_KEY_LIST: i32 = 3102;
+pub const ID_KEY_CAPTURE: i32 = 3103;
+pub const ID_KEY_ASSIGN: i32 = 3104;
+pub const ID_KEY_CLEAR: i32 = 3105;
+pub const ID_KEY_RESET: i32 = 3106;
+pub const ID_KEY_RESET_ALL: i32 = 3107;
+const ID_KEY_HINT: i32 = 3108;
+const ID_KEY_FILTER_LABEL: i32 = 3109;
+const ID_KEY_CAPTURE_LABEL: i32 = 3110;
+/// 「キー」ページがある場合の、本文の高さ。
+const KEYS_BODY_H: i32 = 330;
 /// 操作役を呼ぶための自前のメッセージ。
 const WM_RUN_DRIVER: u32 = WM_APP + 7;
 
@@ -64,6 +88,13 @@ const LB_GETCURSEL: u32 = 0x188;
 const DM_SETDEFID: u32 = 0x401;
 const LBN_SELCHANGE: u32 = 1;
 const BN_CLICKED: u32 = 0;
+const EN_CHANGE: u32 = 0x300;
+const ES_READONLY: u32 = 0x800;
+const WM_NOTIFY: u32 = 0x4E;
+const NM_DBLCLK: u32 = 0xFFFF_FFFD;
+const WM_GETDLGCODE: u32 = 0x87;
+const DLGC_WANTARROWS: isize = 0x1;
+const DLGC_WANTALLKEYS: isize = 0x4;
 
 /// 項目の通し番号（ページの順に数える）から部品の ID を作る。
 fn control_id(index: usize, sub: i32) -> i32 {
@@ -91,6 +122,9 @@ struct State<'a> {
     /// ページごとの部品（ページを切り替えるときに出し入れする）。
     page_controls: Vec<Vec<HWND>>,
     font: UiFont,
+    /// 「キー」ページ: コマンドの定義、いま一覧に出している行（絞り込み後）。
+    defs: Vec<CommandDef>,
+    key_visible: Vec<KeyRow>,
     driver: Option<&'a mut (dyn FnMut(HWND) + 'a)>,
 }
 
@@ -108,8 +142,18 @@ pub fn run<'a>(
         items: all_items(),
         page_controls: Vec::new(),
         font: UiFont::for_dpi(dpi_for_window(owner)),
+        defs: Vec::new(),
+        key_visible: Vec::new(),
         driver,
     };
+    state.defs = state.session.command_defs();
+    // SAFETY: 共通コントロール（ListView）の登録。
+    unsafe {
+        let _ = InitCommonControlsEx(&INITCOMMONCONTROLSEX {
+            dwSize: std::mem::size_of::<INITCOMMONCONTROLSEX>() as u32,
+            dwICC: ICC_LISTVIEW_CLASSES,
+        });
+    }
     let template = blank_dialog_template(10, 10);
     // SAFETY: 自分のモジュールのハンドル。
     let Ok(instance) = (unsafe { GetModuleHandleW(PCWSTR::null()) }) else {
@@ -223,7 +267,10 @@ fn build(dlg: HWND, state: &mut State<'_>, owner: HWND) {
     let row_h = 28;
     let max_rows = pages().iter().map(|p| p.items.len()).max().unwrap_or(0) as i32;
     let body_top = margin + if banner_h > 0 { banner_h + 8 } else { 0 };
-    let body_h = (max_rows * row_h + 8).max(160);
+    let has_keys = pages().iter().any(|p| p.kind == PageKind::Keys);
+    let body_h = (max_rows * row_h + 8)
+        .max(160)
+        .max(if has_keys { KEYS_BODY_H } else { 0 });
     let client_w = margin + list_w + 14 + page_w + margin;
     let client_h = body_top + body_h + 14 + 28 + margin;
 
@@ -400,6 +447,15 @@ fn build(dlg: HWND, state: &mut State<'_>, owner: HWND) {
         state.page_controls[page].extend(made);
     }
 
+    // 専用のページ（キー）。
+    for (page, p) in pages().iter().enumerate() {
+        if p.kind == PageKind::Keys {
+            let area = (page_x, body_top + 4, page_w, body_h);
+            let made = build_keys_page(dlg, state, area, dpi);
+            state.page_controls[page].extend(made);
+        }
+    }
+
     // 下のボタン。
     let by = client_h - margin - 28;
     let bw = 92;
@@ -435,7 +491,7 @@ fn build(dlg: HWND, state: &mut State<'_>, owner: HWND) {
 }
 
 /// 作業用の設定の値を部品に出す。
-fn refresh_controls(dlg: HWND, state: &State<'_>) {
+fn refresh_controls(dlg: HWND, state: &mut State<'_>) {
     for (index, (_, item)) in state.items.iter().enumerate() {
         // SAFETY: 自分のダイアログの部品（なければエラーで飛ばす）。
         let Ok(ctl) = (unsafe { GetDlgItem(Some(dlg), control_id(index, SUB_MAIN)) }) else {
@@ -456,6 +512,7 @@ fn refresh_controls(dlg: HWND, state: &State<'_>) {
             _ => {}
         }
     }
+    refresh_key_list(dlg, state);
 }
 
 /// 指定のページの部品だけを出す。
@@ -552,6 +609,391 @@ fn choose_font(dlg: HWND, state: &mut State<'_>) {
     }
 }
 
+// ------------------------------------------------------------------ 「キー」ページ（V4-2）
+
+/// 一覧の列（見出し、幅）。
+const KEY_COLUMNS: [(&str, i32); 4] = [
+    ("分類", 62),
+    ("コマンド", 160),
+    ("キー", 112),
+    ("既定との違い", 128),
+];
+
+/// 「キー」ページの部品を作り、ページに属する部品の一覧を返す。`area` は (x, y, 幅, 高さ)。
+fn build_keys_page(
+    dlg: HWND,
+    state: &State<'_>,
+    (x0, y0, w, body_h): (i32, i32, i32, i32),
+    dpi: u32,
+) -> Vec<HWND> {
+    let px = |n: i32| scale(n, dpi);
+    let font = &state.font;
+    let mut made = Vec::new();
+    made.push(child(
+        dlg,
+        windows::core::w!("STATIC"),
+        "絞り込み",
+        0,
+        0,
+        (px(x0), px(y0 + 3), px(60), px(20)),
+        ID_KEY_FILTER_LABEL,
+        font,
+    ));
+    made.push(child(
+        dlg,
+        windows::core::w!("EDIT"),
+        "",
+        ES_AUTOHSCROLL | WS_BORDER | WS_TABSTOP,
+        0,
+        (px(x0 + 64), px(y0), px(w - 64), px(22)),
+        ID_KEY_FILTER,
+        font,
+    ));
+    let list_h = body_h - 132;
+    let list = child(
+        dlg,
+        WC_LISTVIEWW,
+        "",
+        LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS | WS_TABSTOP | WS_BORDER,
+        0,
+        (px(x0), px(y0 + 28), px(w), px(list_h)),
+        ID_KEY_LIST,
+        font,
+    );
+    send(
+        list,
+        LVM_SETEXTENDEDLISTVIEWSTYLE,
+        LVS_EX_FULLROWSELECT as usize,
+        LVS_EX_FULLROWSELECT as isize,
+    );
+    for (i, (title, width)) in KEY_COLUMNS.iter().enumerate() {
+        let mut wide = to_wide(title);
+        let col = LVCOLUMNW {
+            mask: LVCF_FMT | LVCF_TEXT | LVCF_WIDTH | LVCF_SUBITEM,
+            fmt: LVCFMT_LEFT,
+            cx: px(*width),
+            pszText: PWSTR(wide.as_mut_ptr()),
+            iSubItem: i as i32,
+            ..Default::default()
+        };
+        send(
+            list,
+            LVM_INSERTCOLUMNW,
+            i,
+            &col as *const LVCOLUMNW as isize,
+        );
+    }
+    made.push(list);
+
+    let y1 = y0 + 28 + list_h + 8;
+    made.push(child(
+        dlg,
+        windows::core::w!("STATIC"),
+        "新しいキー",
+        0,
+        0,
+        (px(x0), px(y1 + 3), px(72), px(20)),
+        ID_KEY_CAPTURE_LABEL,
+        font,
+    ));
+    let capture = child(
+        dlg,
+        windows::core::w!("EDIT"),
+        "",
+        ES_READONLY | WS_BORDER | WS_TABSTOP,
+        0,
+        (px(x0 + 76), px(y1), px(166), px(22)),
+        ID_KEY_CAPTURE,
+        font,
+    );
+    // SAFETY: 自分のダイアログの部品。解除は WM_NCDESTROY で行う。
+    unsafe {
+        let _ = SetWindowSubclass(capture, Some(capture_proc), 1, 0);
+    }
+    made.push(capture);
+    let buttons: [(&str, i32, i32, i32, i32); 4] = [
+        ("割り当て", ID_KEY_ASSIGN, x0 + 248, y1 - 1, 84),
+        ("割り当てを外す", ID_KEY_CLEAR, x0 + 338, y1 - 1, 120),
+        ("既定に戻す", ID_KEY_RESET, x0, y1 + 30, 110),
+        ("すべて既定に戻す", ID_KEY_RESET_ALL, x0 + 118, y1 + 30, 140),
+    ];
+    for (label, id, bx, by, bw) in buttons {
+        made.push(child(
+            dlg,
+            windows::core::w!("BUTTON"),
+            label,
+            BS_PUSHBUTTON | WS_TABSTOP,
+            0,
+            (px(bx), px(by), px(bw), px(24)),
+            id,
+            font,
+        ));
+    }
+    made.push(child(
+        dlg,
+        windows::core::w!("STATIC"),
+        "一覧でコマンドを選び、「新しいキー」の欄で割り当てたいキー（Ctrl／Alt／Shift との組み合わせ、F キーなど）を押して、「割り当て」を押します。他のコマンドが使っているキーは、付け替えるかどうかを確認します。",
+        0,
+        0,
+        (px(x0), px(y1 + 60), px(w), px(32)),
+        ID_KEY_HINT,
+        font,
+    ));
+    made
+}
+
+/// キー入力欄のウィンドウ処理（サブクラス）。押したキーの組み合わせを、表記の文字にして入れる。
+unsafe extern "system" fn capture_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    _id: usize,
+    _data: usize,
+) -> LRESULT {
+    use crate::ui::menu::{chord_from_input, current_modifiers};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetParent, WM_CHAR, WM_KEYDOWN, WM_KEYUP, WM_NCDESTROY, WM_SYSCHAR, WM_SYSKEYDOWN,
+        WM_SYSKEYUP,
+    };
+    match msg {
+        WM_GETDLGCODE => LRESULT(DLGC_WANTALLKEYS | DLGC_WANTARROWS),
+        WM_KEYDOWN | WM_SYSKEYDOWN => {
+            let vk = wparam.0 as u32;
+            let mods = current_modifiers();
+            if vk == 0x09 && !mods.ctrl && !mods.alt {
+                // Tab・Shift+Tab は、次・前の部品へ移る（入力欄に閉じ込めない）。
+                // SAFETY: 自分のダイアログの部品。
+                unsafe {
+                    if let Ok(dlg) = GetParent(hwnd) {
+                        let next = GetNextDlgTabItem(dlg, Some(hwnd), mods.shift);
+                        if let Ok(next) = next {
+                            let _ = SetFocus(Some(next));
+                        }
+                    }
+                }
+                return LRESULT(0);
+            }
+            if let Some(chord) = chord_from_input(vk, mods) {
+                set_text(hwnd, &chord.to_string());
+            }
+            LRESULT(0)
+        }
+        WM_KEYUP | WM_SYSKEYUP | WM_CHAR | WM_SYSCHAR => LRESULT(0),
+        WM_NCDESTROY => {
+            // SAFETY: 自分のサブクラスの解除。
+            unsafe {
+                let _ = RemoveWindowSubclass(hwnd, Some(capture_proc), 1);
+                DefSubclassProc(hwnd, msg, wparam, lparam)
+            }
+        }
+        // SAFETY: 既定の処理に渡す。
+        _ => unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) },
+    }
+}
+
+fn dlg_item(dlg: HWND, id: i32) -> Option<HWND> {
+    // SAFETY: 自分のダイアログの部品（なければ `None`）。
+    unsafe { GetDlgItem(Some(dlg), id) }.ok()
+}
+
+/// 一覧で選んでいる行の位置（なければ `None`）。
+fn selected_key_index(list: HWND) -> Option<usize> {
+    usize::try_from(send(
+        list,
+        LVM_GETNEXTITEM,
+        usize::MAX,
+        LVNI_SELECTED as isize,
+    ))
+    .ok()
+}
+
+fn lv_set_text(list: HWND, index: usize, sub: usize, text: &str) {
+    let mut wide = to_wide(text);
+    let item = LVITEMW {
+        mask: LVIF_TEXT,
+        iItem: index as i32,
+        iSubItem: sub as i32,
+        pszText: PWSTR(wide.as_mut_ptr()),
+        ..Default::default()
+    };
+    let message = if sub == 0 {
+        LVM_INSERTITEMW
+    } else {
+        LVM_SETITEMTEXTW
+    };
+    send(
+        list,
+        message,
+        if sub == 0 { 0 } else { index },
+        &item as *const LVITEMW as isize,
+    );
+}
+
+/// 一覧の 1 行の文字。
+fn key_row_texts(row: &KeyRow) -> [String; 4] {
+    let diff = if row.custom {
+        format!(
+            "変更済（既定: {}）",
+            row.default
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "なし".to_owned())
+        )
+    } else {
+        String::new()
+    };
+    let mut title = row.title.to_owned();
+    if row.global {
+        title.push_str("（グローバル）");
+    }
+    [row.category.to_owned(), title, row.chord_text(), diff]
+}
+
+/// 作業用の設定と絞り込みから、一覧を作り直す（選んでいたコマンドは、残っていれば選び直す）。
+fn refresh_key_list(dlg: HWND, state: &mut State<'_>) {
+    let (Some(list), Some(filter)) = (dlg_item(dlg, ID_KEY_LIST), dlg_item(dlg, ID_KEY_FILTER))
+    else {
+        return;
+    };
+    let selected = selected_key_index(list).and_then(|i| state.key_visible.get(i).map(|r| r.id));
+    let filter = get_text(filter);
+    state.key_visible = keybind::key_rows(&state.defs, &state.working)
+        .into_iter()
+        .filter(|r| keybind::row_matches(r, &filter))
+        .collect();
+    send(list, LVM_DELETEALLITEMS, 0, 0);
+    for (i, row) in state.key_visible.iter().enumerate() {
+        for (sub, text) in key_row_texts(row).iter().enumerate() {
+            lv_set_text(list, i, sub, text);
+        }
+    }
+    if let Some(i) = selected.and_then(|id| state.key_visible.iter().position(|r| r.id == id)) {
+        select_key_index(list, i);
+    }
+}
+
+fn select_key_index(list: HWND, index: usize) {
+    let item = LVITEMW {
+        state: LIST_VIEW_ITEM_STATE_FLAGS(LVIS_SELECTED.0 | LVIS_FOCUSED.0),
+        stateMask: LIST_VIEW_ITEM_STATE_FLAGS(LVIS_SELECTED.0 | LVIS_FOCUSED.0),
+        ..Default::default()
+    };
+    send(
+        list,
+        LVM_SETITEMSTATE,
+        index,
+        &item as *const LVITEMW as isize,
+    );
+    send(list, LVM_ENSUREVISIBLE, index, 0);
+}
+
+/// 一覧で選んでいるコマンド（なければ知らせて `None`）。
+fn selected_key_row(dlg: HWND, state: &mut State<'_>) -> Option<KeyRow> {
+    let row = dlg_item(dlg, ID_KEY_LIST)
+        .and_then(selected_key_index)
+        .and_then(|i| state.key_visible.get(i).cloned());
+    if row.is_none() {
+        state
+            .session
+            .notice(dlg, "先に、一覧でコマンドを選んでください。");
+    }
+    row
+}
+
+fn clear_capture(dlg: HWND) {
+    if let Some(c) = dlg_item(dlg, ID_KEY_CAPTURE) {
+        set_text(c, "");
+    }
+}
+
+/// 「割り当て」: 入力欄のキーを選んだコマンドに割り当てる。重複は確認して付け替える。
+fn key_assign(dlg: HWND, state: &mut State<'_>) {
+    let Some(row) = selected_key_row(dlg, state) else {
+        return;
+    };
+    let text = dlg_item(dlg, ID_KEY_CAPTURE)
+        .map(get_text)
+        .unwrap_or_default();
+    let Ok(chord) = KeyChord::parse(&text) else {
+        state.session.notice(
+            dlg,
+            "「新しいキー」の欄を選んで、割り当てたいキーを押してから「割り当て」を押してください。",
+        );
+        return;
+    };
+    let mut next = state.working.clone();
+    let mut result = keybind::assign_chord(&mut next, &state.defs, row.id, chord, false);
+    if let Err(keybind::AssignError::Conflict(_, other_title)) = &result {
+        let question = format!(
+            "{chord} は「{other_title}」が使っています。\n「{}」に付け替えますか？\n（「{other_title}」は割り当てなしになります）",
+            row.title
+        );
+        if !state.session.confirm(dlg, "キーの付け替え", &question) {
+            return;
+        }
+        next = state.working.clone();
+        result = keybind::assign_chord(&mut next, &state.defs, row.id, chord, true);
+    }
+    match result {
+        Ok(()) => {
+            state.working = next;
+            clear_capture(dlg);
+            refresh_key_list(dlg, state);
+        }
+        Err(keybind::AssignError::Rejected(why)) => state.session.notice(dlg, &why),
+        Err(_) => state
+            .session
+            .notice(dlg, "このコマンドには割り当てられません。"),
+    }
+}
+
+/// 「割り当てを外す」「既定に戻す」「すべて既定に戻す」。
+fn key_button(dlg: HWND, state: &mut State<'_>, id: i32) {
+    match id {
+        ID_KEY_ASSIGN => key_assign(dlg, state),
+        ID_KEY_CLEAR | ID_KEY_RESET => {
+            let Some(row) = selected_key_row(dlg, state) else {
+                return;
+            };
+            if id == ID_KEY_CLEAR {
+                keybind::clear_chord(&mut state.working, &state.defs, row.id);
+            } else {
+                keybind::reset_chord(&mut state.working, row.id);
+            }
+            // 既定に戻した先が、別のコマンドが使っているキーなら知らせる（重複は先の定義が優先）。
+            if id == ID_KEY_RESET {
+                let now = keybind::key_rows(&state.defs, &state.working)
+                    .into_iter()
+                    .find(|r| r.id == row.id)
+                    .and_then(|r| r.chord);
+                if let Some(chord) = now {
+                    if let Some(other) =
+                        keybind::find_conflict(&state.defs, &state.working, row.id, &chord)
+                    {
+                        let text = format!(
+                            "既定の {chord} は「{}」が使っています。どちらかの割り当てを変えてください。",
+                            other.title
+                        );
+                        state.session.notice(dlg, &text);
+                    }
+                }
+            }
+            refresh_key_list(dlg, state);
+        }
+        ID_KEY_RESET_ALL
+            if state.session.confirm(
+                dlg,
+                "すべて既定に戻す",
+                "すべてのコマンドのキー割り当てを既定に戻します。よろしいですか？",
+            ) =>
+        {
+            keybind::reset_all(&mut state.working, &state.defs);
+            refresh_key_list(dlg, state);
+        }
+        _ => {}
+    }
+}
+
 unsafe extern "system" fn dialog_proc(
     dlg: HWND,
     msg: u32,
@@ -590,11 +1032,37 @@ unsafe extern "system" fn dialog_proc(
             }
             1
         }
+        WM_NOTIFY => {
+            // 一覧の行のダブルクリックで、キー入力欄へ移る。
+            // SAFETY: WM_NOTIFY の lparam は NMHDR を指す。
+            let hdr = unsafe { (lparam.0 as *const NMHDR).as_ref() };
+            if let Some(h) = hdr {
+                if h.idFrom == ID_KEY_LIST as usize && h.code == NM_DBLCLK {
+                    if let Some(c) = dlg_item(dlg, ID_KEY_CAPTURE) {
+                        // SAFETY: 自分のダイアログの部品。
+                        unsafe {
+                            let _ = SetFocus(Some(c));
+                        }
+                    }
+                }
+            }
+            0
+        }
         WM_COMMAND => {
             let id = (wparam.0 & 0xFFFF) as i32;
             let notify = ((wparam.0 >> 16) & 0xFFFF) as u32;
             let Some(state) = state_of(dlg) else { return 0 };
-            if id == IDOK.0 && notify == BN_CLICKED {
+            if id == ID_KEY_FILTER && notify == EN_CHANGE {
+                refresh_key_list(dlg, state);
+                1
+            } else if matches!(
+                id,
+                ID_KEY_ASSIGN | ID_KEY_CLEAR | ID_KEY_RESET | ID_KEY_RESET_ALL
+            ) && notify == BN_CLICKED
+            {
+                key_button(dlg, state, id);
+                1
+            } else if id == IDOK.0 && notify == BN_CLICKED {
                 if apply(dlg, state) {
                     // SAFETY: 自分のダイアログを閉じる。
                     unsafe {
@@ -762,4 +1230,71 @@ pub fn press(dlg: HWND, id: i32) {
         id as usize | ((BN_CLICKED as usize) << 16),
         0,
     );
+}
+
+/// 「キー」ページの一覧の文字（行ごとに 4 列: 分類、コマンド、キー、既定との違い）。
+pub fn key_list_texts(dlg: HWND) -> Vec<[String; 4]> {
+    let Some(list) = dlg_item(dlg, ID_KEY_LIST) else {
+        return Vec::new();
+    };
+    let count = send(list, LVM_GETITEMCOUNT, 0, 0).max(0) as usize;
+    (0..count)
+        .map(|i| {
+            let mut cells: [String; 4] = Default::default();
+            for (sub, cell) in cells.iter_mut().enumerate() {
+                let mut buf = [0u16; 256];
+                let item = LVITEMW {
+                    iSubItem: sub as i32,
+                    pszText: PWSTR(buf.as_mut_ptr()),
+                    cchTextMax: buf.len() as i32,
+                    ..Default::default()
+                };
+                let n = send(list, LVM_GETITEMTEXTW, i, &item as *const LVITEMW as isize).max(0)
+                    as usize;
+                *cell = String::from_utf16_lossy(&buf[..n.min(buf.len())]);
+            }
+            cells
+        })
+        .collect()
+}
+
+/// 一覧で、コマンド（`file.save` など）の行を選ぶ。一覧にない（絞り込みで隠れている）なら `false`。
+pub fn key_select(dlg: HWND, command: &str) -> bool {
+    let (Some(list), Some(state)) = (dlg_item(dlg, ID_KEY_LIST), state_of(dlg)) else {
+        return false;
+    };
+    let Some(i) = state.key_visible.iter().position(|r| r.id == command) else {
+        return false;
+    };
+    select_key_index(list, i);
+    true
+}
+
+/// 絞り込みの欄に文字を入れる（一覧が作り直される）。
+pub fn key_filter(dlg: HWND, text: &str) {
+    if let Some(c) = dlg_item(dlg, ID_KEY_FILTER) {
+        set_text(c, text);
+    }
+}
+
+/// キー入力欄に、押したことにするキーの表記を入れる。
+pub fn key_capture(dlg: HWND, chord: &str) {
+    if let Some(c) = dlg_item(dlg, ID_KEY_CAPTURE) {
+        set_text(c, chord);
+    }
+}
+
+/// キー入力欄の文字。
+pub fn key_capture_text(dlg: HWND) -> String {
+    dlg_item(dlg, ID_KEY_CAPTURE)
+        .map(get_text)
+        .unwrap_or_default()
+}
+
+/// キー入力欄に仮想キーの押下を送る（修飾キーは実際の状態に従う）。
+pub fn key_capture_press(dlg: HWND, vk: u32) {
+    use windows::Win32::UI::WindowsAndMessaging::WM_KEYDOWN;
+    if let Some(c) = dlg_item(dlg, ID_KEY_CAPTURE) {
+        send(c, WM_KEYDOWN, vk as usize, 0);
+    }
 }

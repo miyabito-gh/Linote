@@ -9,6 +9,7 @@
 //!
 //! 担当: タスク I1（統括）。
 
+use crate::command::CommandDef;
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -72,6 +73,12 @@ pub trait SettingsSession {
     /// 編集した設定 `edited` を反映して保存する。`baseline` は編集の前の設定で、これと違う
     /// 項目だけを、最新の設定に差し替える。反映後の（いま実行中の）設定を返す。
     fn apply(&mut self, baseline: &Settings, edited: &Settings) -> Settings;
+    /// 登録されているコマンドの定義（「キー」ページの一覧）。
+    fn command_defs(&self) -> Vec<CommandDef>;
+    /// はい／いいえの確認（キーの付け替え、すべて既定に戻す）。
+    fn confirm(&mut self, owner: HWND, caption: &str, text: &str) -> bool;
+    /// OK だけの知らせ（割り当てられないキー、ショートカットの登録の失敗など）。
+    fn notice(&mut self, owner: HWND, text: &str);
 }
 
 /// 利用者に尋ねる・知らせる操作の一式。

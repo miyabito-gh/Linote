@@ -1,7 +1,8 @@
 //! 改善 V4-1 の自己診断: 設定の再読み込み（テーマ・表示・キーとメニューの表示・グローバル
 //! ショートカット・そのほかの項目）、壊れた設定ファイルの扱いと復旧、自分の書き込みでは再読み込み
 //! しないこと、外部の変更の自動検出、Linote のタブで保存したときの再読み込み、設定ファイルを開く、
-//! 設定画面（台本つきの操作と、実際のダイアログの操作）での保存と反映。
+//! 設定画面（台本つきの操作と、実際のダイアログの操作）での保存と反映。V4-2 は「キー」ページ
+//! （一覧、絞り込み、割り当て、付け替え、外す、既定に戻す、保存とアクセラレーター・メニュー表示への反映）。
 //! 実際のウィンドウの見た目・前面に戻ったときの自動検出・高 DPI は Windows 実機で確認する
 //! （`docs/verification/V.md`）。
 
@@ -39,6 +40,7 @@ pub(super) fn run(ctx: &Ctx) -> Check {
     open_and_save_settings_file(&file)?;
     scripted_dialog(ctx, &file)?;
     real_dialog(&file)?;
+    keys_page(ctx, &file)?;
     // 後始末: 既定の設定に戻す。
     write(&file, "{}")?;
     cmd("app.reload_settings", Value::Null)?;
@@ -650,4 +652,215 @@ fn real_dialog(file: &Path) -> Check {
         check!(app.settings == before, "キャンセルで設定が変わった");
         Ok(())
     })?
+}
+
+/// 「キー」ページ（実際のダイアログ）: 一覧と絞り込み、割り当て、重複の確認（付け替える・やめる）、
+/// 外す、既定に戻す、OK での保存とアクセラレーター・メニューの表示への反映。
+fn keys_page(ctx: &Ctx, file: &Path) -> Check {
+    use windows::Win32::UI::WindowsAndMessaging::IDOK;
+    settle()?;
+    write(file, "{}")?;
+    cmd("app.reload_settings", Value::Null)?;
+    // 確認の答え: 1 つめ「やめる」、2 つめ「付け替える」、3 つめ「すべて既定に戻す」は はい。
+    ctx.prompts.confirm.borrow_mut().extend([false, true, true]);
+    ctx.prompts.shown.borrow_mut().clear();
+    let problems: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+    let p = problems.clone();
+    let mut driver = move |dlg: windows::Win32::Foundation::HWND| {
+        let bad = |what: &str, ok: bool| {
+            if !ok {
+                p.borrow_mut().push(what.to_owned());
+            }
+        };
+        let key_of = |dlg, command: &str| -> Option<[String; 4]> {
+            let rows = dialog::key_list_texts(dlg);
+            // 一覧の「キー」列は、コマンド名ではなく表示名で探す。
+            let title = match command {
+                "file.save" => "上書き保存",
+                "file.open" => "開く...",
+                "file.new" => "新規",
+                _ => return None,
+            };
+            rows.into_iter().find(|r| r[1] == title)
+        };
+        bad("キーのページを選べる", dialog::select_page(dlg, "keys"));
+        let rows = dialog::key_list_texts(dlg);
+        bad("一覧にコマンドが並ぶ", rows.len() > 50);
+        bad(
+            "分類が出る",
+            rows.iter().any(|r| r[0] == "ファイル") && rows.iter().any(|r| r[0] == "編集"),
+        );
+        bad(
+            "グローバルショートカットも一覧にある",
+            rows.iter()
+                .any(|r| r[1].contains("（グローバル）") && r[2] == "Ctrl+Alt+V"),
+        );
+        bad("最初は変更済がない", rows.iter().all(|r| r[3].is_empty()));
+        // 絞り込み。
+        let all = rows.len();
+        dialog::key_filter(dlg, "ctrl+s");
+        let some = dialog::key_list_texts(dlg);
+        bad(
+            "キーで絞り込める",
+            !some.is_empty() && some.len() < all && some.iter().any(|r| r[2] == "Ctrl+S"),
+        );
+        dialog::key_filter(dlg, "存在しない語");
+        bad("該当なしは空", dialog::key_list_texts(dlg).is_empty());
+        dialog::key_filter(dlg, "");
+        bad(
+            "絞り込みを消すと全部",
+            dialog::key_list_texts(dlg).len() == all,
+        );
+
+        // 1. 割り当て: 上書き保存を Ctrl+Alt+K に。
+        bad(
+            "上書き保存の既定のキー",
+            key_of(dlg, "file.save").is_some_and(|r| r[2] == "Ctrl+S"),
+        );
+        bad("上書き保存を選べる", dialog::key_select(dlg, "file.save"));
+        dialog::key_capture(dlg, "ctrl+alt+k");
+        dialog::press(dlg, dialog::ID_KEY_ASSIGN);
+        bad(
+            "割り当てが一覧に出る",
+            key_of(dlg, "file.save").is_some_and(|r| {
+                r[2] == "Ctrl+Alt+K" && r[3].contains("変更済") && r[3].contains("Ctrl+S")
+            }),
+        );
+        bad("入力欄が空になる", dialog::key_capture_text(dlg).is_empty());
+        // 2. 重複して「やめる」: 開く を Ctrl+Alt+K に → 確認は いいえ → 変わらない。
+        bad("開くを選べる", dialog::key_select(dlg, "file.open"));
+        dialog::key_capture(dlg, "Ctrl+Alt+K");
+        dialog::press(dlg, dialog::ID_KEY_ASSIGN);
+        bad(
+            "やめたら変わらない",
+            key_of(dlg, "file.open").is_some_and(|r| r[2] == "Ctrl+O")
+                && key_of(dlg, "file.save").is_some_and(|r| r[2] == "Ctrl+Alt+K"),
+        );
+        // 3. 重複して「付け替える」: 確認は はい → 相手は割り当てなし。
+        dialog::press(dlg, dialog::ID_KEY_ASSIGN);
+        bad(
+            "付け替えた",
+            key_of(dlg, "file.open").is_some_and(|r| r[2] == "Ctrl+Alt+K")
+                && key_of(dlg, "file.save")
+                    .is_some_and(|r| r[2].is_empty() && r[3].contains("変更済")),
+        );
+        // 4. 割り当てられないキー（文字入力を奪う）は知らせて変えない。
+        bad("新規を選べる", dialog::key_select(dlg, "file.new"));
+        dialog::key_capture(dlg, "A");
+        dialog::press(dlg, dialog::ID_KEY_ASSIGN);
+        bad(
+            "文字のキーは断る",
+            key_of(dlg, "file.new").is_some_and(|r| r[2] == "Ctrl+N"),
+        );
+        // 5. 外す。
+        dialog::press(dlg, dialog::ID_KEY_CLEAR);
+        bad(
+            "外せる",
+            key_of(dlg, "file.new").is_some_and(|r| r[2].is_empty()),
+        );
+        // 6. 既定に戻す。
+        dialog::press(dlg, dialog::ID_KEY_RESET);
+        bad(
+            "既定に戻せる",
+            key_of(dlg, "file.new").is_some_and(|r| r[2] == "Ctrl+N" && r[3].is_empty()),
+        );
+        // 7. キー入力欄に押下を送ると表記になる（修飾キーなしの F5）。
+        dialog::key_capture_press(dlg, 0x74);
+        bad("F5 を受け取る", dialog::key_capture_text(dlg) == "F5");
+        dialog::key_capture(dlg, "");
+        // OK で保存と反映。
+        dialog::press(dlg, IDOK.0);
+    };
+    step(|app| app.run_real_settings_dialog_for_test(&mut driver))?;
+    check!(
+        problems.borrow().is_empty(),
+        "キーのページの確認に失敗: {:?}",
+        problems.borrow()
+    );
+    let shown = ctx.prompts.shown.borrow().join("\n");
+    check!(
+        shown.contains("付け替え") || shown.contains("使っています"),
+        "付け替えの確認の文面 {shown}"
+    );
+    check!(
+        shown.contains("文字の入力に使う"),
+        "割り当てられないキーの知らせ {shown}"
+    );
+    step(|app| -> Check {
+        let key = |t: &str| app.keymap().command_for(&KeyChord::parse(t).unwrap());
+        check!(
+            key("Ctrl+Alt+K") == Some(CommandId::new("file.open")),
+            "新しい割り当てがアクセラレーターに"
+        );
+        check!(key("Ctrl+S").is_none(), "外れた既定のキーが残っている");
+        check!(key("Ctrl+O").is_none(), "付け替えた元の既定が残っている");
+        let label = |command: &'static str| -> Result<String, String> {
+            let id = app
+                .menu()
+                .unwrap()
+                .entries()
+                .iter()
+                .find(|e| e.command == CommandId::new(command))
+                .map(|e| e.id)
+                .ok_or(format!("{command} の項目がない"))?;
+            Ok(app.menu().unwrap().label_of(id).unwrap_or_default())
+        };
+        let open = label("file.open")?;
+        check!(open.contains("Ctrl+Alt+K"), "開くのメニュー表示 {open}");
+        let save = label("file.save")?;
+        check!(!save.contains("Ctrl+"), "上書き保存のメニュー表示 {save}");
+        check!(
+            app.settings.keys.len() == 2
+                && app.settings.keys.get("file.open").map(String::as_str) == Some("Ctrl+Alt+K")
+                && app.settings.keys.get("file.save").map(String::as_str) == Some(""),
+            "既定と違うものだけが keys に残る {:?}",
+            app.settings.keys
+        );
+        Ok(())
+    })??;
+    settle()?;
+    let text = std::fs::read_to_string(file).map_err(|e| e.to_string())?;
+    check!(
+        text.contains("Ctrl+Alt+K") && !text.contains("file.new"),
+        "保存された keys {text}"
+    );
+
+    // 開き直すと、保存した割り当てが一覧に出る。「すべて既定に戻す」（はい）で全部戻り、
+    // キャンセルするので設定は変わらない。続けて OK で戻す。
+    let problems2: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+    let p2 = problems2.clone();
+    let mut driver2 = move |dlg: windows::Win32::Foundation::HWND| {
+        dialog::select_page(dlg, "keys");
+        let rows = dialog::key_list_texts(dlg);
+        let changed = rows.iter().filter(|r| !r[3].is_empty()).count();
+        if changed != 2 {
+            p2.borrow_mut()
+                .push(format!("開き直した一覧の変更済は 2 件: {changed}"));
+        }
+        dialog::press(dlg, dialog::ID_KEY_RESET_ALL);
+        if dialog::key_list_texts(dlg).iter().any(|r| !r[3].is_empty()) {
+            p2.borrow_mut().push("すべて既定に戻す".into());
+        }
+        dialog::press(dlg, windows::Win32::UI::WindowsAndMessaging::IDOK.0);
+    };
+    step(|app| app.run_real_settings_dialog_for_test(&mut driver2))?;
+    check!(problems2.borrow().is_empty(), "{:?}", problems2.borrow());
+    step(|app| -> Check {
+        check!(
+            app.settings.keys.is_empty(),
+            "すべて既定に戻した {:?}",
+            app.settings.keys
+        );
+        check!(
+            app.keymap()
+                .command_for(&KeyChord::parse("Ctrl+S").unwrap())
+                == Some(CommandId::new("file.save")),
+            "既定のキーが戻った"
+        );
+        Ok(())
+    })??;
+    settle()?;
+    let text = std::fs::read_to_string(file).map_err(|e| e.to_string())?;
+    check!(!text.contains("Ctrl+Alt+K"), "keys が消えた {text}");
+    Ok(())
 }

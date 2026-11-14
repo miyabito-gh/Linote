@@ -31,7 +31,7 @@ use super::App;
 pub const APP_SETTINGS: CommandDef = CommandDef::new(
     CommandId::new("app.settings"),
     "設定...",
-    "設定画面（一般・表示）を開く。OK・適用で設定ファイルに保存し、実行中のウィンドウに反映する。",
+    "設定画面（一般・表示・キー）を開く。OK・適用で設定ファイルに保存し、実行中のウィンドウに反映する。",
 )
 .default_key("Ctrl+Comma");
 
@@ -294,16 +294,16 @@ impl App {
 
     /// 設定画面の「適用」: 最新の設定ファイルを取り込んでから、画面で変えた項目だけを差し替え、
     /// 反映して保存する。設定ファイルが壊れている間は保存せず、この起動の間だけ反映する。
-    /// 反映後の設定を返す。
+    /// 反映後の設定と、利用者に知らせるべき問題（キーの重複、ショートカットの登録の失敗）を返す。
     pub(super) fn apply_settings_edit(
         &mut self,
         baseline: &Settings,
         edited: &Settings,
-    ) -> Settings {
+    ) -> (Settings, Vec<String>) {
         self.reload_settings(ReloadReason::BeforeApply);
         let mut next = self.settings.clone();
         if apply_edits(baseline, edited, &mut next).is_empty() {
-            return self.settings.clone();
+            return (self.settings.clone(), Vec::new());
         }
         let old = std::mem::replace(&mut self.settings, next);
         let changes = old.diff(&self.settings);
@@ -323,7 +323,7 @@ impl App {
             kind = MessageKind::Warning;
         }
         self.set_status(&text, kind);
-        self.settings.clone()
+        (self.settings.clone(), notes)
     }
 
     /// 設定を保存できない理由（保存できるなら `None`）。
@@ -371,6 +371,31 @@ impl SettingsSession for AppSettingsSession<'_> {
     }
 
     fn apply(&mut self, baseline: &Settings, edited: &Settings) -> Settings {
-        self.app.apply_settings_edit(baseline, edited)
+        let (settings, notes) = self.app.apply_settings_edit(baseline, edited);
+        if !notes.is_empty() {
+            let owner = self.app.hwnd;
+            self.notice(owner, &notes.join("\n"));
+        }
+        settings
+    }
+
+    fn command_defs(&self) -> Vec<CommandDef> {
+        self.app.registry.definitions().copied().collect()
+    }
+
+    fn confirm(
+        &mut self,
+        owner: windows::Win32::Foundation::HWND,
+        caption: &str,
+        text: &str,
+    ) -> bool {
+        let prompts = self.app.prompts.clone();
+        prompts.confirm(owner, caption, text)
+    }
+
+    fn notice(&mut self, owner: windows::Win32::Foundation::HWND, text: &str) {
+        use crate::ui::dialogs::NoticeKind;
+        let prompts = self.app.prompts.clone();
+        prompts.notice(owner, NoticeKind::Warning, "設定", text);
     }
 }
