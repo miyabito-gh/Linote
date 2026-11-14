@@ -98,6 +98,14 @@ pub const EDIT_GOTO_BRACE: CommandDef = CommandDef::new(
 .target(TargetKind::Document)
 .default_key("Ctrl+BracketRight");
 
+/// 次のマウス選択・矢印キーによる選択を矩形にする切り替え（Alt＋ドラッグの代わり）。
+pub const EDIT_RECTANGULAR_SELECT: CommandDef = CommandDef::new(
+    CommandId::new("edit.rectangular_select"),
+    "矩形選択",
+    "次のマウス選択・矢印キーによる選択を矩形にする状態を切り替える（もう一度で解除）。",
+)
+.target(TargetKind::Document);
+
 impl App {
     /// 行末の空白などの変換の結果を知らせる。
     fn report_edit(&mut self, count: usize, done: &str, none: &str) {
@@ -112,6 +120,10 @@ impl App {
 
 /// 編集コマンドを登録する。
 pub fn register(registry: &mut Registry<App>) -> Result<()> {
+    registry.register(EDIT_RECTANGULAR_SELECT, |app, call| {
+        app.with_text(call.document()?, |ed| ed.toggle_rectangular_select())?;
+        Ok(Value::Null)
+    })?;
     registry.register(EDIT_DUPLICATE_LINE, |app, call| {
         app.with_text(call.document()?, |ed| ed.duplicate_line_or_selection())?;
         Ok(Value::Null)

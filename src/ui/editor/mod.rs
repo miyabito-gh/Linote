@@ -528,6 +528,30 @@ impl Editor {
         self.send(SCI_GETSELECTIONMODE, 0, 0) as usize == SC_SEL_RECTANGLE
     }
 
+    /// 「矩形選択」の切り替えが入っているか（以後のマウス選択・矢印キーによる選択が
+    /// 矩形になる状態）。
+    pub fn rectangular_select_active(&self) -> bool {
+        self.is_rectangular_selection() && self.send(SCI_GETMOVEEXTENDSSELECTION, 0, 0) != 0
+    }
+
+    /// 次のマウス選択・矢印キーによる選択を矩形にする状態を切り替える（V1）。
+    /// `SCI_SETSELECTIONMODE` は同じ値を 2 回送ると解除になる（Scintilla の仕様）。
+    pub fn toggle_rectangular_select(&self) {
+        if self.rectangular_select_active() {
+            // 矩形から通常へは 2 回（1 回目で種類だけ戻り、2 回目で「伸ばす」状態が切れる）。
+            for _ in 0..2 {
+                if self.send(SCI_GETMOVEEXTENDSSELECTION, 0, 0) == 0
+                    && !self.is_rectangular_selection()
+                {
+                    break;
+                }
+                self.send(SCI_SETSELECTIONMODE, SC_SEL_STREAM, 0);
+            }
+        } else {
+            self.send(SCI_SETSELECTIONMODE, SC_SEL_RECTANGLE, 0);
+        }
+    }
+
     pub fn select_all(&self) {
         self.send(SCI_SELECTALL, 0, 0);
     }

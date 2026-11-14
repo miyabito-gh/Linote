@@ -739,8 +739,32 @@ impl App {
         self.hotkey.as_ref().map(|h| h.status())
     }
 
+    /// 文書がないと意味のないコマンドか（文書 0 件のときは、メニューは無効表示、
+    /// ショートカットは何もしない）。対象が文書のコマンドのほか、対象を取らずに
+    /// アクティブな文書に作用するものも含む。
+    pub(super) fn needs_document(&self, command: CommandId) -> bool {
+        matches!(
+            command.as_str(),
+            "search.find"
+                | "search.replace"
+                | "search.find_next"
+                | "search.find_prev"
+                | "search.find_selection"
+                | "view.preview_pane"
+                | "view.preview_window"
+                | "view.next_tab"
+                | "view.prev_tab"
+        ) || self
+            .registry
+            .find(command.as_str())
+            .is_some_and(|d| d.target == crate::command::TargetKind::Document)
+    }
+
     /// コマンドを利用者の操作として実行する（失敗は状態表示に出る）。
     pub fn run_command(&mut self, command: CommandId, args: Value) {
+        if self.active.is_none() && self.needs_document(command) {
+            return;
+        }
         if command == super::printing::FILE_PRINT.id
             && self.active.is_some()
             && !self.active_can_print()
@@ -758,6 +782,22 @@ impl App {
     /// キー入力がコマンドの割り当てなら実行して `true`（メッセージループから呼ぶ）。
     /// 編集欄とメインウィンドウへの入力だけを扱い、小窓や入力欄のキーは触らない。
     pub(super) fn translate_shortcut(&mut self, msg: &MSG) -> bool {
+        // Alt を使った操作（Alt＋ドラッグ、Alt＋Shift＋矢印）のあと、Alt を離しても
+        // メニューバーへフォーカスを移さない（V1）。
+        if is_our_editor(msg.hwnd) {
+            // SAFETY: キーの状態を読むだけ。
+            let alt_down = unsafe {
+                windows::Win32::UI::Input::KeyboardAndMouse::GetKeyState(
+                    windows::Win32::UI::Input::KeyboardAndMouse::VK_MENU.0 as i32,
+                ) < 0
+            };
+            if self
+                .alt
+                .track(msg.message, msg.wParam.0, msg.lParam.0, alt_down)
+            {
+                return true;
+            }
+        }
         if msg.message != WM_KEYDOWN && msg.message != WM_SYSKEYDOWN {
             return false;
         }
@@ -823,6 +863,9 @@ impl App {
             if entry.command == crate::ui::menu::ID_FILE_OPEN_RECENT {
                 let n = entry.args["index"].as_u64().unwrap_or(0) as usize;
                 return n >= 1 && n <= recent.len();
+            }
+            if self.active.is_none() && self.needs_document(entry.command) {
+                return false;
             }
             registry
                 .check_available(self, &Invocation::user(entry.command))

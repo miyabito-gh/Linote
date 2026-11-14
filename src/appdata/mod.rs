@@ -5,6 +5,7 @@
 //! ```text
 //! %LOCALAPPDATA%\Linote\
 //!   settings.json          設定（[`settings::Settings`]）
+//!   session.json           前回のタブの記録（[`session::Session`]）
 //!   memos\                 一時メモ（タスク E が中の形式を決める）
 //!   recovery\              未保存変更の復元データ（タスク D が中の形式を決める）
 //!   mcp\authorization.json MCP の認可（次の版）
@@ -18,9 +19,10 @@
 //!   別の場所に向けたいとき（結合テスト、検証）は環境変数 [`DATA_DIR_ENV`] を使う。
 
 pub mod handoff;
+pub mod session;
 pub mod settings;
 
-pub use settings::{Settings, ThemeMode};
+pub use settings::{Settings, ThemeMode, WindowSettings};
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -83,6 +85,11 @@ impl AppPaths {
     /// 設定ファイル。
     pub fn settings_file(&self) -> PathBuf {
         self.root.join("settings.json")
+    }
+
+    /// 前回のタブの記録（V1、`session` モジュール）。
+    pub fn session_file(&self) -> PathBuf {
+        self.root.join("session.json")
     }
 
     /// 一時メモのディレクトリ（タスク E）。

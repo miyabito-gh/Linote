@@ -58,6 +58,8 @@ fn close_everything() -> Check {
         }
         // 前の試験の受け渡しが残っていたら捨てる。
         app.handoffs.clear();
+        // 最後の 1 つを閉じると文書 0 件になる（V1）ので、従来どおり空の文書を 1 つ残す。
+        let _ = app.new_untitled();
     })
 }
 

@@ -294,6 +294,7 @@ static MENUS: &[MenuDef] = &[
             Item::Cmd(CommandId::new("edit.copy")),
             Item::Cmd(CommandId::new("edit.paste")),
             Item::Cmd(CommandId::new("edit.select_all")),
+            Item::Cmd(CommandId::new("edit.rectangular_select")),
             Item::Separator,
             Item::Sub(
                 "行の操作(&L)",

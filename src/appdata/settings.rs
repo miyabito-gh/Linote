@@ -10,6 +10,8 @@
 //!   "recent_files": ["C:\\work\\a.txt"],
 //!   "view": { "wrap": "word", "wrap_column": 80, "zoom": 0, "line_numbers": true },
 //!   "print": { "margin_left": 2000, "landscape": false, "color": true },
+//!   "restore_session": true,
+//!   "window": { "x": 100, "y": 80, "width": 1100, "height": 720, "maximized": false },
 //!   "mcp": { "enabled": false }
 //! }
 //! ```
@@ -24,6 +26,9 @@
 //!   （`view` がオブジェクトでなければ壊れているとみなす）。全タブに適用する。
 //! - `print`: 印刷の設定（[`PrintSettings`]。余白は 0.01 mm、用紙の種類と向き、色、行番号、
 //!   ヘッダー、フッター）。値が不正な項目は既定値にして読む。
+//! - `restore_session`: 起動時に前回のタブを開き直す（既定 `true`。記録は `session.json`）。
+//! - `window`: 前回のウィンドウの位置と大きさ（通常状態の矩形と最大化の有無。V1）。値が
+//!   不正なら無視して既定の位置で開く。
 //! - 知らない項目は読み込んだまま保持し、書き戻すときに失わない
 //!   （新しい版が書いた設定を古い版が消さないため）。
 //! - ファイルがなければ既定値。ファイルは設定を変更して保存するときに初めて作る。
@@ -310,8 +315,70 @@ impl PrintSettings {
     }
 }
 
+/// 前回のウィンドウの位置と大きさ（画面座標。最大化していても通常状態の矩形を持つ）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WindowSettings {
+    pub x: i32,
+    pub y: i32,
+    pub width: i32,
+    pub height: i32,
+    pub maximized: bool,
+}
+
+/// 保存したウィンドウの幅・高さの下限（これより小さい値は壊れているとみなす）。
+pub const WINDOW_MIN_SIZE: i32 = 200;
+
+impl WindowSettings {
+    fn from_value(map: &Map<String, Value>) -> Option<Self> {
+        let num = |k: &str| {
+            map.get(k)
+                .and_then(Value::as_i64)
+                .and_then(|n| i32::try_from(n).ok())
+        };
+        let w = WindowSettings {
+            x: num("x")?,
+            y: num("y")?,
+            width: num("width")?,
+            height: num("height")?,
+            maximized: map
+                .get("maximized")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        };
+        (w.width >= WINDOW_MIN_SIZE && w.height >= WINDOW_MIN_SIZE).then_some(w)
+    }
+
+    fn to_value(self) -> Map<String, Value> {
+        let mut m = Map::new();
+        m.insert("x".into(), self.x.into());
+        m.insert("y".into(), self.y.into());
+        m.insert("width".into(), self.width.into());
+        m.insert("height".into(), self.height.into());
+        m.insert("maximized".into(), self.maximized.into());
+        m
+    }
+
+    /// 矩形を、モニターの作業領域 `work`（左, 上, 右, 下）の内側に収める。作業領域より大きければ
+    /// 作業領域に合わせて縮め、はみ出していれば寄せる（画面外に出た窓を取り戻せるように）。
+    pub fn fitted(self, work: (i32, i32, i32, i32)) -> Self {
+        let fit = |pos: i32, len: i32, lo: i32, hi: i32| {
+            let len = len.min((hi - lo).max(1));
+            (pos.clamp(lo, (hi - len).max(lo)), len)
+        };
+        let (x, width) = fit(self.x, self.width, work.0, work.2);
+        let (y, height) = fit(self.y, self.height, work.1, work.3);
+        WindowSettings {
+            x,
+            y,
+            width,
+            height,
+            maximized: self.maximized,
+        }
+    }
+}
+
 /// 設定。
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Settings {
     pub theme: ThemeMode,
     /// コマンド名 → キー表記。空文字列は「割り当てなし」。
@@ -324,8 +391,28 @@ pub struct Settings {
     pub view: ViewSettings,
     /// 印刷の設定。
     pub print: PrintSettings,
+    /// 起動時に前回のタブを開き直す。
+    pub restore_session: bool,
+    /// 前回のウィンドウの位置と大きさ。
+    pub window: Option<WindowSettings>,
     /// このプログラムが知らない項目。読み込んだまま書き戻す。
     extra: Map<String, Value>,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Settings {
+            theme: ThemeMode::default(),
+            keys: BTreeMap::new(),
+            mcp_enabled: false,
+            recent_files: Vec::new(),
+            view: ViewSettings::default(),
+            print: PrintSettings::default(),
+            restore_session: true,
+            window: None,
+            extra: Map::new(),
+        }
+    }
 }
 
 fn corrupt(reason: impl Into<String>) -> Error {
@@ -399,6 +486,13 @@ impl Settings {
             };
             settings.print = PrintSettings::from_value(&print);
         }
+        if let Some(v) = map.remove("restore_session") {
+            // 真偽値でなければ既定（有効）のまま。
+            settings.restore_session = v.as_bool().unwrap_or(true);
+        }
+        if let Some(Value::Object(w)) = map.remove("window") {
+            settings.window = WindowSettings::from_value(&w);
+        }
         if let Some(mcp) = map.remove("mcp") {
             let Value::Object(mut mcp) = mcp else {
                 return Err(corrupt("mcp がオブジェクトではありません"));
@@ -442,6 +536,11 @@ impl Settings {
         );
         map.insert("view".into(), Value::Object(self.view.to_value()));
         map.insert("print".into(), Value::Object(self.print.to_value()));
+        map.insert("restore_session".into(), self.restore_session.into());
+        match self.window {
+            Some(w) => map.insert("window".into(), Value::Object(w.to_value())),
+            None => map.remove("window"),
+        };
         let mcp = map
             .entry("mcp")
             .or_insert_with(|| Value::Object(Map::new()));
@@ -514,6 +613,66 @@ mod tests {
         let value: Value = serde_json::from_str(&text).unwrap();
         assert_eq!(value["version"], 1);
         assert_eq!(value["mcp"]["enabled"], true);
+    }
+
+    #[test]
+    fn restore_session_and_window_round_trip() {
+        let mut s = Settings::default();
+        assert!(s.restore_session);
+        assert_eq!(s.window, None);
+        s.restore_session = false;
+        s.window = Some(WindowSettings {
+            x: -1200,
+            y: 40,
+            width: 900,
+            height: 700,
+            maximized: true,
+        });
+        assert_eq!(Settings::from_json(&s.to_json()).unwrap(), s);
+        // 不正な値は既定に戻す（設定全体は壊れていない）。
+        for bad in [
+            r#"{"window":{"x":1,"y":2,"width":10,"height":500}}"#,
+            r#"{"window":{"x":"a","y":2,"width":500,"height":500}}"#,
+            r#"{"window":{"y":2,"width":500,"height":500}}"#,
+            r#"{"window":5}"#,
+        ] {
+            assert_eq!(Settings::from_json(bad).unwrap().window, None, "{bad}");
+        }
+        assert!(
+            Settings::from_json(r#"{"restore_session":"x"}"#)
+                .unwrap()
+                .restore_session
+        );
+        let ok = Settings::from_json(r#"{"window":{"x":1,"y":2,"width":500,"height":400}}"#)
+            .unwrap()
+            .window
+            .unwrap();
+        assert!(!ok.maximized);
+    }
+
+    #[test]
+    fn window_is_fitted_into_the_work_area() {
+        let w = |x, y, width, height| WindowSettings {
+            x,
+            y,
+            width,
+            height,
+            maximized: false,
+        };
+        let work = (0, 0, 1920, 1040);
+        // 収まっていれば変えない。
+        assert_eq!(w(100, 50, 800, 600).fitted(work), w(100, 50, 800, 600));
+        // 画面外（取り外したモニター）は内側へ寄せる。
+        assert_eq!(w(3000, 50, 800, 600).fitted(work), w(1120, 50, 800, 600));
+        assert_eq!(w(-2000, -500, 800, 600).fitted(work), w(0, 0, 800, 600));
+        assert_eq!(w(100, 900, 800, 600).fitted(work), w(100, 440, 800, 600));
+        // 作業領域より大きければ縮める。
+        assert_eq!(w(-50, -50, 4000, 3000).fitted(work), w(0, 0, 1920, 1040));
+        // 作業領域が原点でないモニター。
+        assert_eq!(
+            w(100, 100, 500, 400).fitted((1920, 0, 2920, 700)),
+            w(1920, 100, 500, 400)
+        );
     }
 
     #[test]

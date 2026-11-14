@@ -378,17 +378,16 @@ fn closing_many(ctx: &Ctx) -> Check {
         check!(app.active_id() == Some(keep), "アクティブな文書");
         Ok(())
     })??;
-    // すべて閉じる: 空の新規文書が 1 つ残る。
+    // すべて閉じる: 文書 0 件になる（無題は作らない。V1）。
     cmd("file.new", Value::Null)?;
     cmd("file.close_all", Value::Null)?;
     step(|app| -> Check {
-        check!(app.documents().len() == 1, "残り {}", app.documents().len());
-        check!(
-            app.documents()[0].state.path().is_none(),
-            "新しい空の文書になる"
-        );
+        check!(app.documents().is_empty(), "残り {}", app.documents().len());
+        check!(app.active_id().is_none(), "アクティブな文書がない");
         Ok(())
     })??;
+    // 以降の試験のために、文書を 1 つ開き直す。
+    cmd("file.new", Value::Null)?;
     Ok(())
 }
 

@@ -221,6 +221,37 @@ impl App {
         });
     }
 
+    /// 設定をその場で（UI スレッドで）書く。終了の間際に、ワーカーの書き出しを待たずに
+    /// 確実に書くため。進行中の書き出しがあれば、それが終わるのを待ってから書く。
+    pub(super) fn persist_settings_now(&mut self) {
+        let Some(paths) = self.paths.clone() else {
+            return;
+        };
+        if !self.settings_state.writable() {
+            return;
+        }
+        let json = self.settings.to_json();
+        self.settings_state = SettingsState::Loaded;
+        let seq = SETTINGS_SEQ.fetch_add(1, Ordering::SeqCst) + 1;
+        let mut last = SETTINGS_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
+        *last = (*last).max(seq);
+        for attempt in 1..=SETTINGS_WRITE_ATTEMPTS {
+            let result = paths.ensure_dir(paths.root()).and_then(|()| {
+                file::write_atomic(
+                    &paths.settings_file(),
+                    json.as_bytes(),
+                    &TaskContext::detached(),
+                )
+            });
+            if result.is_ok() {
+                break;
+            }
+            if attempt < SETTINGS_WRITE_ATTEMPTS {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+    }
+
     // ---------------------------------------------------------------- 開く
 
     /// ファイルを開く（ワーカーで読む）。既に開いていればそのタブへ切り替える。
@@ -344,7 +375,6 @@ impl App {
                     &format!("{} を開けませんでした", request.path.display()),
                     &e,
                 );
-                self.ensure_a_document();
                 return;
             }
         };
@@ -365,7 +395,6 @@ impl App {
                     &format!("{} を開けませんでした", request.path.display()),
                     &e,
                 );
-                self.ensure_a_document();
             }
             return;
         }
@@ -417,13 +446,6 @@ impl App {
                 ),
                 MessageKind::Warning,
             );
-        }
-    }
-
-    /// 文書が 1 つもない状態を避ける（開くのに失敗した起動時など）。
-    fn ensure_a_document(&mut self) {
-        if self.docs.is_empty() && self.opening.is_empty() {
-            let _ = self.new_untitled();
         }
     }
 

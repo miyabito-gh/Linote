@@ -24,10 +24,12 @@
 //!
 //! 担当: タスク B（統合は I1）。
 
+mod altkey;
 mod bigdoc;
 mod closing;
 mod commands;
 mod editcmds;
+mod emptyview;
 mod fileio;
 mod fileops;
 mod highlight;
@@ -37,6 +39,7 @@ mod printing;
 mod recover;
 mod search;
 pub mod selftest;
+mod session;
 mod tabops;
 mod viewopts;
 
@@ -244,7 +247,8 @@ impl Default for Hooks {
 /// [`run`] の指定。
 #[derive(Default)]
 pub struct RunOptions {
-    /// 起動時に開くファイル。空なら新しい空の文書を 1 つ開く。
+    /// 起動時に開くファイル。空で、受け渡し（`adopt`）もなければ、前回のタブを開き直す
+    /// （設定 `restore_session`）。それもなければ文書 0 件で起動する。
     pub files: Vec<PathBuf>,
     /// 明暗の指定。`None` なら設定ファイルの値（なければ Windows に合わせる）。
     pub theme: Option<ThemeMode>,
@@ -350,6 +354,12 @@ pub struct App {
     handoff_seq: u32,
     /// 別ウィンドウへの移動で新しいプロセスを起動するか（自己診断では `false`）。
     pub(crate) handoff_spawn: bool,
+    /// 前回のタブの復元の進み具合（V1）。
+    restore: session::RestoreState,
+    /// 文書が 0 件のときの案内の、クリックできる行（矩形, 最近使ったファイルの番号）。
+    empty_links: Vec<(RECT, usize)>,
+    /// Alt を使った操作のあと、Alt を離してもメニューを有効にしない（V1）。
+    alt: altkey::AltTracker,
     /// 統合側が差し込む処理。
     pub hooks: Hooks,
 }
@@ -523,13 +533,14 @@ pub fn start(options: RunOptions) -> Result<()> {
                 ));
             }
         }
-        if files.is_empty() && app.docs.is_empty() {
-            if let Err(e) = app.new_untitled() {
-                app.set_status(&e.to_string(), MessageKind::Warning);
-            }
-        }
+        // 開くものがなければ、前回のタブを開き直す。それもなければ文書 0 件のまま
+        // （無題の文書は作らない。読み込みは非同期なので、`docs` の空きでは判断しない）。
+        let nothing_given = files.is_empty() && adopt.is_none();
         for path in &files {
             app.open_path(path);
+        }
+        if nothing_given {
+            app.begin_session_restore();
         }
         if let Some(setup) = setup {
             setup(app);
@@ -537,9 +548,14 @@ pub fn start(options: RunOptions) -> Result<()> {
         app.startup_notices();
     })
     .ok_or_else(|| Error::Internal("アプリの状態を用意できませんでした".into()))?;
+    // 前回のウィンドウの位置（受け渡し先の位置指定があればそちらを優先）。置けたら表示まで
+    // 済んでいる。
+    let placed = window_pos.is_none() && with_app(|app| app.apply_saved_window()) == Some(true);
     // SAFETY: 自分のウィンドウを表示する。
     unsafe {
-        let _ = ShowWindow(hwnd, SW_SHOWDEFAULT);
+        if !placed {
+            let _ = ShowWindow(hwnd, SW_SHOWDEFAULT);
+        }
         let _ = UpdateWindow(hwnd);
     }
     with_app(|app| {
@@ -671,6 +687,9 @@ impl App {
             handoff_timer: false,
             handoff_seq: 0,
             handoff_spawn: true,
+            restore: session::RestoreState::default(),
+            empty_links: Vec::new(),
+            alt: altkey::AltTracker::default(),
             hooks: Hooks::default(),
         };
         app.editor.apply_view(&app.settings.view);
@@ -679,6 +698,11 @@ impl App {
         // ドロップ対象が親へ WM_DROPFILES として転送する（third_party/VENDORED.md を参照）。
         // SAFETY: 自分のウィンドウ。
         unsafe { windows::Win32::UI::Shell::DragAcceptFiles(hwnd, true) };
+        // 文書が 0 件のあいだは編集欄を隠し、本文の場所に案内を描く（V1）。
+        // SAFETY: 自分の編集欄を隠す。
+        unsafe {
+            let _ = ShowWindow(app.editor.hwnd(), SW_HIDE);
+        }
         Ok(app)
     }
 
@@ -954,6 +978,7 @@ impl App {
         self.sync();
         let savepoint_valid = !state.is_dirty();
         let id = state.id();
+        let activate = self.session_activation(&state, activate);
         self.docs.push(OpenDoc::new(
             state,
             title,
@@ -966,6 +991,7 @@ impl App {
         } else {
             self.refresh_tabs();
         }
+        self.apply_session_restore(id);
         Ok(id)
     }
 
@@ -983,6 +1009,7 @@ impl App {
             let _ = ShowWindow(hwnd, SW_HIDE);
         }
         let id = state.id();
+        let activate = self.session_activation(&state, activate);
         self.docs.push(OpenDoc::new(
             state,
             title,
@@ -995,6 +1022,7 @@ impl App {
         } else {
             self.refresh_tabs();
         }
+        self.apply_session_restore(id);
         Ok(id)
     }
 
@@ -1170,8 +1198,9 @@ impl App {
         let i = self.index_of(id)?;
         if self.active == Some(i) {
             // 隣（右、なければ左）を先に表示し、編集欄が閉じる文書を手放すようにする。
+            // 最後の 1 つなら、文書 0 件の状態にする（無題は作らない）。
             if self.docs.len() == 1 {
-                self.new_untitled()?;
+                self.deactivate_all();
             } else {
                 let next = if i + 1 < self.docs.len() {
                     i + 1
@@ -1210,10 +1239,54 @@ impl App {
         // 閉じた文書の通知（あれば）を捨てる。
         self.sync();
         self.refresh_tabs();
+        if self.docs.is_empty() {
+            self.show_no_document();
+        }
         if let Some(hook) = self.hooks.document_closed {
             hook(self, id, doc.view);
         }
         Ok(true)
+    }
+
+    /// 表示中の文書を手放して、アクティブな文書をなしにする（最後のタブを閉じる前の準備）。
+    /// 編集欄は閉じる文書の参照を持たない空のドキュメントになり、隠れる。
+    fn deactivate_all(&mut self) {
+        self.sync();
+        self.clear_highlight();
+        if let Some(cur) = self.active.take() {
+            match self.docs[cur].view {
+                DocView::Scintilla(_) => {
+                    self.editor.detach_document();
+                    // SAFETY: 自分の編集欄を隠す。
+                    unsafe {
+                        let _ = ShowWindow(self.editor.hwnd(), SW_HIDE);
+                    }
+                }
+                DocView::External(h) => {
+                    let leaving = self.docs[cur].id();
+                    self.big_leave(leaving);
+                    // SAFETY: 外部の表示部品を隠すだけ。
+                    unsafe {
+                        let _ = ShowWindow(h, SW_HIDE);
+                    }
+                }
+            }
+        }
+    }
+
+    /// 文書が 0 件になった後の表示の更新（案内の描画、ステータス・タイトルの空表示）。
+    fn show_no_document(&mut self) {
+        self.refresh_status();
+        self.update_window_title();
+        self.update_find_context();
+        self.invalidate(self.layout.editor);
+        if let Some(hook) = self.hooks.active_changed {
+            hook(self, None);
+        }
+        // SAFETY: 自分のウィンドウにフォーカスを移す（隠れた編集欄にはフォーカスを置けない）。
+        unsafe {
+            let _ = SetFocus(Some(self.hwnd));
+        }
     }
 
     /// タブの題名を変える（メモの名前の変更など）。
@@ -1227,7 +1300,9 @@ impl App {
 
     fn focus_active(&self) {
         match self.active.map(|i| self.docs[i].view) {
-            Some(DocView::Scintilla(_)) | None => self.editor.focus(),
+            Some(DocView::Scintilla(_)) => self.editor.focus(),
+            // 文書 0 件: 編集欄は隠れている。
+            None => {}
             // SAFETY: 外部の表示部品にフォーカスを移す。
             Some(DocView::External(h)) => unsafe {
                 let _ = SetFocus(Some(h));
@@ -1651,6 +1726,15 @@ impl App {
                 Some(LRESULT(0))
             }
             WM_SETCURSOR => {
+                if (lparam.0 & 0xFFFF) as u32 == HTCLIENT && self.cursor_over_empty_link() {
+                    // SAFETY: 標準のカーソル。
+                    unsafe {
+                        if let Ok(c) = LoadCursorW(None, windows::Win32::UI::WindowsAndMessaging::IDC_HAND) {
+                            SetCursor(Some(c));
+                        }
+                    }
+                    return Some(LRESULT(1));
+                }
                 if (lparam.0 & 0xFFFF) as u32 == HTCLIENT && self.cursor_over_splitter() {
                     // SAFETY: 標準のカーソル。
                     unsafe {
@@ -1728,6 +1812,14 @@ impl App {
             }
             return;
         }
+        // 文書 0 件の案内の、最近使ったファイル。
+        if let Some(n) = self.empty_link_at(x, y) {
+            self.run_command(
+                crate::ui::menu::ID_FILE_OPEN_RECENT,
+                serde_json::json!({ "index": n }),
+            );
+            return;
+        }
         match self.tabs.hit_test(x, y) {
             Some(TabHit::Tab(i)) => {
                 let id = self.docs[i].id();
@@ -1803,9 +1895,8 @@ impl App {
                 );
             }
             // 何も置いていない領域（右ペインが未設定、外部の表示部品の外など）。
-            let c = window::Canvas { hdc, dpi: self.dpi };
             if self.active.is_none() {
-                c.fill(&self.layout.editor, self.theme.editor.bg);
+                self.paint_empty_view(hdc);
             }
             let _ = EndPaint(self.hwnd, &ps);
         }
@@ -1843,6 +1934,10 @@ impl App {
     fn teardown(&mut self) {
         self.sync();
         let forced = self.exit_without_confirmation;
+        // 確認を通った正常な終了のときだけ、前回のタブとウィンドウの位置を記録する。
+        if !forced {
+            self.save_session_and_window();
+        }
         let discarded = std::mem::take(&mut self.exit_discard);
         for d in std::mem::take(&mut self.docs) {
             if let DocView::Scintilla(s) = d.view {

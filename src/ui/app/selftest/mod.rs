@@ -25,8 +25,7 @@ use crate::appdata::{AppPaths, ThemeMode};
 use crate::command::{CommandDef, CommandId, Effect, Invocation, Registry, TargetKind, Value};
 use crate::core::{Actor, Error, TargetRef};
 use crate::document::{
-    Capabilities, Capability, DocumentKind, DocumentState, EditTarget, Selection, TextRange,
-    TextSource,
+    Capabilities, Capability, DocumentState, EditTarget, Selection, TextRange, TextSource,
 };
 use crate::ui::dialogs::ScriptedPrompts;
 use crate::ui::editor::Language;
@@ -38,6 +37,7 @@ mod integration_u2;
 mod integration_u3;
 mod integration_u4;
 mod integration_u5;
+mod integration_v1;
 
 /// 統合の試験の道具立て。
 pub(crate) struct Ctx {
@@ -88,6 +88,13 @@ fn pump_until(mut done: impl FnMut() -> bool) -> bool {
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
     done()
+}
+
+fn editor_visible(app: &App) -> bool {
+    // SAFETY: ウィンドウの表示状態を調べるだけ。
+    unsafe {
+        windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(app.editor().hwnd()).as_bool()
+    }
 }
 
 fn text_of(app: &mut App, id: crate::core::DocumentId) -> String {
@@ -152,8 +159,58 @@ pub fn run_self_test() -> i32 {
 }
 
 fn checks_basic(app: &mut App) -> Check {
-    // 起動直後は空の文書が 1 つ。
-    check!(app.documents().len() == 1, "起動時の文書の数");
+    // 起動直後は文書 0 件（無題を作らない。V1）。編集欄は隠れ、案内を描く。
+    check!(app.documents().is_empty(), "起動時の文書の数");
+    check!(app.active_id().is_none(), "起動時はアクティブな文書がない");
+    check!(app.tabs.items().is_empty(), "起動時のタブ");
+    check!(!editor_visible(app), "文書 0 件では編集欄を隠す");
+    check!(
+        app.status.info() == &Default::default(),
+        "文書 0 件のステータス"
+    );
+    // 文書を前提とするコマンドは何もしない（パニックしない）。
+    for cmd in [
+        "file.save",
+        "file.save_as",
+        "file.close",
+        "file.print",
+        "edit.undo",
+        "edit.select_all",
+        "edit.goto_line",
+        "edit.rectangular_select",
+        "search.find",
+        "search.find_next",
+        "view.preview_pane",
+        "view.next_tab",
+        "view.prev_tab",
+    ] {
+        app.run_command(CommandId::new(cmd), Value::Null);
+    }
+    check!(
+        app.documents().is_empty(),
+        "文書を前提とするコマンドが何かした"
+    );
+    check!(app.find_panel.is_none(), "検索欄が開いた");
+    check!(
+        app.needs_document(CommandId::new("file.save"))
+            && app.needs_document(CommandId::new("search.find"))
+            && !app.needs_document(CommandId::new("file.new"))
+            && !app.needs_document(CommandId::new("file.open")),
+        "文書を前提とするコマンドの判定"
+    );
+    // 最近使ったファイルの案内も描ける（当たり判定ができる）。
+    app.settings.recent_files = vec!["C:\\work\\a.txt".into(), "C:\\work\\b.txt".into()];
+    app.paint_for_test();
+    check!(
+        app.empty_links.len() == 2,
+        "案内の最近使ったファイル {}",
+        app.empty_links.len()
+    );
+    app.settings.recent_files.clear();
+    // 新規（file.new）で文書ができ、編集欄が現れる。
+    app.execute(&Invocation::user(FILE_NEW.id)).map_err(e2s)?;
+    check!(app.documents().len() == 1, "新規で文書ができる");
+    check!(editor_visible(app), "文書があれば編集欄を出す");
     let first = app.active_id().ok_or("アクティブな文書がない")?;
     check!(!app.state(first).unwrap().is_dirty(), "空の文書は未変更");
     check!(app.theme().dark, "ダークテーマ");
@@ -387,18 +444,21 @@ fn checks_close(app: &mut App) -> Check {
     check!(app.state(dirty).is_none(), "閉じた文書が残っている");
     check!(app.active_id().is_some(), "隣のタブ");
 
-    // 全部閉じると新しい空の文書が 1 つ残る。
+    // 全部閉じると文書 0 件になる（無題は作らない。V1）。
     let ids: Vec<_> = app.documents().iter().map(|d| d.id()).collect();
     for id in ids {
         app.close_document(id, true).map_err(e2s)?;
     }
-    check!(app.documents().len() == 1, "最後の文書を閉じた後");
-    let id = app.active_id().unwrap();
-    check!(
-        *app.state(id).unwrap().kind() == DocumentKind::Untitled,
-        "空の文書"
-    );
-    check!(app.editor().length() == 0, "空の本文");
+    check!(app.documents().is_empty(), "最後の文書を閉じた後");
+    check!(app.active_id().is_none(), "アクティブな文書がない");
+    check!(app.tabs.items().is_empty(), "タブが空");
+    check!(!editor_visible(app), "編集欄を隠す");
+    check!(app.editor().length() == 0, "編集欄は空のドキュメント");
+    check!(app.status.info() == &Default::default(), "ステータスは空");
+    // 以降の試験のために、文書を 1 つ開き直す。
+    app.new_untitled().map_err(e2s)?;
+    check!(editor_visible(app), "文書を開けば編集欄が出る");
+    check!(app.documents().len() == 1, "開き直した文書");
     Ok(())
 }
 

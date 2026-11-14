@@ -13,7 +13,7 @@ use crate::core::{Error, Result};
 use crate::ui::editor::Language;
 use crate::ui::statusbar::MessageKind;
 
-use super::App;
+use super::{App, DocView};
 
 const WRAP_MODES: &[&str] = &["none", "word", "char", "column"];
 const TAB_WIDTHS: &[&str] = &["2", "4", "8"];
@@ -389,7 +389,7 @@ impl App {
     }
 
     /// メニューの印（チェック）の状態。印を付ける項目でなければ `None`。
-    pub(super) fn view_menu_checked(&self, command: CommandId, args: &Value) -> Option<bool> {
+    pub(crate) fn view_menu_checked(&self, command: CommandId, args: &Value) -> Option<bool> {
         let v = &self.settings.view;
         let arg = args.as_object().and_then(|m| m.values().next());
         let arg = arg.and_then(Value::as_str);
@@ -404,6 +404,12 @@ impl App {
             "view.toggle_edge_guide" => v.edge_guide,
             "view.toggle_tab_spaces" => v.use_spaces,
             "view.toggle_auto_indent" => v.auto_indent,
+            "edit.rectangular_select" => {
+                matches!(
+                    self.active.map(|i| self.docs[i].view),
+                    Some(DocView::Scintilla(_))
+                ) && self.editor.rectangular_select_active()
+            }
             _ => return None,
         })
     }
