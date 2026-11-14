@@ -70,6 +70,7 @@ impl App {
             file.stamp(),
         );
         let id = state.id();
+        self.add_recent(&path);
         {
             let sender = sender.clone();
             view.set_callback(Rc::new(move |event: &BigViewEvent| {

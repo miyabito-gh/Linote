@@ -155,14 +155,56 @@ pub struct Win32Prompts;
 
 const FILE_BUFFER: usize = 32 * 1024;
 
+/// 「テキストファイル」の種類に含める拡張子。
+pub const TEXT_EXTENSIONS: &[&str] = &[
+    "txt",
+    "log",
+    "md",
+    "markdown",
+    "csv",
+    "tsv",
+    "json",
+    "xml",
+    "html",
+    "htm",
+    "css",
+    "js",
+    "ts",
+    "rs",
+    "c",
+    "h",
+    "cpp",
+    "hpp",
+    "cs",
+    "java",
+    "py",
+    "ps1",
+    "bat",
+    "cmd",
+    "sql",
+    "ini",
+    "toml",
+    "yaml",
+    "yml",
+    "cfg",
+    "conf",
+    "properties",
+];
+
+/// ファイルダイアログの種類の指定（「表示名\0パターン\0」の並びを、空の項目で終える）。
+/// 先頭（既定）は「すべてのファイル」。
 fn filter_wide() -> Vec<u16> {
-    // 「表示名\0パターン\0」の並びを、空の項目で終える。
+    let patterns = TEXT_EXTENSIONS
+        .iter()
+        .map(|e| format!("*.{e}"))
+        .collect::<Vec<_>>()
+        .join(";");
     let mut v = Vec::new();
     for part in [
-        "テキスト文書 (*.txt)",
-        "*.txt",
         "すべてのファイル (*.*)",
         "*.*",
+        "テキストファイル",
+        patterns.as_str(),
     ] {
         v.extend(part.encode_utf16());
         v.push(0);
@@ -195,6 +237,7 @@ impl Prompts for Win32Prompts {
             lStructSize: std::mem::size_of::<OPENFILENAMEW>() as u32,
             hwndOwner: owner,
             lpstrFilter: PCWSTR(filter.as_ptr()),
+            nFilterIndex: 1,
             lpstrFile: PWSTR(buffer.as_mut_ptr()),
             nMaxFile: buffer.len() as u32,
             lpstrInitialDir: dir.as_ref().map_or(PCWSTR::null(), |d| PCWSTR(d.as_ptr())),
@@ -231,6 +274,7 @@ impl Prompts for Win32Prompts {
             lStructSize: std::mem::size_of::<OPENFILENAMEW>() as u32,
             hwndOwner: owner,
             lpstrFilter: PCWSTR(filter.as_ptr()),
+            nFilterIndex: 1,
             lpstrFile: PWSTR(buffer.as_mut_ptr()),
             nMaxFile: buffer.len() as u32,
             lpstrDefExt: PCWSTR(ext.as_ptr()),
@@ -567,6 +611,22 @@ mod tests {
         v.push(0);
         v.resize(v.len() + 8, 0);
         v
+    }
+
+    #[test]
+    fn filter_lists_all_files_first_then_text_files() {
+        let f = filter_wide();
+        let parts: Vec<String> = f
+            .split(|&c| c == 0)
+            .filter(|p| !p.is_empty())
+            .map(String::from_utf16_lossy)
+            .collect();
+        assert_eq!(parts.len(), 4);
+        assert_eq!(parts[0], "すべてのファイル (*.*)");
+        assert_eq!(parts[1], "*.*");
+        assert!(parts[3].starts_with("*.txt;*.log;*.md;"));
+        assert!(parts[3].contains("*.properties"));
+        assert_eq!(f[f.len() - 2..], [0, 0]);
     }
 
     #[test]

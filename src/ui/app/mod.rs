@@ -28,6 +28,7 @@ mod bigdoc;
 mod closing;
 mod commands;
 mod fileio;
+mod fileops;
 mod memos;
 mod preview;
 mod recover;
@@ -56,9 +57,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
     LoadCursorW, PostMessageW, PostQuitMessage, SendMessageW, SetCursor, SetTimer, SetWindowPos,
     SetWindowTextW, ShowWindow, TranslateMessage, HMENU, HTCLIENT, IDC_SIZEWE, MSG, SWP_NOACTIVATE,
     SWP_NOZORDER, SW_HIDE, SW_SHOW, SW_SHOWDEFAULT, WM_ACTIVATE, WM_CAPTURECHANGED, WM_CLOSE,
-    WM_COMMAND, WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND, WM_HOTKEY, WM_INITMENUPOPUP,
-    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONUP, WM_MOUSEMOVE, WM_NOTIFY,
-    WM_PAINT, WM_SETCURSOR, WM_SETFOCUS, WM_SETTINGCHANGE, WM_SIZE, WM_TIMER,
+    WM_COMMAND, WM_DESTROY, WM_DPICHANGED, WM_DROPFILES, WM_ERASEBKGND, WM_HOTKEY,
+    WM_INITMENUPOPUP, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONUP, WM_MOUSEMOVE,
+    WM_NOTIFY, WM_PAINT, WM_SETCURSOR, WM_SETFOCUS, WM_SETTINGCHANGE, WM_SIZE, WM_TIMER,
 };
 
 use crate::appdata::{AppPaths, Settings, ThemeMode};
@@ -630,6 +631,10 @@ impl App {
             hooks: Hooks::default(),
         };
         app.editor.apply_theme(&app.theme, Language::PlainText);
+        // ファイルのドラッグ＆ドロップ（タブバー・状態表示・本文）。本文は Scintilla の
+        // ドロップ対象が親へ WM_DROPFILES として転送する（third_party/VENDORED.md を参照）。
+        // SAFETY: 自分のウィンドウ。
+        unsafe { windows::Win32::UI::Shell::DragAcceptFiles(hwnd, true) };
         Ok(app)
     }
 
@@ -1507,6 +1512,10 @@ impl App {
                 Some(LRESULT(0))
             }
             WM_HOTKEY => self.on_hotkey(wparam),
+            WM_DROPFILES => {
+                self.on_drop_files(windows::Win32::UI::Shell::HDROP(wparam.0 as *mut _));
+                Some(LRESULT(0))
+            }
             WM_TIMER if wparam.0 == TIMER_AUTOSAVE => {
                 self.autosave_tick(false);
                 Some(LRESULT(0))

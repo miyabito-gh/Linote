@@ -25,6 +25,7 @@ pub const SCI_GOTOLINE: u32 = 2024;
 pub const SCI_GOTOPOS: u32 = 2025;
 pub const SCI_SETANCHOR: u32 = 2026;
 pub const SCI_SETEOLMODE: u32 = 2031;
+pub const SCI_CONVERTEOLS: u32 = 2029;
 pub const SCI_SETTABWIDTH: u32 = 2036;
 pub const SCI_SETCODEPAGE: u32 = 2037;
 pub const SCI_GETTEXTRANGEFULL: u32 = 2039;

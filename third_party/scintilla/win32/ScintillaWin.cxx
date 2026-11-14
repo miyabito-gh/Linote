@@ -349,6 +349,7 @@ class ScintillaWin :
 	HRGN hRgnUpdate;
 
 	bool hasOKText;
+	bool hasFiles; // Linote: files dragged from Explorer (CF_HDROP)
 
 	CLIPFORMAT cfColumnSelect;
 	CLIPFORMAT cfBorlandIDEBlockType;
@@ -569,6 +570,7 @@ ScintillaWin::ScintillaWin(HWND hwnd) {
 	hRgnUpdate = {};
 
 	hasOKText = false;
+	hasFiles = false;
 
 	// There does not seem to be a real standard for indicating that the clipboard
 	// contains a rectangular selection, so copy Developer Studio and Borland Delphi.
@@ -3418,7 +3420,12 @@ STDMETHODIMP ScintillaWin::DragEnter(LPDATAOBJECT pIDataSource, DWORD grfKeyStat
 	FORMATETC fmtu = {CF_UNICODETEXT, nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL };
 	const HRESULT hrHasUText = pIDataSource->QueryGetData(&fmtu);
 	hasOKText = (hrHasUText == S_OK);
-	if (hasOKText) {
+	// Linote: accept files (CF_HDROP); Drop forwards them to the parent as WM_DROPFILES.
+	FORMATETC fmth = {CF_HDROP, nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL};
+	hasFiles = !hasOKText && (pIDataSource->QueryGetData(&fmth) == S_OK);
+	if (hasFiles) {
+		*pdwEffect = DROPEFFECT_COPY;
+	} else if (hasOKText) {
 		*pdwEffect = EffectFromState(grfKeyState);
 	} else {
 		*pdwEffect = DROPEFFECT_NONE;
@@ -3429,6 +3436,10 @@ STDMETHODIMP ScintillaWin::DragEnter(LPDATAOBJECT pIDataSource, DWORD grfKeyStat
 
 STDMETHODIMP ScintillaWin::DragOver(DWORD grfKeyState, POINTL pt, PDWORD pdwEffect) {
 	try {
+		if (hasFiles) {
+			*pdwEffect = DROPEFFECT_COPY;
+			return S_OK;
+		}
 		if (!hasOKText || pdoc->IsReadOnly()) {
 			*pdwEffect = DROPEFFECT_NONE;
 			return S_OK;
@@ -3467,6 +3478,34 @@ STDMETHODIMP ScintillaWin::Drop(LPDATAOBJECT pIDataSource, DWORD grfKeyState,
 			return E_POINTER;
 
 		SetDragPosition(SelectionPosition(Sci::invalidPosition));
+
+		// Linote: dropped files are handed to the parent window as WM_DROPFILES
+		// (a copy of the HDROP; the receiver releases it with DragFinish).
+		if (hasFiles) {
+			hasFiles = false;
+			FORMATETC fmth = {CF_HDROP, nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL};
+			STGMEDIUM mh{};
+			if (SUCCEEDED(pIDataSource->GetData(&fmth, &mh)) && mh.hGlobal) {
+				const SIZE_T size = ::GlobalSize(mh.hGlobal);
+				HGLOBAL copy = ::GlobalAlloc(GMEM_MOVEABLE, size);
+				if (copy) {
+					void *src = ::GlobalLock(mh.hGlobal);
+					void *dst = ::GlobalLock(copy);
+					if (src && dst) {
+						memcpy(dst, src, size);
+					}
+					if (dst) ::GlobalUnlock(copy);
+					if (src) ::GlobalUnlock(mh.hGlobal);
+					HWND parent = ::GetParent(MainHWND());
+					if (!(src && dst && parent &&
+					      ::PostMessageW(parent, WM_DROPFILES, reinterpret_cast<WPARAM>(copy), 0))) {
+						::GlobalFree(copy);
+					}
+				}
+				::ReleaseStgMedium(&mh);
+			}
+			return S_OK;
+		}
 
 		std::string putf;
 		FORMATETC fmtu = {CF_UNICODETEXT, nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL};

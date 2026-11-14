@@ -93,6 +93,7 @@ pub(super) fn run(ctx: &Ctx) -> Check {
     clipboard_tab()?;
     menu_keys_and_settings(ctx)?;
     super::integration_i2::run(ctx)?;
+    super::integration_u1::run(ctx)?;
     Ok(())
 }
 
@@ -776,6 +777,8 @@ fn menu_keys_and_settings(ctx: &Ctx) -> Check {
     step(|app| app.set_theme_mode(crate::appdata::ThemeMode::Dark))?;
 
     // 壊れた設定ファイルは上書きしない。
+    // 進行中の設定の書き出し（最近使ったファイルの記録など）が終わるのを待つ。
+    std::thread::sleep(std::time::Duration::from_millis(400));
     let broken: PathBuf = settings.clone();
     std::fs::write(&broken, "{ broken").map_err(|e| e.to_string())?;
     step(|app| {
