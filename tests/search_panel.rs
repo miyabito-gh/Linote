@@ -220,6 +220,36 @@ fn panel_greps_opens_hits_and_disables_replace() {
     }
     assert_eq!(panel.options().unwrap().query, "changed-query");
 
+    // A multi-line error must retain all text, with a scrollable viewport.
+    let long_status = "長い検索エラーと対象ファイルの説明 ".repeat(40);
+    panel.set_status(&long_status, true);
+    unsafe {
+        let status = windows::Win32::UI::WindowsAndMessaging::GetDlgItem(Some(hwnd), 213).unwrap();
+        assert!(SendMessageW(status, 0x00BA /* EM_GETLINECOUNT */, None, None).0 > 1);
+        let mut text = vec![0u16; long_status.encode_utf16().count() + 1];
+        let len = windows::Win32::UI::WindowsAndMessaging::GetWindowTextW(status, &mut text).max(0)
+            as usize;
+        assert_eq!(String::from_utf16_lossy(&text[..len]), long_status);
+        let style = windows::Win32::UI::WindowsAndMessaging::GetWindowLongPtrW(
+            status,
+            windows::Win32::UI::WindowsAndMessaging::GWL_STYLE,
+        ) as u32;
+        assert_ne!(
+            style & windows::Win32::UI::WindowsAndMessaging::WS_VSCROLL.0,
+            0
+        );
+        SendMessageW(
+            status,
+            windows::Win32::UI::WindowsAndMessaging::WM_KEYDOWN,
+            Some(WPARAM(0x1B)),
+            None,
+        );
+        assert!(
+            !panel.is_visible(),
+            "長い状態文を読んでいるときもEscで閉じる"
+        );
+    }
+
     panel.hide();
     assert!(!panel.is_visible());
     assert!(events.borrow().contains(&"closed".to_string()));

@@ -101,9 +101,26 @@ pub fn compute_layout_with_tab_height(
     bottom_height: Option<i32>,
     tab_height: i32,
 ) -> Layout {
+    compute_layout_with_bars(client, dpi, right_ratio, bottom_height, tab_height, true)
+}
+
+/// 文書を狭めるバーの実寸と、ステータスバー表示に応じた配置。
+/// 非表示時の status は高さ0にし、編集欄・差し込み欄を下端まで広げる。
+pub fn compute_layout_with_bars(
+    client: RECT,
+    dpi: u32,
+    right_ratio: Option<f32>,
+    bottom_height: Option<i32>,
+    tab_height: i32,
+    status_visible: bool,
+) -> Layout {
     let (l, t, r, b) = (client.left, client.top, client.right, client.bottom);
     let tab_h = tab_height.max(0).min((b - t).max(0));
-    let status_h = scale(dims::STATUS_HEIGHT, dpi).min((b - t - tab_h).max(0));
+    let status_h = if status_visible {
+        scale(dims::STATUS_HEIGHT, dpi).min((b - t - tab_h).max(0))
+    } else {
+        0
+    };
     let tabs = rect(l, t, r, t + tab_h);
     let status = rect(l, b - status_h, r, b);
     let mut body_bottom = status.top;
@@ -221,6 +238,43 @@ impl UiFont {
 
     pub fn handle(&self) -> HFONT {
         self.font
+    }
+
+    /// Measure with the same UI font used by controls. A width enables word wrapping.
+    pub fn measure_text(&self, text: &str, max_width: Option<i32>) -> SIZE {
+        let mut text: Vec<u16> = text.encode_utf16().collect();
+        if text.is_empty() {
+            text.push(b' ' as u16);
+        }
+        let mut rect = RECT {
+            right: max_width.unwrap_or(0).max(1),
+            ..Default::default()
+        };
+        // SAFETY: measurement-only DC, with its original font restored before deletion.
+        unsafe {
+            let dc = CreateCompatibleDC(None);
+            if dc.is_invalid() {
+                return SIZE {
+                    cx: 0,
+                    cy: self.text_height,
+                };
+            }
+            let old = SelectObject(dc, self.font.into());
+            let flags = windows::Win32::Graphics::Gdi::DT_CALCRECT
+                | DT_NOPREFIX
+                | if max_width.is_some() {
+                    windows::Win32::Graphics::Gdi::DT_WORDBREAK
+                } else {
+                    DT_SINGLELINE
+                };
+            DrawTextW(dc, &mut text, &mut rect, flags);
+            SelectObject(dc, old);
+            let _ = DeleteDC(dc);
+        }
+        SIZE {
+            cx: rect.right - rect.left,
+            cy: rect.bottom - rect.top,
+        }
     }
 }
 
@@ -528,6 +582,40 @@ mod tests {
             l.bottom.unwrap(),
         ] {
             assert!(r.right >= r.left && r.bottom >= r.top, "{r:?}");
+        }
+    }
+
+    #[test]
+    fn hidden_status_bar_gives_its_height_to_the_document_at_each_dpi() {
+        for dpi in [96, 144, 192] {
+            for bottom in [None, Some(70)] {
+                let shown = compute_layout_with_bars(
+                    client(800, 600),
+                    dpi,
+                    Some(0.4),
+                    bottom,
+                    scale(24, dpi),
+                    true,
+                );
+                let hidden = compute_layout_with_bars(
+                    client(800, 600),
+                    dpi,
+                    Some(0.4),
+                    bottom,
+                    scale(24, dpi),
+                    false,
+                );
+                assert_eq!(hidden.status.top, hidden.status.bottom);
+                assert_eq!(hidden.status.bottom, 600);
+                assert_eq!(
+                    hidden.editor.bottom - shown.editor.bottom,
+                    scale(dims::STATUS_HEIGHT, dpi)
+                );
+                assert_eq!(hidden.right.unwrap().bottom, hidden.editor.bottom);
+                if let Some(panel) = hidden.bottom {
+                    assert_eq!(panel.bottom, 600);
+                }
+            }
         }
     }
 

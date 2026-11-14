@@ -159,6 +159,8 @@ pub struct ViewSettings {
     pub show_whitespace: bool,
     pub show_eol: bool,
     pub line_numbers: bool,
+    /// ステータスバーの表示（非表示中も情報・通知を保持する）。
+    pub status_bar: bool,
     pub highlight_current_line: bool,
     pub highlight_braces: bool,
     /// 折り返し桁のガイド線（`wrap` が桁指定のときだけ出す）。
@@ -181,6 +183,7 @@ impl Default for ViewSettings {
             show_whitespace: false,
             show_eol: false,
             line_numbers: true,
+            status_bar: true,
             highlight_current_line: true,
             highlight_braces: true,
             edge_guide: true,
@@ -223,6 +226,7 @@ impl ViewSettings {
             show_whitespace: flag("show_whitespace", d.show_whitespace),
             show_eol: flag("show_eol", d.show_eol),
             line_numbers: flag("line_numbers", d.line_numbers),
+            status_bar: flag("status_bar", d.status_bar),
             highlight_current_line: flag("highlight_current_line", d.highlight_current_line),
             highlight_braces: flag("highlight_braces", d.highlight_braces),
             edge_guide: flag("edge_guide", d.edge_guide),
@@ -243,6 +247,7 @@ impl ViewSettings {
         m.insert("show_whitespace".into(), self.show_whitespace.into());
         m.insert("show_eol".into(), self.show_eol.into());
         m.insert("line_numbers".into(), self.line_numbers.into());
+        m.insert("status_bar".into(), self.status_bar.into());
         m.insert(
             "highlight_current_line".into(),
             self.highlight_current_line.into(),
@@ -882,6 +887,15 @@ impl Settings {
                 return Err(corrupt("view がオブジェクトではありません"));
             };
             settings.view = ViewSettings::from_value(&view);
+            // Keep fields added by a newer application version when editing
+            // a known visibility flag in this version.
+            let mut unknown = view;
+            for name in settings.view.to_value().keys() {
+                unknown.remove(name);
+            }
+            if !unknown.is_empty() {
+                settings.extra.insert("view".into(), Value::Object(unknown));
+            }
         }
         if let Some(print) = map.remove("print") {
             let Value::Object(print) = print else {
@@ -963,7 +977,12 @@ impl Settings {
         map.insert("external_change".into(), self.external_change.name().into());
         let grep = self.grep.to_value(map.get("grep"));
         map.insert("grep".into(), grep);
-        map.insert("view".into(), Value::Object(self.view.to_value()));
+        let mut view = map
+            .remove("view")
+            .and_then(|v| v.as_object().cloned())
+            .unwrap_or_default();
+        view.extend(self.view.to_value());
+        map.insert("view".into(), Value::Object(view));
         map.insert("print".into(), Value::Object(self.print.to_value()));
         map.insert("restore_session".into(), self.restore_session.into());
         map.insert("new_file".into(), Value::Object(self.new_file.to_value()));
@@ -1112,6 +1131,18 @@ mod tests {
             .window
             .unwrap();
         assert!(!ok.maximized);
+    }
+
+    #[test]
+    fn status_bar_defaults_on_and_round_trips_with_unknown_view_fields() {
+        for text in ["{}", r#"{"view":{"status_bar":"off"}}"#] {
+            assert!(Settings::from_json(text).unwrap().view.status_bar);
+        }
+        let s = Settings::from_json(r#"{"view":{"status_bar":false,"future":123}}"#).unwrap();
+        assert!(!s.view.status_bar);
+        let json = s.to_json();
+        assert_eq!(Settings::from_json(&json).unwrap(), s);
+        assert!(json.contains("future"));
     }
 
     #[test]
@@ -1345,6 +1376,7 @@ mod tests {
             show_whitespace: true,
             show_eol: true,
             line_numbers: false,
+            status_bar: false,
             highlight_current_line: false,
             highlight_braces: false,
             edge_guide: false,

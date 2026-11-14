@@ -39,11 +39,11 @@ use windows::Win32::UI::WindowsAndMessaging::{
     RegisterClassExW, SetWindowLongPtrW, SetWindowPos, ShowWindow, BN_CLICKED, BS_PUSHBUTTON,
     CREATESTRUCTW, ES_AUTOHSCROLL, GWLP_USERDATA, GWLP_WNDPROC, HMENU, IDC_ARROW, LBN_DBLCLK,
     LBS_NOINTEGRALHEIGHT, LBS_NOTIFY, LB_ADDSTRING, LB_GETCURSEL, LB_RESETCONTENT, LB_SETCURSEL,
-    SWP_NOZORDER, SW_HIDE, SW_SHOW, WM_ACTIVATE, WM_CHAR, WM_CLOSE, WM_COMMAND, WM_CREATE,
-    WM_CTLCOLOREDIT, WM_CTLCOLORLISTBOX, WM_ERASEBKGND, WM_KEYDOWN, WM_NCDESTROY, WM_SETFONT,
-    WM_SIZE, WNDCLASSEXW, WNDPROC, WS_BORDER, WS_CAPTION, WS_CHILD, WS_CLIPCHILDREN,
-    WS_EX_CLIENTEDGE, WS_EX_TOOLWINDOW, WS_POPUP, WS_SYSMENU, WS_TABSTOP, WS_THICKFRAME,
-    WS_VISIBLE, WS_VSCROLL,
+    MINMAXINFO, SWP_NOMOVE, SWP_NOZORDER, SW_HIDE, SW_SHOW, WM_ACTIVATE, WM_CHAR, WM_CLOSE,
+    WM_COMMAND, WM_CREATE, WM_CTLCOLOREDIT, WM_CTLCOLORLISTBOX, WM_ERASEBKGND, WM_GETMINMAXINFO,
+    WM_KEYDOWN, WM_NCDESTROY, WM_SETFONT, WM_SIZE, WNDCLASSEXW, WNDPROC, WS_BORDER, WS_CAPTION,
+    WS_CHILD, WS_CLIPCHILDREN, WS_EX_CLIENTEDGE, WS_EX_TOOLWINDOW, WS_POPUP, WS_SYSMENU,
+    WS_TABSTOP, WS_THICKFRAME, WS_VISIBLE, WS_VSCROLL,
 };
 
 use crate::core::{
@@ -181,6 +181,7 @@ impl MemoPanel {
         match created {
             Ok(hwnd) => {
                 let panel = MemoPanel { hwnd };
+                panel.ensure_minimum_size();
                 panel.center_on(owner);
                 Ok(panel)
             }
@@ -190,6 +191,27 @@ impl MemoPanel {
                 "メモの小窓",
                 format!("作れませんでした: {e}"),
             )),
+        }
+    }
+
+    fn ensure_minimum_size(&self) {
+        if let Some((min_w, min_h)) = with_state(self.hwnd, |s| s.minimum_outer_size()) {
+            let mut rect = RECT::default();
+            // SAFETY: Compute the size before resizing, so WM_SIZE can borrow State independently.
+            unsafe {
+                let _ = GetWindowRect(self.hwnd, &mut rect);
+                if rect.right - rect.left < min_w || rect.bottom - rect.top < min_h {
+                    let _ = SetWindowPos(
+                        self.hwnd,
+                        None,
+                        0,
+                        0,
+                        (rect.right - rect.left).max(min_w),
+                        (rect.bottom - rect.top).max(min_h),
+                        SWP_NOMOVE | SWP_NOZORDER,
+                    );
+                }
+            }
         }
     }
 
@@ -274,6 +296,7 @@ impl MemoPanel {
             s.apply_font();
             s.layout();
         });
+        self.ensure_minimum_size();
     }
 
     /// 破棄する（所有者の破棄でも自動的に破棄される）。
@@ -380,6 +403,35 @@ impl State {
         }
     }
 
+    fn minimum_outer_size(&self) -> (i32, i32) {
+        use windows::Win32::UI::WindowsAndMessaging::{GetWindowTextLengthW, GetWindowTextW};
+        let button_width = [self.button, self.delete_button]
+            .into_iter()
+            .map(|h| {
+                let mut text = vec![0u16; unsafe { GetWindowTextLengthW(h) }.max(0) as usize + 1];
+                let len = unsafe { GetWindowTextW(h, &mut text) }.max(0) as usize;
+                self.font
+                    .measure_text(&String::from_utf16_lossy(&text[..len]), None)
+                    .cx
+                    + scale(24, self.dpi)
+            })
+            .max()
+            .unwrap_or(0);
+        let (mut outer, mut client) = (RECT::default(), RECT::default());
+        unsafe {
+            let _ = GetWindowRect(self.hwnd, &mut outer);
+            let _ = GetClientRect(self.hwnd, &mut client);
+        }
+        (
+            button_width * 2 + scale(24, self.dpi) + outer.right - outer.left - client.right
+                + client.left,
+            self.font.measure_text("あAg", None).cy * 2 + scale(150, self.dpi) + outer.bottom
+                - outer.top
+                - client.bottom
+                + client.top,
+        )
+    }
+
     fn layout(&self) {
         let mut rc = RECT::default();
         // SAFETY: 自分のウィンドウ。
@@ -387,8 +439,8 @@ impl State {
             let _ = GetClientRect(self.hwnd, &mut rc);
         }
         let m = scale(8, self.dpi);
-        let edit_h = scale(28, self.dpi);
-        let button_h = scale(30, self.dpi);
+        let edit_h = self.font.measure_text("あAg", None).cy + scale(12, self.dpi);
+        let button_h = edit_h;
         let (w, h) = (rc.right - rc.left, rc.bottom - rc.top);
         let inner = (w - 2 * m).max(0);
         let list_h = (h - edit_h - button_h - 4 * m).max(0);
@@ -653,6 +705,16 @@ extern "system" fn panel_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPAR
                 set_dark_title_bar(hwnd, s.theme.dark);
                 s.layout();
             });
+            LRESULT(0)
+        }
+        WM_GETMINMAXINFO => {
+            if let Some((w, h)) = with_state(hwnd, |s| s.minimum_outer_size()) {
+                if lparam.0 != 0 {
+                    let info = unsafe { &mut *(lparam.0 as *mut MINMAXINFO) };
+                    info.ptMinTrackSize.x = w;
+                    info.ptMinTrackSize.y = h;
+                }
+            }
             LRESULT(0)
         }
         WM_SIZE => {

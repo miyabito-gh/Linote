@@ -32,6 +32,7 @@ use crate::ui::editor::Language;
 
 mod integration;
 mod integration_i2;
+mod integration_status_bar;
 mod integration_u1;
 mod integration_u2;
 mod integration_u3;

@@ -1468,12 +1468,13 @@ impl App {
         unsafe {
             let _ = GetClientRect(self.hwnd, &mut client);
         }
-        self.layout = window::compute_layout_with_tab_height(
+        self.layout = window::compute_layout_with_bars(
             client,
             self.dpi,
             self.right.map(|r| r.ratio),
             self.bottom.map(|b| b.height_dip),
             self.font.tab_height(self.dpi),
+            self.settings.view.status_bar,
         );
         let l = self.layout;
         let place = |h: HWND, r: RECT| {
@@ -1882,7 +1883,13 @@ impl App {
                 }
             }
             Some(TabHit::Empty) | None => {
-                if let Some(seg) = self.status.hit_test(x, y) {
+                if let Some(seg) = self
+                    .settings
+                    .view
+                    .status_bar
+                    .then(|| self.status.hit_test(x, y))
+                    .flatten()
+                {
                     if let Some(hook) = self.hooks.status_click {
                         hook(self, seg);
                     }
@@ -1923,7 +1930,9 @@ impl App {
         unsafe {
             let hdc = BeginPaint(self.hwnd, &mut ps);
             self.tabs.paint(hdc, &self.theme, &self.font);
-            self.status.paint(hdc, &self.theme, &self.font);
+            if self.settings.view.status_bar {
+                self.status.paint(hdc, &self.theme, &self.font);
+            }
             if let Some(s) = self.layout.splitter {
                 let c = window::Canvas { hdc, dpi: self.dpi };
                 c.fill(&s, self.theme.ui.bar_bg);

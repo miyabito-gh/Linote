@@ -581,7 +581,7 @@ fn input_template() -> Vec<u8> {
     push_wstr(&mut v, "Yu Gothic UI");
     push_item(
         &mut v,
-        WS_CHILD | WS_VISIBLE,
+        WS_CHILD | WS_VISIBLE | 0x80, /* SS_NOPREFIX */
         (10, 8, 190, 10),
         ID_INPUT_LABEL as u16,
         0x0082,
@@ -614,6 +614,85 @@ fn input_template() -> Vec<u8> {
     v
 }
 
+/// Native input dialogs already use font-relative dialog units. Expand the label
+/// when its actual text wraps, and move following controls by the measured delta.
+fn fit_input_label(dlg: HWND, text: &[u16]) {
+    use windows::Win32::Foundation::{POINT, RECT};
+    use windows::Win32::Graphics::Gdi::{
+        DrawTextW, GetDC, ReleaseDC, RestoreDC, SaveDC, ScreenToClient, SelectObject, DT_CALCRECT,
+        DT_NOPREFIX, DT_WORDBREAK, HFONT,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetWindowRect, MoveWindow, SetWindowPos, SWP_NOZORDER, WM_GETFONT,
+    };
+    unsafe {
+        let Ok(label) = GetDlgItem(Some(dlg), ID_INPUT_LABEL) else {
+            return;
+        };
+        let mut rect = RECT::default();
+        if GetWindowRect(label, &mut rect).is_err() {
+            return;
+        }
+        let width = rect.right - rect.left;
+        let old_height = rect.bottom - rect.top;
+        let dc = GetDC(Some(label));
+        let saved = SaveDC(dc);
+        let font = SendMessageW(label, WM_GETFONT, None, None);
+        if font.0 != 0 {
+            SelectObject(dc, HFONT(font.0 as *mut _).into());
+        }
+        let mut measured = RECT {
+            right: width,
+            ..Default::default()
+        };
+        let mut wide = text.strip_suffix(&[0]).unwrap_or(text).to_vec();
+        DrawTextW(
+            dc,
+            &mut wide,
+            &mut measured,
+            DT_CALCRECT | DT_WORDBREAK | DT_NOPREFIX,
+        );
+        let _ = RestoreDC(dc, saved);
+        ReleaseDC(Some(label), dc);
+        let delta = (measured.bottom - measured.top + 2 - old_height).max(0);
+        if delta == 0 {
+            return;
+        }
+        for id in [ID_INPUT_LABEL, ID_INPUT_EDIT, IDOK.0, IDCANCEL.0] {
+            let Ok(ctl) = GetDlgItem(Some(dlg), id) else {
+                continue;
+            };
+            let mut r = RECT::default();
+            let _ = GetWindowRect(ctl, &mut r);
+            let mut point = POINT {
+                x: r.left,
+                y: r.top,
+            };
+            let _ = ScreenToClient(dlg, &mut point);
+            let is_label = id == ID_INPUT_LABEL;
+            let _ = MoveWindow(
+                ctl,
+                point.x,
+                point.y + if is_label { 0 } else { delta },
+                r.right - r.left,
+                r.bottom - r.top + if is_label { delta } else { 0 },
+                true,
+            );
+        }
+        let mut r = RECT::default();
+        let _ = GetWindowRect(dlg, &mut r);
+        let _ = SetWindowPos(
+            dlg,
+            None,
+            r.left,
+            (r.top - delta / 2).max(0),
+            r.right - r.left,
+            r.bottom - r.top + delta,
+            SWP_NOZORDER,
+        );
+    }
+}
+
 unsafe extern "system" fn input_proc(
     hwnd: HWND,
     msg: u32,
@@ -632,6 +711,7 @@ unsafe extern "system" fn input_proc(
                 );
                 let _ = SetDlgItemTextW(hwnd, ID_INPUT_LABEL, PCWSTR(state.label.as_ptr()));
                 let _ = SetDlgItemTextW(hwnd, ID_INPUT_EDIT, PCWSTR(state.initial.as_ptr()));
+                fit_input_label(hwnd, &state.label);
                 windows::Win32::UI::WindowsAndMessaging::SetWindowLongPtrW(
                     hwnd,
                     windows::Win32::UI::WindowsAndMessaging::GWLP_USERDATA,

@@ -10,6 +10,10 @@
 //! - 試験用に、操作役（`driver`）を渡せる。ダイアログが開いた直後に呼ばれ、部品の操作と
 //!   ボタンの押下を行う（[`set_check`]、[`press`] など）。
 
+#[cfg(test)]
+mod layout_tests;
+mod scroll;
+
 use windows::core::{PCWSTR, PWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -43,6 +47,7 @@ use crate::ui::window::UiFont;
 pub const ID_APPLY: i32 = 3003;
 const ID_BANNER: i32 = 3001;
 const ID_PAGE_LIST: i32 = 3002;
+const ID_PAGE_HOST_BASE: i32 = 3500;
 /// 項目の部品の ID の最初（項目の通し番号 × 8 を足す）。
 const ID_ITEM_BASE: i32 = 4000;
 /// 項目の部品の ID の枝番。
@@ -126,6 +131,7 @@ struct State<'a> {
     defs: Vec<CommandDef>,
     key_visible: Vec<KeyRow>,
     driver: Option<&'a mut (dyn FnMut(HWND) + 'a)>,
+    dpi: u32,
 }
 
 /// 設定画面を開く。閉じるまで戻らない。`driver` は試験用の操作役（普段は `None`）。
@@ -134,6 +140,15 @@ pub fn run<'a>(
     session: &'a mut (dyn SettingsSession + 'a),
     driver: Option<&'a mut (dyn FnMut(HWND) + 'a)>,
 ) {
+    run_at_dpi(owner, session, driver, dpi_for_window(owner));
+}
+
+fn run_at_dpi<'a>(
+    owner: HWND,
+    session: &'a mut (dyn SettingsSession + 'a),
+    driver: Option<&'a mut (dyn FnMut(HWND) + 'a)>,
+    dpi: u32,
+) {
     let baseline = session.current();
     let mut state = State {
         session,
@@ -141,10 +156,11 @@ pub fn run<'a>(
         baseline,
         items: all_items(),
         page_controls: Vec::new(),
-        font: UiFont::for_dpi(dpi_for_window(owner)),
+        font: UiFont::for_dpi(dpi),
         defs: Vec::new(),
         key_visible: Vec::new(),
         driver,
+        dpi,
     };
     state.defs = state.session.command_defs();
     // SAFETY: 共通コントロール（ListView）の登録。
@@ -254,41 +270,140 @@ fn font_label(name: &str, size: u32) -> String {
     format!("{face}、{size} pt")
 }
 
+fn text_dip_height(font: &UiFont, text: &str, width: i32, dpi: u32) -> i32 {
+    let h = font.measure_text(text, Some(scale(width.max(1), dpi))).cy;
+    ((h * 96 + dpi as i32 - 1) / dpi.max(1) as i32).max(1)
+}
+fn row_height(item: &Item, font: &UiFont, page_w: i32, label_w: i32, row: i32, dpi: u32) -> i32 {
+    match item.kind {
+        ItemKind::Font => row * 2 + text_dip_height(font, &"Ｍ".repeat(48), page_w, dpi) + 8,
+        ItemKind::Check => row.max(text_dip_height(font, item.label, page_w - 24, dpi) + 10),
+        _ => row.max(text_dip_height(font, item.label, label_w - 8, dpi) + 10),
+    }
+}
+fn key_row_height(font: &UiFont, width: i32, dpi: u32) -> i32 {
+    let text = text_dip_height(font, "すべて既定に戻す", ((width - 8) / 2 - 20).max(1), dpi);
+    (text + 12).max(28)
+}
+const KEY_HELP: &str = "一覧でコマンドを選び、新しいキーを押して「割り当て」を選びます。Ctrl／Alt／Shift と文字・F キーなどを組み合わせられます。使用中のキーは付け替えを確認します。";
+
+// GetDlgItem only searches direct children. Settings fields now live in scrollable pages.
+fn dialog_control(dlg: HWND, id: i32) -> windows::core::Result<HWND> {
+    unsafe {
+        if let Ok(control) = GetDlgItem(Some(dlg), id) {
+            return Ok(control);
+        }
+        for page in 0..pages().len() {
+            if let Ok(host) = GetDlgItem(Some(dlg), ID_PAGE_HOST_BASE + page as i32) {
+                if let Ok(control) = GetDlgItem(Some(host), id) {
+                    return Ok(control);
+                }
+            }
+        }
+        GetDlgItem(Some(dlg), id)
+    }
+}
+
 /// ダイアログの部品を作る（`WM_INITDIALOG`）。
 fn build(dlg: HWND, state: &mut State<'_>, owner: HWND) {
-    let dpi = dpi_for_window(owner);
+    let dpi = state.dpi;
     let px = |n: i32| scale(n, dpi);
     set_text(dlg, "設定");
     let warning = state.session.warning();
-    let banner_h = if warning.is_some() { 52 } else { 0 };
-    let margin = 12;
-    let list_w = 150;
-    let page_w = 470;
-    let row_h = 28;
-    let max_rows = pages().iter().map(|p| p.items.len()).max().unwrap_or(0) as i32;
-    let body_top = margin + if banner_h > 0 { banner_h + 8 } else { 0 };
-    let has_keys = pages().iter().any(|p| p.kind == PageKind::Keys);
-    let body_h = (max_rows * row_h + 8)
-        .max(160)
-        .max(if has_keys { KEYS_BODY_H } else { 0 });
-    let client_w = margin + list_w + 14 + page_w + margin;
-    let client_h = body_top + body_h + 14 + 28 + margin;
-
-    // 大きさ（クライアント領域から外枠を逆算）と位置（所有者の中央）。
-    // SAFETY: 自分のダイアログと所有者の矩形を読むだけ。
+    let mut work = windows::Win32::Foundation::RECT {
+        right: px(1000),
+        bottom: px(800),
+        ..Default::default()
+    };
+    let extra_w;
+    let extra_h;
+    let mut owner_rect = windows::Win32::Foundation::RECT::default();
     unsafe {
+        use windows::Win32::Graphics::Gdi::{
+            GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+        };
+        let mut monitor = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if GetMonitorInfoW(
+            MonitorFromWindow(owner, MONITOR_DEFAULTTONEAREST),
+            &mut monitor,
+        )
+        .as_bool()
+        {
+            work = monitor.rcWork;
+        }
         let mut outer = windows::Win32::Foundation::RECT::default();
         let mut client = windows::Win32::Foundation::RECT::default();
         let _ = GetWindowRect(dlg, &mut outer);
         let _ = GetClientRect(dlg, &mut client);
-        let extra_w = (outer.right - outer.left) - (client.right - client.left);
-        let extra_h = (outer.bottom - outer.top) - (client.bottom - client.top);
-        let (w, h) = (px(client_w) + extra_w, px(client_h) + extra_h);
-        let mut o = windows::Win32::Foundation::RECT::default();
-        let _ = GetWindowRect(owner, &mut o);
-        let x = o.left + ((o.right - o.left) - w) / 2;
-        let y = o.top + ((o.bottom - o.top) - h) / 2;
-        let _ = SetWindowPos(dlg, None, x.max(0), y.max(0), w, h, SWP_NOZORDER);
+        extra_w = (outer.right - outer.left) - (client.right - client.left);
+        extra_h = (outer.bottom - outer.top) - (client.bottom - client.top);
+        let _ = GetWindowRect(owner, &mut owner_rect);
+    }
+    let dip = |pixels: i32| (pixels.max(0) as i64 * 96 / dpi.max(1) as i64) as i32;
+    let margin = 12;
+    let max_client_w = dip(work.right - work.left - extra_w);
+    let list_w = 150.min(max_client_w / 5).max(90);
+    let gutter = 20; // leave room for a page scrollbar without reducing field widths
+    let page_w = 620
+        .min(max_client_w - 2 * margin - list_w - 14 - gutter)
+        .max(260);
+    let choice_w = state
+        .items
+        .iter()
+        .filter_map(|(_, item)| {
+            if let ItemKind::Choice(choices) = item.kind {
+                Some(
+                    choices
+                        .iter()
+                        .map(|c| dip(state.font.measure_text(c.label, None).cx) + 36)
+                        .max()
+                        .unwrap_or(100),
+                )
+            } else {
+                None
+            }
+        })
+        .max()
+        .unwrap_or(200);
+    let label_w = (page_w - choice_w).clamp(page_w / 3, page_w / 2);
+    let row_h = (dip(state.font.measure_text("国Ag", None).cy) + 12).max(28);
+    let banner_h = warning.as_ref().map_or(0, |text| {
+        text_dip_height(&state.font, text, list_w + 14 + page_w + gutter, dpi) + 8
+    });
+    let body_top = margin + if banner_h > 0 { banner_h + 8 } else { 0 };
+    let mut page_heights = vec![8; pages().len()];
+    for (page, item) in &state.items {
+        page_heights[*page] += row_height(item, &state.font, page_w, label_w, row_h, dpi);
+    }
+    for (i, page) in pages().iter().enumerate() {
+        if page.kind == PageKind::Keys {
+            page_heights[i] = KEYS_BODY_H.max(
+                key_row_height(&state.font, page_w, dpi) * 5
+                    + 200
+                    + text_dip_height(&state.font, KEY_HELP, page_w, dpi),
+            );
+        }
+    }
+    let bw = (92.max(dip(state.font.measure_text("キャンセル", None).cx) + 24))
+        .min((margin + list_w + 14 + page_w + gutter - 16) / 3);
+    let button_h = row_h.max(text_dip_height(&state.font, "キャンセル", bw - 16, dpi) + 12);
+    let desired_body = page_heights.iter().copied().max().unwrap_or(160);
+    let body_h = desired_body
+        .min(dip(work.bottom - work.top - extra_h) - body_top - 14 - button_h - margin)
+        .max(row_h * 3);
+    let client_w = margin + list_w + 14 + page_w + gutter + margin;
+    let client_h = body_top + body_h + 14 + button_h + margin;
+    unsafe {
+        let w = px(client_w) + extra_w;
+        let h = px(client_h) + extra_h;
+        let x = (owner_rect.left + (owner_rect.right - owner_rect.left - w) / 2)
+            .clamp(work.left, (work.right - w).max(work.left));
+        let y = (owner_rect.top + (owner_rect.bottom - owner_rect.top - h) / 2)
+            .clamp(work.top, (work.bottom - h).max(work.top));
+        let _ = SetWindowPos(dlg, None, x, y, w, h, SWP_NOZORDER);
     }
 
     // 上部の警告。
@@ -329,11 +444,31 @@ fn build(dlg: HWND, state: &mut State<'_>, owner: HWND) {
     // ページごとの部品。
     state.page_controls = vec![Vec::new(); pages().len()];
     let page_x = margin + list_w + 14;
-    let mut row_in_page = vec![0i32; pages().len()];
+    let hosts: Vec<_> = page_heights
+        .iter()
+        .enumerate()
+        .map(|(i, height)| {
+            scroll::create(
+                dlg,
+                ID_PAGE_HOST_BASE + i as i32,
+                px(page_x),
+                px(body_top),
+                px(page_w + gutter),
+                px(body_h),
+                px(*height),
+            )
+        })
+        .collect();
+    for (page, host) in hosts.iter().enumerate() {
+        state.page_controls[page].push(*host);
+    }
+    let mut row_in_page = vec![4i32; pages().len()];
     for (index, (page, item)) in state.items.clone().into_iter().enumerate() {
-        let y = body_top + 4 + row_in_page[page] * row_h;
-        row_in_page[page] += 1;
-        let label_w = 210;
+        let parent = hosts[page];
+        let page_x = 0;
+        let y = row_in_page[page];
+        let item_h = row_height(item, &state.font, page_w, label_w, row_h, dpi);
+        row_in_page[page] += item_h;
         let ctl_x = page_x + label_w;
         let ctl_w = page_w - label_w;
         let mut made = Vec::new();
@@ -342,34 +477,34 @@ fn build(dlg: HWND, state: &mut State<'_>, owner: HWND) {
         match item.kind {
             ItemKind::Check => {
                 made.push(child(
-                    dlg,
+                    parent,
                     windows::core::w!("BUTTON"),
                     item.label,
-                    BS_AUTOCHECKBOX | tab,
+                    BS_AUTOCHECKBOX | 0x2000 /* BS_MULTILINE */ | tab,
                     0,
-                    (px(page_x), px(y), px(page_w), px(row_h - 4)),
+                    (px(page_x), px(y), px(page_w), px(item_h - 4)),
                     id(SUB_MAIN),
                     &state.font,
                 ));
             }
             ItemKind::Choice(choices) => {
                 made.push(child(
-                    dlg,
+                    parent,
                     windows::core::w!("STATIC"),
                     item.label,
                     0,
                     0,
-                    (px(page_x), px(y + 3), px(label_w - 8), px(row_h - 6)),
+                    (px(page_x), px(y + 3), px(label_w - 8), px(item_h - 6)),
                     id(SUB_LABEL),
                     &state.font,
                 ));
                 let combo = child(
-                    dlg,
+                    parent,
                     windows::core::w!("COMBOBOX"),
                     "",
                     CBS_DROPDOWNLIST | WS_VSCROLL | tab,
                     0,
-                    (px(ctl_x), px(y), px(ctl_w.min(250)), px(200)),
+                    (px(ctl_x), px(y), px(ctl_w), px(200)),
                     id(SUB_MAIN),
                     &state.font,
                 );
@@ -381,17 +516,17 @@ fn build(dlg: HWND, state: &mut State<'_>, owner: HWND) {
             }
             ItemKind::Number { .. } => {
                 made.push(child(
-                    dlg,
+                    parent,
                     windows::core::w!("STATIC"),
                     item.label,
                     0,
                     0,
-                    (px(page_x), px(y + 3), px(label_w - 8), px(row_h - 6)),
+                    (px(page_x), px(y + 3), px(label_w - 8), px(item_h - 6)),
                     id(SUB_LABEL),
                     &state.font,
                 ));
                 made.push(child(
-                    dlg,
+                    parent,
                     windows::core::w!("EDIT"),
                     "",
                     ES_AUTOHSCROLL | WS_BORDER | tab,
@@ -402,54 +537,49 @@ fn build(dlg: HWND, state: &mut State<'_>, owner: HWND) {
                 ));
             }
             ItemKind::Font => {
-                // フォント名を見せる幅と、意味の分かる選択ボタンの幅を確保する。
-                let font_x = page_x + 104;
-                let choose_x = page_x + page_w - 210;
+                // A full-width label/value, followed by a separate button row.
+                // Long family names never compete with the selection buttons.
                 made.push(child(
-                    dlg,
+                    parent,
                     windows::core::w!("STATIC"),
                     item.label,
                     0,
                     0,
-                    (px(page_x), px(y + 3), px(100), px(row_h - 6)),
+                    (0, px(y + 3), px(page_w), px(row_h - 6)),
                     id(SUB_LABEL),
                     &state.font,
                 ));
                 made.push(child(
-                    dlg,
+                    parent,
                     windows::core::w!("STATIC"),
                     "",
                     0,
                     0,
-                    (
-                        px(font_x),
-                        px(y + 3),
-                        px(choose_x - font_x - 5),
-                        px(row_h - 6),
-                    ),
+                    (0, px(y + row_h), px(page_w), px(item_h - row_h * 2 - 4)),
                     id(SUB_MAIN),
                     &state.font,
                 ));
-                made.push(child(
-                    dlg,
-                    windows::core::w!("BUTTON"),
-                    "フォントを選択...",
-                    BS_PUSHBUTTON | tab,
-                    0,
-                    (px(choose_x), px(y), px(135), px(row_h - 4)),
-                    id(SUB_FONT_CHOOSE),
-                    &state.font,
-                ));
-                made.push(child(
-                    dlg,
-                    windows::core::w!("BUTTON"),
-                    "既定",
-                    BS_PUSHBUTTON | tab,
-                    0,
-                    (px(ctl_x + ctl_w - 70), px(y), px(66), px(row_h - 4)),
-                    id(SUB_FONT_DEFAULT),
-                    &state.font,
-                ));
+                let choose_w = (page_w - 8) * 2 / 3;
+                for (label, sub, x, width) in [
+                    ("フォントを選択...", SUB_FONT_CHOOSE, 0, choose_w),
+                    (
+                        "既定",
+                        SUB_FONT_DEFAULT,
+                        choose_w + 8,
+                        page_w - choose_w - 8,
+                    ),
+                ] {
+                    made.push(child(
+                        parent,
+                        windows::core::w!("BUTTON"),
+                        label,
+                        BS_PUSHBUTTON | 0x2000 /* BS_MULTILINE */ | tab,
+                        0,
+                        (px(x), px(y + item_h - row_h), px(width), px(row_h - 4)),
+                        id(sub),
+                        &state.font,
+                    ));
+                }
             }
         }
         state.page_controls[page].extend(made);
@@ -458,15 +588,14 @@ fn build(dlg: HWND, state: &mut State<'_>, owner: HWND) {
     // 専用のページ（キー）。
     for (page, p) in pages().iter().enumerate() {
         if p.kind == PageKind::Keys {
-            let area = (page_x, body_top + 4, page_w, body_h);
-            let made = build_keys_page(dlg, state, area, dpi);
+            let area = (0, 4, page_w, page_heights[page] - 8);
+            let made = build_keys_page(hosts[page], state, area, dpi);
             state.page_controls[page].extend(made);
         }
     }
 
     // 下のボタン。
-    let by = client_h - margin - 28;
-    let bw = 92;
+    let by = client_h - margin - button_h;
     for (i, (label, id, style)) in [
         ("OK", IDOK.0, BS_DEFPUSHBUTTON),
         ("キャンセル", IDCANCEL.0, BS_PUSHBUTTON),
@@ -480,9 +609,9 @@ fn build(dlg: HWND, state: &mut State<'_>, owner: HWND) {
             dlg,
             windows::core::w!("BUTTON"),
             label,
-            style | WS_TABSTOP | if i == 0 { WS_GROUP } else { 0 },
+            style | 0x2000 /* BS_MULTILINE */ | WS_TABSTOP | if i == 0 { WS_GROUP } else { 0 },
             0,
-            (px(x), px(by), px(bw), px(28)),
+            (px(x), px(by), px(bw), px(button_h)),
             id,
             &state.font,
         );
@@ -502,7 +631,7 @@ fn build(dlg: HWND, state: &mut State<'_>, owner: HWND) {
 fn refresh_controls(dlg: HWND, state: &mut State<'_>) {
     for (index, (_, item)) in state.items.iter().enumerate() {
         // SAFETY: 自分のダイアログの部品（なければエラーで飛ばす）。
-        let Ok(ctl) = (unsafe { GetDlgItem(Some(dlg), control_id(index, SUB_MAIN)) }) else {
+        let Ok(ctl) = dialog_control(dlg, control_id(index, SUB_MAIN)) else {
             continue;
         };
         match (item.kind, item.get(&state.working)) {
@@ -540,7 +669,7 @@ fn read_controls(dlg: HWND, state: &State<'_>) -> Result<Settings, (HWND, String
     let mut settings = state.working.clone();
     for (index, (_, item)) in state.items.iter().enumerate() {
         // SAFETY: 自分のダイアログの部品。
-        let Ok(ctl) = (unsafe { GetDlgItem(Some(dlg), control_id(index, SUB_MAIN)) }) else {
+        let Ok(ctl) = dialog_control(dlg, control_id(index, SUB_MAIN)) else {
             continue;
         };
         match item.kind {
@@ -595,7 +724,7 @@ fn apply(dlg: HWND, state: &mut State<'_>) -> bool {
         state.working = now;
         refresh_controls(dlg, state);
         // 保存できない事情が変わったかもしれない（設定ファイルが直った）。
-        if let Ok(banner) = unsafe { GetDlgItem(Some(dlg), ID_BANNER) } {
+        if let Ok(banner) = dialog_control(dlg, ID_BANNER) {
             set_text(banner, &state.session.warning().unwrap_or_default());
         }
     }
@@ -659,13 +788,18 @@ fn build_keys_page(
     let px = |n: i32| scale(n, dpi);
     let font = &state.font;
     let mut made = Vec::new();
+    let key_row = key_row_height(font, w, dpi);
+    let label_w = (((font.measure_text("新しいキー", None).cx * 96 + dpi as i32 - 1)
+        / dpi.max(1) as i32)
+        + 8)
+    .min(w / 2);
     made.push(child(
         dlg,
         windows::core::w!("STATIC"),
         "絞り込み",
         0,
         0,
-        (px(x0), px(y0 + 3), px(60), px(20)),
+        (px(x0), px(y0 + 3), px(label_w - 4), px(key_row - 6)),
         ID_KEY_FILTER_LABEL,
         font,
     ));
@@ -675,26 +809,27 @@ fn build_keys_page(
         "",
         ES_AUTOHSCROLL | WS_BORDER | WS_TABSTOP,
         0,
-        (px(x0 + 64), px(y0), px(w - 64), px(22)),
+        (px(x0 + label_w), px(y0), px(w - label_w), px(key_row - 6)),
         ID_KEY_FILTER,
         font,
     ));
-    let list_h = body_h - 132;
+    let hint_h = text_dip_height(font, KEY_HELP, w, dpi) + 6;
+    let list_h = (body_h - key_row * 4 - hint_h - 24).max(100);
     let list = child(
         dlg,
         WC_LISTVIEWW,
         "",
         LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS | WS_TABSTOP | WS_BORDER,
         0,
-        (px(x0), px(y0 + 28), px(w), px(list_h)),
+        (px(x0), px(y0 + key_row), px(w), px(list_h)),
         ID_KEY_LIST,
         font,
     );
     send(
         list,
         LVM_SETEXTENDEDLISTVIEWSTYLE,
-        LVS_EX_FULLROWSELECT as usize,
-        LVS_EX_FULLROWSELECT as isize,
+        (LVS_EX_FULLROWSELECT | 0x4000/* LVS_EX_LABELTIP */) as usize,
+        (LVS_EX_FULLROWSELECT | 0x4000) as isize,
     );
     for (i, (title, width)) in KEY_COLUMNS.iter().enumerate() {
         let mut wide = to_wide(title);
@@ -715,14 +850,14 @@ fn build_keys_page(
     }
     made.push(list);
 
-    let y1 = y0 + 28 + list_h + 8;
+    let y1 = y0 + key_row + list_h + 8;
     made.push(child(
         dlg,
         windows::core::w!("STATIC"),
         "新しいキー",
         0,
         0,
-        (px(x0), px(y1 + 3), px(72), px(20)),
+        (px(x0), px(y1 + 3), px(label_w - 4), px(key_row - 6)),
         ID_KEY_CAPTURE_LABEL,
         font,
     ));
@@ -732,7 +867,7 @@ fn build_keys_page(
         "",
         ES_READONLY | WS_BORDER | WS_TABSTOP,
         0,
-        (px(x0 + 76), px(y1), px(166), px(22)),
+        (px(x0 + label_w), px(y1), px(w - label_w), px(key_row - 6)),
         ID_KEY_CAPTURE,
         font,
     );
@@ -742,19 +877,37 @@ fn build_keys_page(
     }
     made.push(capture);
     let buttons: [(&str, i32, i32, i32, i32); 4] = [
-        ("割り当て", ID_KEY_ASSIGN, x0 + 248, y1 - 1, 84),
-        ("割り当てを外す", ID_KEY_CLEAR, x0 + 338, y1 - 1, 120),
-        ("既定に戻す", ID_KEY_RESET, x0, y1 + 30, 110),
-        ("すべて既定に戻す", ID_KEY_RESET_ALL, x0 + 118, y1 + 30, 140),
+        ("割り当て", ID_KEY_ASSIGN, x0, y1 + key_row, (w - 8) / 2),
+        (
+            "割り当てを外す",
+            ID_KEY_CLEAR,
+            x0 + (w - 8) / 2 + 8,
+            y1 + key_row,
+            (w - 8) / 2,
+        ),
+        (
+            "既定に戻す",
+            ID_KEY_RESET,
+            x0,
+            y1 + key_row * 2,
+            (w - 8) / 2,
+        ),
+        (
+            "すべて既定に戻す",
+            ID_KEY_RESET_ALL,
+            x0 + (w - 8) / 2 + 8,
+            y1 + key_row * 2,
+            (w - 8) / 2,
+        ),
     ];
     for (label, id, bx, by, bw) in buttons {
         made.push(child(
             dlg,
             windows::core::w!("BUTTON"),
             label,
-            BS_PUSHBUTTON | WS_TABSTOP,
+            BS_PUSHBUTTON | 0x2000 /* BS_MULTILINE */ | WS_TABSTOP,
             0,
-            (px(bx), px(by), px(bw), px(24)),
+            (px(bx), px(by), px(bw), px(key_row - 4)),
             id,
             font,
         ));
@@ -762,10 +915,10 @@ fn build_keys_page(
     made.push(child(
         dlg,
         windows::core::w!("STATIC"),
-        "一覧でコマンドを選び、「新しいキー」の欄で割り当てたいキー（Ctrl／Alt／Shift との組み合わせ、F キーなど）を押して、「割り当て」を押します。他のコマンドが使っているキーは、付け替えるかどうかを確認します。",
+        KEY_HELP,
         0,
         0,
-        (px(x0), px(y1 + 60), px(w), px(32)),
+        (px(x0), px(y1 + key_row * 3 + 8), px(w), px(hint_h)),
         ID_KEY_HINT,
         font,
     ));
@@ -824,7 +977,7 @@ unsafe extern "system" fn capture_proc(
 
 fn dlg_item(dlg: HWND, id: i32) -> Option<HWND> {
     // SAFETY: 自分のダイアログの部品（なければ `None`）。
-    unsafe { GetDlgItem(Some(dlg), id) }.ok()
+    dialog_control(dlg, id).ok()
 }
 
 /// 一覧で選んでいる行の位置（なければ `None`）。
@@ -896,6 +1049,15 @@ fn refresh_key_list(dlg: HWND, state: &mut State<'_>) {
         for (sub, text) in key_row_texts(row).iter().enumerate() {
             lv_set_text(list, i, sub, text);
         }
+    }
+    for (column, (title, _)) in KEY_COLUMNS.iter().enumerate() {
+        send(
+            list, 0x101E, /* LVM_SETCOLUMNWIDTH */
+            column, -1, /* LVSCW_AUTOSIZE */
+        );
+        let content = send(list, 0x101D /* LVM_GETCOLUMNWIDTH */, column, 0);
+        let header = state.font.measure_text(title, None).cx + scale(24, state.dpi);
+        send(list, 0x101E, column, content.max(header as isize));
     }
     if let Some(i) = selected.and_then(|id| state.key_visible.iter().position(|r| r.id == id)) {
         select_key_index(list, i);
@@ -1111,7 +1273,7 @@ unsafe extern "system" fn dialog_proc(
                 1
             } else if id == ID_PAGE_LIST && notify == LBN_SELCHANGE {
                 // SAFETY: 自分のダイアログの部品。
-                if let Ok(list) = unsafe { GetDlgItem(Some(dlg), ID_PAGE_LIST) } {
+                if let Ok(list) = dialog_control(dlg, ID_PAGE_LIST) {
                     let sel = send(list, LB_GETCURSEL, 0, 0);
                     if let Ok(page) = usize::try_from(sel) {
                         show_page(state, page);
@@ -1150,7 +1312,7 @@ pub fn item_control(dlg: HWND, item_id: &str) -> Option<HWND> {
         .iter()
         .position(|(_, item)| item.id == item_id)?;
     // SAFETY: 自分のダイアログの部品。
-    unsafe { GetDlgItem(Some(dlg), control_id(index, SUB_MAIN)) }.ok()
+    dialog_control(dlg, control_id(index, SUB_MAIN)).ok()
 }
 
 /// 項目の部品の ID（書体の選択ボタンなど、枝番つき）。
@@ -1220,9 +1382,7 @@ pub fn control_text(dlg: HWND, item_id: &str) -> Option<String> {
 /// 上部の警告の文（なければ `None`）。
 pub fn banner_text(dlg: HWND) -> Option<String> {
     // SAFETY: 自分のダイアログの部品。
-    unsafe { GetDlgItem(Some(dlg), ID_BANNER) }
-        .ok()
-        .map(get_text)
+    dialog_control(dlg, ID_BANNER).ok().map(get_text)
 }
 
 /// 項目の部品がいま見えているか（ページが選ばれているか。部品自身の表示の指定で判断する）。
@@ -1239,7 +1399,7 @@ pub fn select_page(dlg: HWND, page_id: &str) -> bool {
         return false;
     };
     // SAFETY: 自分のダイアログの部品。
-    let Ok(list) = (unsafe { GetDlgItem(Some(dlg), ID_PAGE_LIST) }) else {
+    let Ok(list) = dialog_control(dlg, ID_PAGE_LIST) else {
         return false;
     };
     send(list, LB_SETCURSEL, i, 0);

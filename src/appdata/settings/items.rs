@@ -399,6 +399,7 @@ static VIEW_ITEMS: &[Item] = &[
     ),
     check_item!("view.show_eol", "改行記号を表示", view.show_eol),
     check_item!("view.line_numbers", "行番号を表示", view.line_numbers),
+    check_item!("view.status_bar", "ステータスバーを表示", view.status_bar),
     check_item!(
         "view.highlight_current_line",
         "現在行を強調",
@@ -558,6 +559,7 @@ mod tests {
             ("view.show_whitespace", ItemValue::Bool(true)),
             ("view.show_eol", ItemValue::Bool(true)),
             ("view.line_numbers", ItemValue::Bool(false)),
+            ("view.status_bar", ItemValue::Bool(false)),
             ("view.highlight_current_line", ItemValue::Bool(false)),
             ("view.highlight_braces", ItemValue::Bool(false)),
             ("view.tab_width", ItemValue::Text("8".into())),

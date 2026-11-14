@@ -151,6 +151,12 @@ toggle_def!(
     "行番号の表示を切り替えて保存する（巨大ファイルのビューにも適用する）。"
 );
 toggle_def!(
+    VIEW_STATUS_BAR,
+    "view.status_bar",
+    "ステータスバーを表示",
+    "ステータスバーの表示を切り替えて保存する（非表示時は本文を広げる）。"
+);
+toggle_def!(
     VIEW_TOGGLE_CURRENT_LINE,
     "view.toggle_current_line",
     "現在行を強調",
@@ -348,6 +354,13 @@ pub fn register(registry: &mut Registry<App>) -> Result<()> {
         "行番号の表示",
         |v| &mut v.line_numbers,
     )?;
+    registry.register(VIEW_STATUS_BAR, |app, call| {
+        let next = call.bool_or("enabled", !app.settings.view.status_bar);
+        // Preserve the current status information and any pending notice while
+        // changing only visibility, so showing the bar restores its contents.
+        app.update_view(|v| v.status_bar = next);
+        Ok(serde_json::json!({ "enabled": next }))
+    })?;
     register_toggle(
         registry,
         VIEW_TOGGLE_CURRENT_LINE,
@@ -409,6 +422,8 @@ impl App {
             b.view.set_line_numbers(view.line_numbers);
         }
         self.editor.update_brace_highlight();
+        self.relayout();
+        self.invalidate(self.layout.editor);
     }
 
     /// 文書の言語を手動で選ぶ（`None` は拡張子から自動）。表示名を返す。
@@ -489,6 +504,7 @@ impl App {
             "view.toggle_whitespace" => v.show_whitespace,
             "view.toggle_eol" => v.show_eol,
             "view.toggle_line_numbers" => v.line_numbers,
+            "view.status_bar" => v.status_bar,
             "view.toggle_current_line" => v.highlight_current_line,
             "view.toggle_braces" => v.highlight_braces,
             "view.toggle_edge_guide" => v.edge_guide,

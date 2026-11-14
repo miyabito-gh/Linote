@@ -47,11 +47,12 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SetWindowPos, SetWindowTextW, ShowWindow, BM_GETCHECK, BM_SETCHECK, BN_CLICKED,
     BS_AUTOCHECKBOX, BS_PUSHBUTTON, CREATESTRUCTW, ES_AUTOHSCROLL, GWLP_USERDATA, GWLP_WNDPROC,
     HMENU, IDC_ARROW, LBN_DBLCLK, LBS_NOINTEGRALHEIGHT, LBS_NOTIFY, LB_ADDSTRING, LB_GETCURSEL,
-    LB_RESETCONTENT, LB_SETCURSEL, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_SHOW, WM_ACTIVATE,
-    WM_CHAR, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_CTLCOLOREDIT, WM_CTLCOLORLISTBOX,
-    WM_CTLCOLORSTATIC, WM_ERASEBKGND, WM_KEYDOWN, WM_NCDESTROY, WM_SETFONT, WM_SIZE, WNDCLASSEXW,
-    WNDPROC, WS_CAPTION, WS_CHILD, WS_CLIPCHILDREN, WS_EX_CLIENTEDGE, WS_EX_TOOLWINDOW, WS_POPUP,
-    WS_SYSMENU, WS_TABSTOP, WS_THICKFRAME, WS_VISIBLE, WS_VSCROLL,
+    LB_RESETCONTENT, LB_SETCURSEL, MINMAXINFO, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE,
+    SW_SHOW, WM_ACTIVATE, WM_CHAR, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_CTLCOLOREDIT,
+    WM_CTLCOLORLISTBOX, WM_CTLCOLORSTATIC, WM_ERASEBKGND, WM_GETMINMAXINFO, WM_KEYDOWN,
+    WM_NCDESTROY, WM_SETFONT, WM_SIZE, WNDCLASSEXW, WNDPROC, WS_CAPTION, WS_CHILD, WS_CLIPCHILDREN,
+    WS_EX_CLIENTEDGE, WS_EX_TOOLWINDOW, WS_POPUP, WS_SYSMENU, WS_TABSTOP, WS_THICKFRAME,
+    WS_VISIBLE, WS_VSCROLL,
 };
 
 use crate::appdata::settings::GrepSettings;
@@ -194,7 +195,7 @@ struct State {
     include_hidden: HWND,
     filter_labels: [HWND; 2],
     /// コンボボックスと Grep 条件の入力欄（キー操作を受ける）。
-    edits: [HWND; 5],
+    edits: [HWND; 6],
     /// 履歴の差し替え中は入力の通知を無視する。
     quiet: bool,
     buttons: [HWND; 6],
@@ -214,7 +215,7 @@ struct State {
     tx: UiSender<Msg>,
     rx: UiReceiver<Msg>,
     on_event: Rc<dyn Fn(FindEvent)>,
-    edit_procs: [WNDPROC; 5],
+    edit_procs: [WNDPROC; 6],
     list_proc: WNDPROC,
 }
 
@@ -281,6 +282,7 @@ impl FindPanel {
         match created {
             Ok(hwnd) => {
                 let panel = FindPanel { hwnd };
+                panel.ensure_minimum_size();
                 panel.center_on(owner);
                 Ok(panel)
             }
@@ -288,6 +290,27 @@ impl FindPanel {
                 "検索の小窓",
                 format!("作れませんでした: {e}"),
             )),
+        }
+    }
+
+    fn ensure_minimum_size(&self) {
+        if let Some((min_w, min_h)) = with_state(self.hwnd, |s| s.minimum_outer_size()) {
+            let mut rect = RECT::default();
+            // SAFETY: Compute the size before resizing, so WM_SIZE can borrow State independently.
+            unsafe {
+                let _ = GetWindowRect(self.hwnd, &mut rect);
+                if rect.right - rect.left < min_w || rect.bottom - rect.top < min_h {
+                    let _ = SetWindowPos(
+                        self.hwnd,
+                        None,
+                        0,
+                        0,
+                        (rect.right - rect.left).max(min_w),
+                        (rect.bottom - rect.top).max(min_h),
+                        SWP_NOMOVE | SWP_NOZORDER,
+                    );
+                }
+            }
         }
     }
 
@@ -473,6 +496,7 @@ impl FindPanel {
             s.apply_font();
             s.layout();
         });
+        self.ensure_minimum_size();
     }
 
     pub fn destroy(self) {
@@ -645,6 +669,48 @@ impl State {
         }
     }
 
+    fn row_height(&self) -> i32 {
+        self.font.measure_text("あAg", None).cy + scale(10, self.dpi)
+    }
+
+    fn minimum_client_size(&self) -> (i32, i32) {
+        let px = |n| scale(n, self.dpi);
+        let buttons = self
+            .buttons
+            .iter()
+            .map(|h| self.font.measure_text(&text_of(*h), None).cx)
+            .max()
+            .unwrap_or(0)
+            + px(20);
+        let options = [self.case, self.word, self.regex]
+            .iter()
+            .map(|h| self.font.measure_text(&text_of(*h), None).cx + px(26))
+            .max()
+            .unwrap_or(0)
+            * 3;
+        let scope = self.font.measure_text(&text_of(self.in_selection), None).cx + px(26);
+        let width = (buttons * 6 + px(6) * 5).max(options).max(scope) + px(16);
+        // Eight input/option rows, buttons, up to three status lines and a usable result area.
+        let height = self.row_height() * 9
+            + px(6) * 11
+            + self.font.measure_text("あAg", None).cy * 3
+            + px(70);
+        (width, height)
+    }
+
+    fn minimum_outer_size(&self) -> (i32, i32) {
+        let (w, h) = self.minimum_client_size();
+        let (mut outer, mut client) = (RECT::default(), RECT::default());
+        unsafe {
+            let _ = GetWindowRect(self.hwnd, &mut outer);
+            let _ = GetClientRect(self.hwnd, &mut client);
+        }
+        (
+            w + outer.right - outer.left - client.right + client.left,
+            h + outer.bottom - outer.top - client.bottom + client.top,
+        )
+    }
+
     fn layout(&self) {
         let mut rc = RECT::default();
         // SAFETY: 自分のウィンドウ。
@@ -652,7 +718,7 @@ impl State {
             let _ = GetClientRect(self.hwnd, &mut rc);
         }
         let d = self.dpi;
-        let (m, row, gap) = (scale(8, d), scale(26, d), scale(6, d));
+        let (m, row, gap) = (scale(8, d), self.row_height(), scale(6, d));
         let (w, h) = (rc.right - rc.left, rc.bottom - rc.top);
         let inner = (w - 2 * m).max(0);
         let mut y = m;
@@ -674,7 +740,13 @@ impl State {
         y += row + gap;
         mv(self.in_selection, m, y, inner, row);
         y += row + gap;
-        let label_width = scale(116, d);
+        let label_width = self
+            .filter_labels
+            .iter()
+            .map(|h| self.font.measure_text(&text_of(*h), None).cx)
+            .max()
+            .unwrap_or(0)
+            + gap;
         for (label, input) in self
             .filter_labels
             .into_iter()
@@ -691,8 +763,16 @@ impl State {
             mv(b, m + (bw + gap) * i as i32, y, bw, row + gap);
         }
         y += row + 2 * gap;
-        mv(self.status, m, y, inner, scale(20, d));
-        y += scale(20, d) + gap;
+        let line_h = self.font.measure_text("あAg", None).cy.max(1);
+        // Leave room for the edit border and scrollbar when measuring wrapped status text.
+        let status_h = (self
+            .font
+            .measure_text(&text_of(self.status), Some((inner - scale(24, d)).max(1)))
+            .cy)
+            .clamp(line_h, line_h * 3)
+            + scale(4, d);
+        mv(self.status, m, y, inner, status_h);
+        y += status_h + gap;
         mv(self.list, m, y, inner, (h - y - m).max(0));
     }
 
@@ -708,6 +788,7 @@ impl State {
     fn show_status(&mut self, text: &str, error: bool) {
         self.status_is_error = error;
         set_text(self.status, text);
+        self.layout();
         // SAFETY: 自分の子ウィンドウ（色が変わるので描き直す）。
         unsafe {
             let _ = InvalidateRect(Some(self.status), None, true);
@@ -988,7 +1069,16 @@ extern "system" fn panel_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPAR
                 button(w!("Grep"), ID_GREP),
                 button(w!("中止"), ID_STOP),
             ];
-            let status = child(hwnd, w!("STATIC"), w!(""), 0, 0, ID_STATUS);
+            // Read-only multi-line status keeps long regex diagnostics accessible by scrolling.
+            let status = child(
+                hwnd,
+                w!("EDIT"),
+                w!(""),
+                0x0004 /* ES_MULTILINE */ | 0x0800 /* ES_READONLY */
+                    | 0x0040 /* ES_AUTOVSCROLL */ | WS_VSCROLL.0,
+                0,
+                ID_STATUS,
+            );
             let list = child(
                 hwnd,
                 w!("LISTBOX"),
@@ -1011,7 +1101,7 @@ extern "system" fn panel_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPAR
                 exclude_dirs,
                 include_hidden,
                 filter_labels,
-                edits: [HWND::default(); 5],
+                edits: [HWND::default(); 6],
                 quiet: false,
                 buttons,
                 status,
@@ -1030,14 +1120,14 @@ extern "system" fn panel_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPAR
                 tx,
                 rx,
                 on_event,
-                edit_procs: [None; 5],
+                edit_procs: [None; 6],
                 list_proc: None,
             });
             state.rebuild_brushes();
             state.apply_font();
             // SAFETY: 元の処理を控えて、キー操作を受ける処理に差し替える。
             unsafe {
-                for (i, combo) in [query, replace, folder, extensions, exclude_dirs]
+                for (i, combo) in [query, replace, folder, extensions, exclude_dirs, status]
                     .into_iter()
                     .enumerate()
                 {
@@ -1057,6 +1147,16 @@ extern "system" fn panel_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPAR
                 set_dark_title_bar(hwnd, s.theme.dark);
                 s.layout();
             });
+            LRESULT(0)
+        }
+        WM_GETMINMAXINFO => {
+            if let Some((w, h)) = with_state(hwnd, |s| s.minimum_outer_size()) {
+                if lparam.0 != 0 {
+                    let info = unsafe { &mut *(lparam.0 as *mut MINMAXINFO) };
+                    info.ptMinTrackSize.x = w;
+                    info.ptMinTrackSize.y = h;
+                }
+            }
             LRESULT(0)
         }
         WM_SIZE => {
@@ -1208,9 +1308,9 @@ extern "system" fn key_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                     s.find(!shift);
                 } else if hwnd == s.edits[1] {
                     s.replace(false);
-                } else if s.edits[2..].contains(&hwnd) {
+                } else if s.edits[2..5].contains(&hwnd) {
                     s.start_grep();
-                } else {
+                } else if hwnd == s.list {
                     s.open_selected();
                 }
             });

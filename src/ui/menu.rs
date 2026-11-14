@@ -418,6 +418,7 @@ static MENUS: &[MenuDef] = &[
             Item::Cmd(CommandId::new("view.toggle_whitespace")),
             Item::Cmd(CommandId::new("view.toggle_eol")),
             Item::Cmd(CommandId::new("view.toggle_line_numbers")),
+            Item::Cmd(CommandId::new("view.status_bar")),
             Item::Cmd(CommandId::new("view.toggle_current_line")),
             Item::Cmd(CommandId::new("view.toggle_braces")),
             Item::Separator,
