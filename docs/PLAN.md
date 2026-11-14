@@ -231,3 +231,9 @@ W5 配布・性能 ── N → 🪟性能計測 → O 最終レビュー
 - 詳細は `docs/reviews/2026-11-14-editor-ux.md`、実機確認は `docs/verification/V.md` に記録。Windows実機のIME・DPI・表示・性能は未確認。Shift+F10の本文メニュー位置は軽微な改善候補として残す。
 - インストーラーは作成しない。配布版の番号は変更せず0.1.6を維持する。
 - 最終検証: fmt、Windows全ターゲットClippy、Linux libのClippy、Linux libテスト301件、Wine＋XvfbのWindowsテスト452件（doctestを含む、子プロセス・計測用7件ignored）、releaseビルド、単体EXEのDLL依存検査が成功。設定の実コントロールとGUI自己診断も通過。
+
+### 2026-11-15 確認修正の公開とインストーラー作成
+
+- 利用者の明示的な指示で、コード・UX確認の修正 `3088839` を `main` へpushした。
+- 同じ内容で `scripts/package-installer.sh` を実行し、`dist/linote-0.1.6-win-x64-setup.exe` とSHA-256ファイルを作成。版は0.1.6を維持し、成果物はコミットしない。
+- releaseビルド・DLL依存検査・SHA-256照合が成功。Wineで一時フォルダーへのサイレント導入、導入EXEの一致、版登録、通常経路のアンインストールと登録削除、追加ファイルの保持を確認した。Windows実機での対話ウィザード確認は未実施。
