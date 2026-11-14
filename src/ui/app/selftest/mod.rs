@@ -38,6 +38,7 @@ mod integration_u3;
 mod integration_u4;
 mod integration_u5;
 mod integration_v1;
+mod integration_v2;
 
 /// 統合の試験の道具立て。
 pub(crate) struct Ctx {
@@ -172,6 +173,7 @@ fn checks_basic(app: &mut App) -> Check {
     for cmd in [
         "file.save",
         "file.save_as",
+        "file.save_all",
         "file.close",
         "file.print",
         "edit.undo",

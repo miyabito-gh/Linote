@@ -90,6 +90,34 @@ impl Language {
         }
     }
 
+    /// コマンドの引数で使う識別子（`view.language`）。プレーンテキストは `none`。
+    pub const fn id(self) -> &'static str {
+        match self {
+            Language::PlainText => "none",
+            Language::C => "c",
+            Language::Cpp => "cpp",
+            Language::Java => "java",
+            Language::Rust => "rust",
+            Language::Markdown => "markdown",
+            Language::Json => "json",
+            Language::Yaml => "yaml",
+            Language::Ini => "ini",
+            Language::Toml => "toml",
+            Language::Html => "html",
+            Language::Xml => "xml",
+            Language::Python => "python",
+            Language::PowerShell => "powershell",
+            Language::Batch => "batch",
+            Language::Sql => "sql",
+            Language::Log => "log",
+        }
+    }
+
+    /// [`Language::id`] の逆引き。
+    pub fn from_id(id: &str) -> Option<Language> {
+        Language::ALL.into_iter().find(|l| l.id() == id)
+    }
+
     /// ステータスバーなどに出す名前。
     pub const fn label(self) -> &'static str {
         match self {
@@ -554,5 +582,13 @@ mod tests {
             Language::Rust.effective(HIGHLIGHT_MAX_BYTES + 1),
             Language::PlainText
         );
+    }
+
+    #[test]
+    fn ids_round_trip() {
+        for l in Language::ALL {
+            assert_eq!(Language::from_id(l.id()), Some(l));
+        }
+        assert_eq!(Language::from_id("auto"), None);
     }
 }

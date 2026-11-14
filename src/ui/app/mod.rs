@@ -40,6 +40,7 @@ mod recover;
 mod search;
 pub mod selftest;
 mod session;
+mod tabextras;
 mod tabops;
 mod viewopts;
 
@@ -139,6 +140,8 @@ pub struct OpenDoc {
     pub state: DocumentState,
     pub title: String,
     pub language: Language,
+    /// 利用者が手動で選んだ言語（`None` は拡張子から自動）。保存しない（V2）。
+    language_override: Option<Language>,
     view: DocView,
     view_state: ViewState,
     /// Scintilla の保存位置が `state` の保存済みの版と対応しているか。
@@ -171,6 +174,7 @@ impl OpenDoc {
             state,
             title,
             language,
+            language_override: None,
             view,
             view_state: ViewState::default(),
             savepoint_valid,
@@ -356,6 +360,8 @@ pub struct App {
     pub(crate) handoff_spawn: bool,
     /// 前回のタブの復元の進み具合（V1）。
     restore: session::RestoreState,
+    /// 閉じたタブの履歴（その起動の間だけ。V2）。
+    closed_tabs: tabextras::ClosedTabs,
     /// 文書が 0 件のときの案内の、クリックできる行（矩形, 最近使ったファイルの番号）。
     empty_links: Vec<(RECT, usize)>,
     /// Alt を使った操作のあと、Alt を離してもメニューを有効にしない（V1）。
@@ -688,6 +694,7 @@ impl App {
             handoff_seq: 0,
             handoff_spawn: true,
             restore: session::RestoreState::default(),
+            closed_tabs: tabextras::ClosedTabs::default(),
             empty_links: Vec::new(),
             alt: altkey::AltTracker::default(),
             hooks: Hooks::default(),
@@ -1042,7 +1049,9 @@ impl App {
         let current = self.docs[i].state.version() == version;
         if let Some(p) = &new_path {
             self.docs[i].title = file_title(p);
-            let language = Language::from_path(p);
+            let language = self.docs[i]
+                .language_override
+                .unwrap_or_else(|| Language::from_path(p));
             if language != self.docs[i].language {
                 self.docs[i].language = language;
                 self.with_text(id, |ed| ed.set_language(language))?;
@@ -1196,6 +1205,7 @@ impl App {
             }
         }
         let i = self.index_of(id)?;
+        self.remember_closed_tab(i);
         if self.active == Some(i) {
             // 隣（右、なければ左）を先に表示し、編集欄が閉じる文書を手放すようにする。
             // 最後の 1 つなら、文書 0 件の状態にする（無題は作らない）。

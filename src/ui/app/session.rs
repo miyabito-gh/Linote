@@ -127,6 +127,11 @@ impl App {
         self.restore.placed.insert(id, entry.order);
         let to = target_index(&orders, entry.order);
         self.move_tab(id, to);
+        self.restore_view_at(id, entry.caret, entry.first_line);
+    }
+
+    /// 開き終えた文書のカーソルと先頭行を戻す（前回のタブ・閉じたタブの開き直し）。
+    pub(super) fn restore_view_at(&mut self, id: DocumentId, caret: u64, first_line: u64) {
         // 巨大ファイルは外部の表示部品が持つので、位置は戻さない。
         let Ok(i) = self.index_of(id) else { return };
         if !matches!(self.docs[i].view, DocView::Scintilla(_)) {
@@ -134,7 +139,7 @@ impl App {
         }
         let Ok(caret) = self.with_text(id, |ed| {
             let len = ed.length();
-            let mut pos = entry.caret.min(len);
+            let mut pos = caret.min(len);
             while pos > 0 && !ed.is_char_boundary(pos) {
                 pos -= 1;
             }
@@ -144,7 +149,7 @@ impl App {
         };
         let state = ViewState {
             selection: Selection::caret_at(caret),
-            first_visible_line: entry.first_line,
+            first_visible_line: first_line,
             ..ViewState::default()
         };
         self.docs[i].view_state = state;

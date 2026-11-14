@@ -8,8 +8,10 @@ use crate::appdata::settings::{
     ViewSettings, WrapMode, FONT_SIZE_DEFAULT, FONT_SIZE_MAX, FONT_SIZE_MIN, WRAP_COLUMN_MAX,
     WRAP_COLUMN_MIN, ZOOM_MAX, ZOOM_MIN,
 };
-use crate::command::{Call, CommandDef, CommandId, ParamDef, ParamType, Registry, Value};
-use crate::core::{Error, Result};
+use crate::command::{
+    Call, CommandDef, CommandId, ParamDef, ParamType, Registry, TargetKind, Value,
+};
+use crate::core::{DocumentId, Error, Result};
 use crate::ui::editor::Language;
 use crate::ui::statusbar::MessageKind;
 
@@ -80,6 +82,40 @@ pub const VIEW_TAB_WIDTH: CommandDef = CommandDef::new(
     "2、4、8 のいずれか",
 )])
 .result("{\"width\": 幅}");
+
+const LANGUAGE_IDS: &[&str] = &[
+    "auto",
+    "none",
+    "c",
+    "cpp",
+    "java",
+    "rust",
+    "markdown",
+    "json",
+    "yaml",
+    "ini",
+    "toml",
+    "html",
+    "xml",
+    "python",
+    "powershell",
+    "batch",
+    "sql",
+    "log",
+];
+
+pub const VIEW_LANGUAGE: CommandDef = CommandDef::new(
+    CommandId::new("view.language"),
+    "言語",
+    "文書の構文着色の言語を手動で選ぶ（auto＝拡張子から自動、none＝プレーンテキスト）。文書ごとの設定で、保存しない。巨大ファイルは対象外。",
+)
+.target(TargetKind::Document)
+.params(&[ParamDef::required(
+    "language",
+    ParamType::Enum(LANGUAGE_IDS),
+    "auto、none、c、cpp、java、rust、markdown、json、yaml、ini、toml、html、xml、python、powershell、batch、sql、log",
+)])
+.result("{\"language\": 選んだ値, \"label\": 表示名}");
 
 /// 切り替えコマンドの共通の引数（省略すると反転）。
 const ENABLED: &[ParamDef] = &[ParamDef::optional(
@@ -273,6 +309,20 @@ pub fn register(registry: &mut Registry<App>) -> Result<()> {
         Ok(serde_json::json!({ "zoom": 0 }))
     })?;
 
+    registry.register(VIEW_LANGUAGE, |app, call: &Call<'_>| {
+        let id = call.document()?;
+        let choice = call.str("language")?;
+        let manual = match choice {
+            "auto" => None,
+            other => Some(
+                Language::from_id(other)
+                    .ok_or_else(|| Error::invalid_argument("language", "対応していない言語です"))?,
+            ),
+        };
+        let label = app.set_language_choice(id, manual)?;
+        app.set_status(&format!("言語: {label}"), MessageKind::Info);
+        Ok(serde_json::json!({ "language": choice, "label": label }))
+    })?;
     registry.register(VIEW_TAB_WIDTH, |app, call: &Call<'_>| {
         let width: u32 = call
             .str("width")?
@@ -361,6 +411,45 @@ impl App {
         self.editor.update_brace_highlight();
     }
 
+    /// 文書の言語を手動で選ぶ（`None` は拡張子から自動）。表示名を返す。
+    pub(super) fn set_language_choice(
+        &mut self,
+        id: DocumentId,
+        manual: Option<Language>,
+    ) -> Result<&'static str> {
+        let i = self.index_of(id)?;
+        if !matches!(self.docs[i].view, DocView::Scintilla(_)) {
+            return Err(Error::unsupported("巨大ファイルの言語は変えられません"));
+        }
+        let chosen = manual.unwrap_or_else(|| {
+            self.docs[i]
+                .state
+                .path()
+                .map_or(Language::PlainText, Language::from_path)
+        });
+        self.docs[i].language_override = manual;
+        let language = chosen.effective(self.with_text(id, |ed| ed.length())?);
+        self.docs[i].language = language;
+        self.with_text(id, |ed| ed.set_language(language))?;
+        if self.active == Some(i) {
+            self.editor.apply_theme(&self.theme, language);
+            self.refresh_status();
+        }
+        Ok(language.label())
+    }
+
+    /// メニューの印: 言語（`auto` は手動の指定がないとき）。
+    fn language_menu_checked(&self, arg: &str) -> bool {
+        let Some(d) = self.active.map(|i| &self.docs[i]) else {
+            return false;
+        };
+        match (arg, d.language_override) {
+            ("auto", o) => o.is_none(),
+            (id, Some(l)) => l.id() == id,
+            _ => false,
+        }
+    }
+
     /// 拡大率が編集欄側で変わった（Ctrl+ホイール）。設定に取り込んで保存する。
     pub(super) fn on_zoom_changed(&mut self) {
         let zoom = self.editor.zoom().clamp(ZOOM_MIN, ZOOM_MAX);
@@ -395,6 +484,7 @@ impl App {
         let arg = arg.and_then(Value::as_str);
         Some(match command.as_str() {
             "view.wrap" => v.wrap.name() == arg?,
+            "view.language" => self.language_menu_checked(arg?),
             "view.tab_width" => v.tab_width.to_string() == arg?,
             "view.toggle_whitespace" => v.show_whitespace,
             "view.toggle_eol" => v.show_eol,

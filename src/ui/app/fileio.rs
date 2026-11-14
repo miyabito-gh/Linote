@@ -421,7 +421,7 @@ impl App {
         };
         self.add_recent(&request.path);
         if let Some(old) = request.reopen_of {
-            let _ = self.close_document(old.document, true);
+            let _ = self.close_document_quietly(old.document);
         }
         let lossy = loaded.is_lossy();
         if let Ok(i) = self.index_of(id) {
@@ -618,6 +618,11 @@ impl App {
 
     /// 保存先を尋ねて名前を付けて保存する（取り消されたら何もしない）。
     pub(super) fn save_as_flow(&mut self, id: DocumentId, after: After) -> Result<()> {
+        self.save_as_flow_asked(id, after).map(|_| ())
+    }
+
+    /// [`App::save_as_flow`] で、保存先が選ばれて保存を始めたかを返す（`false` は取り消し）。
+    pub(super) fn save_as_flow_asked(&mut self, id: DocumentId, after: After) -> Result<bool> {
         let i = self.index_of(id)?;
         let suggested = match self.docs[i].state.path() {
             Some(p) => file_title(p),
@@ -638,8 +643,10 @@ impl App {
         let owner = self.hwnd;
         let prompts = self.prompts.clone();
         match prompts.save_file(owner, &suggested, dir.as_deref()) {
-            Some(path) => self.save_document(id, SaveDest::As(path), SaveOpts::new(after)),
-            None => Ok(()),
+            Some(path) => self
+                .save_document(id, SaveDest::As(path), SaveOpts::new(after))
+                .map(|()| true),
+            None => Ok(false),
         }
     }
 

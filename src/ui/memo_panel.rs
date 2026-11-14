@@ -30,7 +30,9 @@ use windows::Win32::Graphics::Gdi::{
     CreateSolidBrush, DeleteObject, FillRect, SetBkColor, SetTextColor, HBRUSH, HDC,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::UI::Input::KeyboardAndMouse::{SetFocus, VK_DOWN, VK_ESCAPE, VK_RETURN, VK_UP};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    SetFocus, VK_DELETE, VK_DOWN, VK_ESCAPE, VK_RETURN, VK_UP,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
     CallWindowProcW, CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect,
     GetWindowLongPtrW, GetWindowRect, IsWindowVisible, LoadCursorW, MoveWindow, PostMessageW,
@@ -60,6 +62,7 @@ const WM_PANEL_RESULT: u32 = WM_APP_FIRST_FREE;
 const ID_SEARCH: usize = 101;
 const ID_LIST: usize = 102;
 const ID_NEW: usize = 103;
+const ID_DELETE: usize = 104;
 
 const EN_CHANGE: u32 = 0x0300;
 /// 検索結果の一覧に載せる最大件数。
@@ -70,6 +73,9 @@ const MAX_RESULTS: u64 = 500;
 pub enum PanelEvent {
     /// このメモをタブで開く（読み込み済み。新規作成した直後のメモも同じ）。
     Open(Memo),
+    /// 選択中のメモの削除が求められた（確認と削除は `ui::app` が行い、終わったら
+    /// [`MemoPanel::refresh`] で一覧を読み直す）。
+    Delete { id: MemoId, name: String },
     /// 小窓が閉じた。本文にフォーカスを戻す。
     Closed,
     /// 一覧・読み込み・作成の失敗（状態表示などで利用者に知らせる）。
@@ -90,6 +96,7 @@ struct State {
     edit: HWND,
     list: HWND,
     button: HWND,
+    delete_button: HWND,
     store: MemoStore,
     font: UiFont,
     dpi: u32,
@@ -227,6 +234,11 @@ impl MemoPanel {
         });
     }
 
+    /// 一覧を読み直す（削除の後など）。
+    pub fn refresh(&self) {
+        with_state(self.hwnd, |s| s.start_search());
+    }
+
     /// 開いていれば閉じ、閉じていれば開く。
     pub fn toggle(&self) {
         if self.is_visible() {
@@ -355,7 +367,7 @@ impl State {
     }
 
     fn apply_font(&self) {
-        for h in [self.edit, self.list, self.button] {
+        for h in [self.edit, self.list, self.button, self.delete_button] {
             // SAFETY: 書体は State が保持する間有効。
             unsafe {
                 SendMessageW(
@@ -384,11 +396,14 @@ impl State {
         unsafe {
             let _ = MoveWindow(self.edit, m, m, inner, edit_h, true);
             let _ = MoveWindow(self.list, m, 2 * m + edit_h, inner, list_h, true);
+            let half = ((inner - m) / 2).max(0);
+            let y = 3 * m + edit_h + list_h;
+            let _ = MoveWindow(self.button, m, y, half, button_h, true);
             let _ = MoveWindow(
-                self.button,
-                m,
-                3 * m + edit_h + list_h,
-                inner,
+                self.delete_button,
+                m + half + m,
+                y,
+                (inner - half - m).max(0),
                 button_h,
                 true,
             );
@@ -479,6 +494,14 @@ impl State {
             return;
         };
         self.load(id);
+    }
+
+    /// 選択中のメモの削除を求める。
+    fn delete_selected(&self) {
+        let Some((id, name)) = self.selected().map(|h| (h.id.clone(), h.name.clone())) else {
+            return;
+        };
+        self.emit(PanelEvent::Delete { id, name });
     }
 
     fn load(&self, id: MemoId) {
@@ -584,12 +607,21 @@ extern "system" fn panel_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPAR
                 0,
                 ID_NEW,
             );
+            let delete_button = child(
+                hwnd,
+                w!("BUTTON"),
+                w!("削除"),
+                WS_TABSTOP.0 | BS_PUSHBUTTON as u32,
+                0,
+                ID_DELETE,
+            );
             let (tx, rx) = ui_channel(Arc::new(PostWaker(hwnd.0 as isize)));
             let mut state = Box::new(State {
                 hwnd,
                 edit,
                 list,
                 button,
+                delete_button,
                 store,
                 font: UiFont::for_dpi(dpi),
                 dpi,
@@ -664,6 +696,7 @@ extern "system" fn panel_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPAR
                 (ID_SEARCH, EN_CHANGE) => s.start_search(),
                 (ID_LIST, LBN_DBLCLK) => s.open_selected(),
                 (ID_NEW, BN_CLICKED) => s.create_new(),
+                (ID_DELETE, BN_CLICKED) => s.delete_selected(),
                 _ => {}
             });
             LRESULT(0)
@@ -734,6 +767,10 @@ extern "system" fn key_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
         WM_KEYDOWN if (key == VK_DOWN.0 || key == VK_UP.0) && is_edit(parent, hwnd) => {
             let delta = if key == VK_DOWN.0 { 1 } else { -1 };
             with_state(parent, |s| s.move_selection(delta));
+            true
+        }
+        WM_KEYDOWN if key == VK_DELETE.0 && !is_edit(parent, hwnd) => {
+            with_state(parent, |s| s.delete_selected());
             true
         }
         // Enter・Esc の文字がビープ音にならないようにする。

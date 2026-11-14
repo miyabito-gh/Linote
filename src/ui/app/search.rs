@@ -725,6 +725,7 @@ impl App {
 
     /// 開き終えた文書に、待たせていた移動を適用する。
     pub(super) fn apply_pending_jump(&mut self, id: DocumentId) {
+        self.apply_reopen_view(id);
         let Some(path) = self.state(id).and_then(|s| s.path()).map(Path::to_path_buf) else {
             return;
         };

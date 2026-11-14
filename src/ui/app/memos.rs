@@ -77,10 +77,62 @@ impl App {
                     );
                 }
             }
+            PanelEvent::Delete { id, name } => self.delete_memo_confirmed(&id, &name),
             PanelEvent::Closed => self.focus_active(),
             PanelEvent::Failed(e) => {
                 self.set_status(&format!("メモ: {e}"), MessageKind::Warning);
             }
+        }
+    }
+
+    /// メモの削除（V2）。確認してから、保存領域の版を付けて消す。版が合わなければ
+    /// 通知して消さない。開いているタブがあれば閉じる。
+    pub(super) fn delete_memo_confirmed(&mut self, id: &MemoId, name: &str) {
+        let Some(store) = self.memo_store() else {
+            return;
+        };
+        let owner = self.hwnd;
+        let prompts = self.prompts.clone();
+        let ok = prompts.confirm(
+            owner,
+            "Linote - メモの削除",
+            &format!("メモ「{name}」を削除しますか？\n\n削除したメモは元に戻せません。"),
+        );
+        if !ok {
+            return;
+        }
+        let result = self
+            .memo_version(id)
+            .and_then(|version| store.delete(id, version));
+        match result {
+            Ok(()) => {
+                let open: Vec<DocumentId> = self
+                    .docs
+                    .iter()
+                    .filter(|d| d.memo.as_ref().is_some_and(|t| t.id() == id))
+                    .map(|d| d.id())
+                    .collect();
+                for doc in open {
+                    let _ = self.close_document_quietly(doc);
+                }
+                self.set_status(&format!("メモ「{name}」を削除しました"), MessageKind::Info);
+            }
+            Err(e @ Error::VersionMismatch { .. }) => {
+                self.notify(
+                    crate::ui::dialogs::NoticeKind::Warning,
+                    &format!(
+                        "メモ「{name}」は別の場所で変更されているため、削除しませんでした。\
+                         開き直して内容を確かめてください。({e})"
+                    ),
+                );
+            }
+            Err(e) => self.set_status(
+                &format!("メモを削除できませんでした: {e}"),
+                MessageKind::Warning,
+            ),
+        }
+        if let Some(panel) = self.memo_panel {
+            panel.refresh();
         }
     }
 

@@ -90,6 +90,7 @@ fn panel_opens_closes_and_opens_memos() {
                 e.borrow_mut().push("open".into());
                 o.borrow_mut().push(m);
             }
+            PanelEvent::Delete { .. } => e.borrow_mut().push("delete".into()),
             PanelEvent::Closed => e.borrow_mut().push("closed".into()),
             PanelEvent::Failed(err) => e.borrow_mut().push(format!("failed {err}")),
         }),

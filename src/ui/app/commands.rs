@@ -641,6 +641,7 @@ pub fn register(registry: &mut Registry<App>) -> Result<()> {
         }
     })?;
     super::viewopts::register(registry)?;
+    super::tabextras::register(registry)?;
     super::printing::register(registry)?;
     Ok(())
 }
@@ -752,6 +753,7 @@ impl App {
                 | "search.find_selection"
                 | "view.preview_pane"
                 | "view.preview_window"
+                | "file.save_all"
                 | "view.next_tab"
                 | "view.prev_tab"
         ) || self
@@ -866,6 +868,9 @@ impl App {
             }
             if self.active.is_none() && self.needs_document(entry.command) {
                 return false;
+            }
+            if entry.command.as_str() == "file.reopen_closed" {
+                return !self.closed_tabs_is_empty();
             }
             registry
                 .check_available(self, &Invocation::user(entry.command))

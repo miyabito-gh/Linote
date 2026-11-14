@@ -351,7 +351,7 @@ impl App {
             return;
         }
         // 受け側が引き継いだので、元の復元データも不要（`close_document` が破棄する）。
-        match self.close_document(h.id, true) {
+        match self.close_document_quietly(h.id) {
             Ok(_) => self.set_status(
                 &format!("「{}」を新しいウィンドウへ移しました", h.title),
                 MessageKind::Info,
@@ -435,7 +435,7 @@ impl App {
         let title = t.path.as_deref().map(file_title).unwrap_or(t.title);
         let id = self.open_text(state, &t.text, title, language, true)?;
         if self.claim_or_cancel(file).is_err() {
-            let _ = self.close_document(id, true);
+            let _ = self.close_document_quietly(id);
             return Err(Error::Cancelled);
         }
         if t.dirty {
