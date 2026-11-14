@@ -86,9 +86,9 @@ W5 配布・性能 ── N → 🪟性能計測 → O 最終レビュー
 |---|---|---|---|---|
 | W0-1 | 🔄 | クラウド環境 `linote` の作成 | オーケストレーター | 作成済み。新しいセッションでセットアップスクリプトが通ることは未確認 |
 | W0-2 | ✅ | 要件・計画の文書化 | オーケストレーター | `docs/requirements.md`、`docs/PLAN.md` |
-| W0-3 | ⬜ | 骨組み、`CLAUDE.md`、`.cargo/config.toml`、単体EXE検査スクリプト | オーケストレーター | 空ウィンドウが Windows 向けにビルドでき、品質関門がすべて通る |
-| W0-4 | ⬜ | Scintilla・Lexilla の同梱 | オーケストレーター | `third_party/` に配置、`VENDORED.md`、対象言語のみ組み込み、`.gitattributes` で外部ソース扱い |
-| S1 | ⬜ | 事前検証: Scintilla＋Lexilla を MinGW で静的リンクし、Wine 上で編集ウィンドウを作る | Opus | 単体EXE検査を通る。IME は 🪟 で確認 |
+| W0-3 | ✅ | 骨組み、`CLAUDE.md`、`.cargo/config.toml`、単体EXE検査スクリプト | オーケストレーター | 空ウィンドウが Windows 向けにビルドでき、品質関門がすべて通る |
+| W0-4 | ✅ | Scintilla・Lexilla の同梱 | オーケストレーター | `third_party/` に配置、`VENDORED.md`、対象言語のみ組み込み、`.gitattributes` で外部ソース扱い |
+| S1 | ✅ | 事前検証: Scintilla＋Lexilla を MinGW で静的リンクし、Wine 上で編集ウィンドウを作る | Opus | 単体EXE検査を通る。IME は 🪟 で確認 |
 | S2 | ⬜ | 事前検証: WebView2 の遅延初期化と、ローダーを別DLLなしで使えるか | Opus | 通常起動時に WebView2 関連を一切読み込まないこと。方式を `architecture.md` に記録 |
 | **C0** | 👀 | 共通の取り決め | **Fable** | 版付き文書モデル、コマンド（実行者の記録、機械可読な定義、Undo 単位のまとめ）、文書の機能（保存・Undo 可否）、中止・進捗・件数上限、エラー型、画面に依存しない中核の境界、将来の MCP 中継口の型のみ |
 | **A** | ⬜ | ファイル入出力の中核 | **Fable** | 文字コード判定・変換、BOM・改行保持、変換不能文字の検出、一時ファイル経由の置換、失敗時の保護、外部変更検知。往復の性質テスト |
