@@ -19,8 +19,9 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, VK_CONTROL, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreateMenu, CreatePopupMenu, DestroyMenu, DrawMenuBar, EnableMenuItem, SetMenu,
-    HMENU, MF_BYCOMMAND, MF_ENABLED, MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING,
+    AppendMenuW, CreateMenu, CreatePopupMenu, DestroyMenu, DrawMenuBar, EnableMenuItem,
+    ModifyMenuW, SetMenu, HMENU, MF_BYCOMMAND, MF_ENABLED, MF_GRAYED, MF_POPUP, MF_SEPARATOR,
+    MF_STRING,
 };
 
 use crate::appdata::Settings;
@@ -134,6 +135,8 @@ enum Item {
     CmdArg(CommandId, &'static str, &'static str, &'static str),
     Separator,
     Sub(&'static str, &'static [Item]),
+    /// 最近使ったファイルの枠（1 始まりの番号）。表示名はメニューを開くときに付ける。
+    Recent(u8),
 }
 
 struct MenuDef {
@@ -143,16 +146,35 @@ struct MenuDef {
 
 const ID_FILE_NEW: CommandId = CommandId::new("file.new");
 
+/// 最近使ったファイルのコマンド。
+pub const ID_FILE_OPEN_RECENT: CommandId = CommandId::new("file.open_recent");
+
 static MENUS: &[MenuDef] = &[
     MenuDef {
         title: "ファイル(&F)",
         items: &[
             Item::Cmd(ID_FILE_NEW),
             Item::Cmd(CommandId::new("file.open")),
+            Item::Sub(
+                "最近使ったファイル(&R)",
+                &[
+                    Item::Recent(1),
+                    Item::Recent(2),
+                    Item::Recent(3),
+                    Item::Recent(4),
+                    Item::Recent(5),
+                    Item::Recent(6),
+                    Item::Recent(7),
+                    Item::Recent(8),
+                    Item::Recent(9),
+                    Item::Recent(10),
+                ],
+            ),
             Item::Separator,
             Item::Cmd(CommandId::new("file.save")),
             Item::Cmd(CommandId::new("file.save_as")),
             Item::Separator,
+            Item::Cmd(CommandId::new("file.reload")),
             Item::Sub(
                 "文字コードを指定して開き直す(&E)",
                 &[
@@ -188,8 +210,63 @@ static MENUS: &[MenuDef] = &[
                     ),
                 ],
             ),
+            Item::Sub(
+                "保存時の文字コード(&C)",
+                &[
+                    Item::CmdArg(
+                        CommandId::new("file.save_encoding"),
+                        "UTF-8",
+                        "encoding",
+                        "utf-8",
+                    ),
+                    Item::CmdArg(
+                        CommandId::new("file.save_encoding"),
+                        "UTF-8 (BOM 付き)",
+                        "encoding",
+                        "utf-8-bom",
+                    ),
+                    Item::CmdArg(
+                        CommandId::new("file.save_encoding"),
+                        "UTF-16 LE",
+                        "encoding",
+                        "utf-16le",
+                    ),
+                    Item::CmdArg(
+                        CommandId::new("file.save_encoding"),
+                        "UTF-16 BE",
+                        "encoding",
+                        "utf-16be",
+                    ),
+                    Item::CmdArg(
+                        CommandId::new("file.save_encoding"),
+                        "Shift_JIS (CP932)",
+                        "encoding",
+                        "cp932",
+                    ),
+                ],
+            ),
+            Item::Sub(
+                "保存時の改行(&L)",
+                &[
+                    Item::CmdArg(
+                        CommandId::new("file.save_eol"),
+                        "CRLF (Windows)",
+                        "eol",
+                        "crlf",
+                    ),
+                    Item::CmdArg(CommandId::new("file.save_eol"), "LF (Unix)", "eol", "lf"),
+                    Item::CmdArg(CommandId::new("file.save_eol"), "CR", "eol", "cr"),
+                ],
+            ),
             Item::Separator,
+            Item::Cmd(CommandId::new("file.copy_path")),
+            Item::Cmd(CommandId::new("file.reveal_in_explorer")),
+            Item::Separator,
+            Item::Cmd(CommandId::new("file.new_window")),
             Item::Cmd(CommandId::new("file.close")),
+            Item::Cmd(CommandId::new("file.close_others")),
+            Item::Cmd(CommandId::new("file.close_all")),
+            Item::Separator,
             Item::Cmd(CommandId::new("file.exit")),
         ],
     },
@@ -329,6 +406,30 @@ impl MenuModel {
         }
     }
 
+    /// 開こうとしているメニューのうち、最近使ったファイルの枠の表示名を付け直す。
+    /// `label` は番号（1 始まり）に対する表示名で、なければ「(なし)」にする。
+    pub fn relabel_recent(&self, popup: HMENU, label: impl Fn(usize) -> Option<String>) {
+        for e in self
+            .entries
+            .iter()
+            .filter(|e| e.popup == popup.0 as isize && e.command == ID_FILE_OPEN_RECENT)
+        {
+            let n = e.args["index"].as_u64().unwrap_or(0) as usize;
+            let text = label(n).unwrap_or_else(|| "(なし)".to_owned());
+            let wide = to_wide(&text);
+            // SAFETY: 自分のメニューの項目。
+            unsafe {
+                let _ = ModifyMenuW(
+                    popup,
+                    e.id as u32,
+                    MF_BYCOMMAND | MF_STRING,
+                    e.id as usize,
+                    PCWSTR(wide.as_ptr()),
+                );
+            }
+        }
+    }
+
     /// 項目の有効・無効を全部直す（試験用）。
     pub fn popups(&self) -> Vec<HMENU> {
         let mut v: Vec<isize> = self.entries.iter().map(|e| e.popup).collect();
@@ -380,6 +481,27 @@ fn fill(
                     )
                 }
                 .map_err(unavailable)?;
+            }
+            Item::Recent(n) => {
+                let item_id = *next_id;
+                *next_id += 1;
+                let wide = to_wide("(なし)");
+                // SAFETY: 自分のメニューへの追加。表示名はメニューを開くときに付け直す。
+                unsafe {
+                    AppendMenuW(
+                        popup,
+                        MF_STRING | MF_GRAYED,
+                        item_id as usize,
+                        PCWSTR(wide.as_ptr()),
+                    )
+                }
+                .map_err(unavailable)?;
+                entries.push(MenuEntry {
+                    id: item_id,
+                    command: ID_FILE_OPEN_RECENT,
+                    args: serde_json::json!({ "index": *n }),
+                    popup: popup.0 as isize,
+                });
             }
             Item::Cmd(id) | Item::CmdArg(id, ..) => {
                 let Some(def) = registry.find(id.as_str()) else {

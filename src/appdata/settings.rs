@@ -7,6 +7,7 @@
 //!   "version": 1,
 //!   "theme": "system",
 //!   "keys": { "clipboard.new_tab": "Ctrl+Alt+V", "file.save": "" },
+//!   "recent_files": ["C:\\work\\a.txt"],
 //!   "mcp": { "enabled": false }
 //! }
 //! ```
@@ -15,6 +16,8 @@
 //!   （[`CommandDef::default_key`]）を使う。空文字列は「割り当てなし」。
 //!   グローバルショートカット（クリップボードの展開）も同じ表で、そのコマンドの
 //!   割り当てをエディタ内とグローバルの両方に使う。
+//! - `recent_files`: 最近使ったファイル（新しい順、最大 [`MAX_RECENT_FILES`] 件）。
+//!   存在確認は読み込みでは行わない（選んだときに確かめる）。
 //! - 知らない項目は読み込んだまま保持し、書き戻すときに失わない
 //!   （新しい版が書いた設定を古い版が消さないため）。
 //! - ファイルがなければ既定値。ファイルは設定を変更して保存するときに初めて作る。
@@ -34,6 +37,9 @@ use crate::core::{Error, Result};
 
 /// 現在の設定の形式の版。
 pub const SETTINGS_VERSION: u64 = 1;
+
+/// 最近使ったファイルの最大件数。
+pub const MAX_RECENT_FILES: usize = 10;
 
 /// 明暗テーマの選び方。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -69,6 +75,8 @@ pub struct Settings {
     pub keys: BTreeMap<String, String>,
     /// MCP 連携を有効にするか（既定は無効。次の版で使う）。
     pub mcp_enabled: bool,
+    /// 最近使ったファイル（新しい順）。
+    pub recent_files: Vec<String>,
     /// このプログラムが知らない項目。読み込んだまま書き戻す。
     extra: Map<String, Value>,
 }
@@ -112,6 +120,26 @@ impl Settings {
                 settings.keys.insert(command, key);
             }
         }
+        if let Some(recent) = map.remove("recent_files") {
+            let Value::Array(items) = recent else {
+                return Err(corrupt("recent_files が配列ではありません"));
+            };
+            for item in items {
+                let Value::String(path) = item else {
+                    return Err(corrupt("recent_files に文字列でない要素があります"));
+                };
+                // 新しい順に並んでいる前提で、重複と上限だけ整える。
+                if !path.is_empty()
+                    && settings.recent_files.len() < MAX_RECENT_FILES
+                    && !settings
+                        .recent_files
+                        .iter()
+                        .any(|p| p.eq_ignore_ascii_case(&path))
+                {
+                    settings.recent_files.push(path);
+                }
+            }
+        }
         if let Some(mcp) = map.remove("mcp") {
             let Value::Object(mut mcp) = mcp else {
                 return Err(corrupt("mcp がオブジェクトではありません"));
@@ -144,6 +172,15 @@ impl Settings {
                     .collect(),
             ),
         );
+        map.insert(
+            "recent_files".into(),
+            Value::Array(
+                self.recent_files
+                    .iter()
+                    .map(|p| Value::from(p.as_str()))
+                    .collect(),
+            ),
+        );
         let mcp = map
             .entry("mcp")
             .or_insert_with(|| Value::Object(Map::new()));
@@ -154,6 +191,22 @@ impl Settings {
             .expect("JSON の値は常に文字列にできる");
         text.push('\n');
         text
+    }
+
+    /// 最近使ったファイルの先頭にパスを置く（同じパスは大文字小文字を区別せず 1 つにする）。
+    pub fn push_recent(&mut self, path: String) {
+        if path.is_empty() {
+            return;
+        }
+        self.recent_files
+            .retain(|p| !p.eq_ignore_ascii_case(&path) && p != &path);
+        self.recent_files.insert(0, path);
+        self.recent_files.truncate(MAX_RECENT_FILES);
+    }
+
+    /// 最近使ったファイルから外す。
+    pub fn remove_recent(&mut self, path: &str) {
+        self.recent_files.retain(|p| !p.eq_ignore_ascii_case(path));
     }
 
     /// コマンドに実際に割り当てるキー。設定の割り当てが定義の既定値より優先する。
@@ -232,12 +285,30 @@ mod tests {
             r#"{"mcp":{"enabled":"yes"}}"#,
             r#"{"version":"1"}"#,
             r#"{"version":0}"#,
+            r#"{"recent_files":"a"}"#,
+            r#"{"recent_files":[1]}"#,
         ] {
             assert!(
                 matches!(Settings::from_json(bad), Err(Error::Corrupt { .. })),
                 "{bad}"
             );
         }
+    }
+
+    #[test]
+    fn recent_files_are_deduplicated_limited_and_round_trip() {
+        let mut s = Settings::default();
+        for i in 0..12 {
+            s.push_recent(format!("C:\\work\\{i}.txt"));
+        }
+        s.push_recent("c:\\WORK\\5.TXT".into());
+        assert_eq!(s.recent_files.len(), MAX_RECENT_FILES);
+        assert_eq!(s.recent_files[0], "c:\\WORK\\5.TXT");
+        assert_eq!(s.recent_files[1], "C:\\work\\11.txt");
+        assert!(!s.recent_files.contains(&"C:\\work\\5.txt".to_owned()));
+        s.remove_recent("C:\\work\\11.txt");
+        assert_eq!(s.recent_files[1], "C:\\work\\10.txt");
+        assert_eq!(Settings::from_json(&s.to_json()).unwrap(), s);
     }
 
     #[test]

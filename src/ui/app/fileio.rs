@@ -11,6 +11,8 @@
 //! - 外部変更の確認は、タブを表示したとき・ウィンドウが前面に来たとき・保存の直前。
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 
 use crate::appdata::{AppPaths, Settings};
 use crate::bigfile::{large_mode_reason, FileProfile, LargeModeReason};
@@ -27,6 +29,10 @@ use super::closing::{self, ChoiceAction, ClosePlan};
 use super::{file_title, App, DocView, UiMessage};
 
 // ------------------------------------------------------------------ 設定ファイル
+
+/// 設定の保存の依頼の通し番号と、書き出し済みの最後の番号。
+static SETTINGS_SEQ: AtomicU64 = AtomicU64::new(0);
+static SETTINGS_WRITTEN: Mutex<u64> = Mutex::new(0);
 
 /// 設定ファイルの読み込みの結果。書き戻してよいかを決める。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -176,7 +182,15 @@ impl App {
         let json = self.settings.to_json();
         let sender = self.sender();
         self.settings_state = SettingsState::Loaded;
+        // 続けて何度も保存しても、古い内容が新しい内容を上書きしないよう、書き出しの順番を
+        // 守る（古い番号の書き出しは、新しい番号が書いた後なら捨てる）。
+        let seq = SETTINGS_SEQ.fetch_add(1, Ordering::SeqCst) + 1;
         WorkerPool::global().spawn(move || {
+            let mut last = SETTINGS_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
+            if seq < *last {
+                return;
+            }
+            *last = seq;
             let result = paths.ensure_dir(paths.root()).and_then(|()| {
                 file::write_atomic(
                     &paths.settings_file(),
@@ -184,6 +198,7 @@ impl App {
                     &TaskContext::detached(),
                 )
             });
+            drop(last);
             if let Err(e) = result {
                 sender.send(UiMessage::Status(format!(
                     "設定を保存できませんでした: {}",
@@ -362,6 +377,7 @@ impl App {
                 return;
             }
         };
+        self.add_recent(&request.path);
         if let Some(old) = request.reopen_of {
             let _ = self.close_document(old.document, true);
         }
@@ -434,6 +450,42 @@ impl App {
         let stamp = self.docs[i].state.stamp();
         // 開き直しは同じパスを読むので、重複の判定を通らないようにする。
         self.open_inner(&path, Some((stamp, Some(encoding), bom)))
+    }
+
+    /// ディスクから読み直す（文字コードは自動判定）。未保存の変更があれば確認する
+    /// （破棄される）。外部変更の検知後に、変更を取り込む手段にもなる。
+    pub fn reload_from_disk(&mut self, id: DocumentId) -> Result<()> {
+        let i = self.index_of(id)?;
+        let (path, dirty, title) = {
+            let d = &self.docs[i];
+            let Some(path) = d.state.path().map(Path::to_path_buf) else {
+                return Err(Error::unsupported(
+                    "まだファイルになっていない文書は再読み込みできません",
+                ));
+            };
+            (path, d.state.is_dirty(), d.title.clone())
+        };
+        if !matches!(self.docs[i].state.kind(), DocumentKind::File) {
+            return Err(Error::unsupported(
+                "ファイルではない文書（メモ・巨大ファイルなど）は再読み込みできません",
+            ));
+        }
+        if dirty {
+            let owner = self.hwnd;
+            let prompts = self.prompts.clone();
+            let ok = prompts.confirm(
+                owner,
+                "Linote",
+                &format!(
+                    "「{title}」の未保存の変更は、ディスクから再読み込みすると失われます。\n再読み込みしますか？"
+                ),
+            );
+            if !ok {
+                return Ok(());
+            }
+        }
+        let stamp = self.docs[i].state.stamp();
+        self.open_inner(&path, Some((stamp, None, false)))
     }
 
     // ---------------------------------------------------------------- 外部変更
@@ -681,6 +733,9 @@ impl App {
                     return;
                 }
                 self.recovery_saved(id, saved.doc.version);
+                if matches!(dest, SaveDest::As(_)) {
+                    self.add_recent(&path);
+                }
                 self.set_status(&format!("保存しました: {name}"), MessageKind::Info);
                 match opts.after {
                     After::Nothing => {}

@@ -36,7 +36,7 @@
 
 ## ローカル修正
 
-なし。
+- `scintilla/win32/ScintillaWin.cxx`（U1）: エクスプローラーからのファイルのドラッグ＆ドロップを受け付ける。`DragEnter` で `CF_HDROP` を検出して `hasFiles` を立て、`DragOver` で複写カーソルにし、`Drop` で HDROP の複製を親ウィンドウへ `WM_DROPFILES` として `PostMessage` する（受け手が `DragFinish` で解放する）。テキストのドラッグ＆ドロップの動作は変えない。
 
 ## 更新手順
 

@@ -600,6 +600,16 @@ impl Editor {
         self.send(SCI_SETEOLMODE, mode, 0);
     }
 
+    /// 本文のすべての改行を指定の形式に変換する（編集として Undo できる）。
+    pub fn convert_eols(&self, eol: Eol) {
+        let mode = match eol {
+            Eol::CrLf => SC_EOL_CRLF,
+            Eol::Cr => SC_EOL_CR,
+            Eol::Lf => SC_EOL_LF,
+        };
+        self.send(SCI_CONVERTEOLS, mode, 0);
+    }
+
     pub fn set_wrap(&self, wrap: bool) {
         self.send(
             SCI_SETWRAPMODE,

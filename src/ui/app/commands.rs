@@ -81,6 +81,89 @@ pub const FILE_REOPEN: CommandDef = CommandDef::new(
     "文字コード（utf-8、utf-8-bom、utf-16le、utf-16be、cp932）",
 )]);
 
+pub const FILE_OPEN_RECENT: CommandDef = CommandDef::new(
+    CommandId::new("file.open_recent"),
+    "最近使ったファイル",
+    "最近使ったファイルの一覧から開く（index は 1 が最も新しい。ファイルがなければ案内して一覧から外す）。",
+)
+.params(&[ParamDef::required(
+    "index",
+    ParamType::Integer,
+    "一覧の番号（1 始まり、最大 10）",
+)]);
+
+pub const FILE_RELOAD: CommandDef = CommandDef::new(
+    CommandId::new("file.reload"),
+    "ディスクから再読み込み",
+    "ファイルをディスクから読み直す（文字コードは自動判定）。未保存の変更があれば確認する。",
+)
+.target(TargetKind::Document);
+
+pub const FILE_CLOSE_ALL: CommandDef = CommandDef::new(
+    CommandId::new("file.close_all"),
+    "すべて閉じる",
+    "すべてのタブを閉じる。未保存の文書は 1 つずつ確認し、取り消すとそこで止まる。",
+)
+.result("{\"closed\": 閉じた数}");
+
+pub const FILE_CLOSE_OTHERS: CommandDef = CommandDef::new(
+    CommandId::new("file.close_others"),
+    "ほかのタブをすべて閉じる",
+    "アクティブな文書以外のタブを閉じる。未保存の文書は 1 つずつ確認する。",
+)
+.target(TargetKind::Document)
+.result("{\"closed\": 閉じた数}");
+
+pub const FILE_NEW_WINDOW: CommandDef = CommandDef::new(
+    CommandId::new("file.new_window"),
+    "新しいウィンドウ",
+    "新しいプロセスで Linote を起動する。",
+)
+.default_key("Ctrl+Shift+N");
+
+/// 改行の指定の値。
+const EOLS: &[&str] = &["crlf", "lf", "cr"];
+
+pub const FILE_SAVE_ENCODING: CommandDef = CommandDef::new(
+    CommandId::new("file.save_encoding"),
+    "保存時の文字コード",
+    "保存するときの文字コードを変える（本文は変わらない。保存するまで未保存の変更として扱う）。",
+)
+.target(TargetKind::Document)
+.params(&[ParamDef::required(
+    "encoding",
+    ParamType::Enum(ENCODINGS),
+    "文字コード（utf-8、utf-8-bom、utf-16le、utf-16be、cp932）",
+)])
+.requires(Capabilities::of(&[Capability::SaveAs]));
+
+pub const FILE_SAVE_EOL: CommandDef = CommandDef::new(
+    CommandId::new("file.save_eol"),
+    "保存時の改行",
+    "本文の改行をすべて指定の形式に変換し、保存時の改行にする（Undo できる）。",
+)
+.target(TargetKind::Document)
+.params(&[ParamDef::required(
+    "eol",
+    ParamType::Enum(EOLS),
+    "改行（crlf、lf、cr）",
+)])
+.requires(Capabilities::of(&[Capability::SaveAs]));
+
+pub const FILE_COPY_PATH: CommandDef = CommandDef::new(
+    CommandId::new("file.copy_path"),
+    "フルパスをコピー",
+    "ファイルのフルパスをクリップボードへコピーする。",
+)
+.target(TargetKind::Document);
+
+pub const FILE_REVEAL: CommandDef = CommandDef::new(
+    CommandId::new("file.reveal_in_explorer"),
+    "エクスプローラーで表示",
+    "ファイルをエクスプローラーで選択して開く。",
+)
+.target(TargetKind::Document);
+
 pub const FILE_EXIT: CommandDef =
     CommandDef::new(CommandId::new("file.exit"), "終了", "Linote を終了する。");
 
@@ -281,6 +364,48 @@ pub fn register(registry: &mut Registry<App>) -> Result<()> {
             other => return Err(Error::invalid_argument("encoding", other.to_owned())),
         };
         app.reopen_with_encoding(call.document()?, encoding, bom)?;
+        Ok(Value::Null)
+    })?;
+    registry.register(FILE_OPEN_RECENT, |app, call| {
+        app.open_recent(call.u64("index")?)?;
+        Ok(Value::Null)
+    })?;
+    registry.register(FILE_RELOAD, |app, call| {
+        app.reload_from_disk(call.document()?)?;
+        Ok(Value::Null)
+    })?;
+    registry.register(FILE_CLOSE_ALL, |app, _| {
+        let closed = app.close_all_documents();
+        Ok(serde_json::json!({ "closed": closed }))
+    })?;
+    registry.register(FILE_CLOSE_OTHERS, |app, call| {
+        let closed = app.close_other_documents(call.document()?);
+        Ok(serde_json::json!({ "closed": closed }))
+    })?;
+    registry.register(FILE_NEW_WINDOW, |app, _| {
+        app.spawn_new_window()?;
+        Ok(Value::Null)
+    })?;
+    registry.register(FILE_SAVE_ENCODING, |app, call| {
+        let name = call.str("encoding")?;
+        let (encoding, bom) = super::fileops::parse_encoding(name)
+            .ok_or_else(|| Error::invalid_argument("encoding", name.to_owned()))?;
+        app.set_save_encoding(call.document()?, encoding, bom)?;
+        Ok(Value::Null)
+    })?;
+    registry.register(FILE_SAVE_EOL, |app, call| {
+        let name = call.str("eol")?;
+        let eol = super::fileops::parse_eol(name)
+            .ok_or_else(|| Error::invalid_argument("eol", name.to_owned()))?;
+        app.set_save_eol(call.document()?, eol)?;
+        Ok(Value::Null)
+    })?;
+    registry.register(FILE_COPY_PATH, |app, call| {
+        app.copy_full_path(call.document()?)?;
+        Ok(Value::Null)
+    })?;
+    registry.register(FILE_REVEAL, |app, call| {
+        app.reveal_in_explorer(call.document()?)?;
         Ok(Value::Null)
     })?;
     registry.register(FILE_EXIT, |app, _| {
@@ -613,7 +738,17 @@ impl App {
     pub(super) fn on_init_menu_popup(&mut self, popup: HMENU) {
         let Some(menu) = self.menu.take() else { return };
         let registry = self.registry();
+        let recent = self.settings.recent_files.clone();
+        menu.relabel_recent(popup, |n| {
+            recent
+                .get(n.wrapping_sub(1))
+                .map(|p| super::fileops::recent_menu_label(n, p))
+        });
         menu.update_enabled(popup, |entry| {
+            if entry.command == crate::ui::menu::ID_FILE_OPEN_RECENT {
+                let n = entry.args["index"].as_u64().unwrap_or(0) as usize;
+                return n >= 1 && n <= recent.len();
+            }
             registry
                 .check_available(self, &Invocation::user(entry.command))
                 .is_ok()
