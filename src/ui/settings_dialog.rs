@@ -687,10 +687,10 @@ fn show_page(state: &State<'_>, page: usize) {
     }
 }
 
-/// 部品の値を読んで設定にする。数値が不正なら、その部品と文を返す。
-fn read_controls(dlg: HWND, state: &State<'_>) -> Result<Settings, (HWND, String)> {
+/// 部品の値を読んで設定にする。数値が不正なら、ページ・部品・文を返す。
+fn read_controls(dlg: HWND, state: &State<'_>) -> Result<Settings, (usize, HWND, String)> {
     let mut settings = state.working.clone();
-    for (index, (_, item)) in state.items.iter().enumerate() {
+    for (index, (page, item)) in state.items.iter().enumerate() {
         // SAFETY: 自分のダイアログの部品。
         let Ok(ctl) = dialog_control(dlg, control_id(index, SUB_MAIN)) else {
             continue;
@@ -708,7 +708,7 @@ fn read_controls(dlg: HWND, state: &State<'_>) -> Result<Settings, (HWND, String
             }
             ItemKind::Number { .. } => match item.parse_number(&get_text(ctl)) {
                 Ok(n) => item.set(&mut settings, &ItemValue::Number(n)),
-                Err(e) => return Err((ctl, e.message(item.label))),
+                Err(e) => return Err((*page, ctl, e.message(item.label))),
             },
             // 書体は、選択ボタンで作業用の設定に入っている。
             ItemKind::Font => {
@@ -720,11 +720,24 @@ fn read_controls(dlg: HWND, state: &State<'_>) -> Result<Settings, (HWND, String
     Ok(settings)
 }
 
+/// 入力エラーのページを表示してから、修正する欄へフォーカスを戻す。
+fn reveal_invalid_control(dlg: HWND, state: &State<'_>, page: usize, ctl: HWND) {
+    if let Ok(list) = dialog_control(dlg, ID_PAGE_LIST) {
+        send(list, LB_SETCURSEL, page, 0);
+    }
+    show_page(state, page);
+    // SAFETY: 表示済みの自分の部品。WM_SETFOCUS でスクロール位置も追従する。
+    unsafe {
+        let _ = SetFocus(Some(ctl));
+    }
+    send(ctl, 0xB1 /* EM_SETSEL */, 0, -1);
+}
+
 /// OK・適用。反映できたら `true`（数値が不正で止めたら `false`）。
 fn apply(dlg: HWND, state: &mut State<'_>) -> bool {
     let edited = match read_controls(dlg, state) {
         Ok(s) => s,
-        Err((ctl, message)) => {
+        Err((page, ctl, message)) => {
             let text = to_wide(&message);
             let caption = to_wide("設定");
             // SAFETY: NUL 終端の文字列。
@@ -735,9 +748,8 @@ fn apply(dlg: HWND, state: &mut State<'_>) -> bool {
                     PCWSTR(caption.as_ptr()),
                     MB_OK | MB_ICONWARNING,
                 );
-                let _ = SetFocus(Some(ctl));
             }
-            send(ctl, 0xB1 /* EM_SETSEL */, 0, -1);
+            reveal_invalid_control(dlg, state, page, ctl);
             return false;
         }
     };

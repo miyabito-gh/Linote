@@ -137,6 +137,11 @@ impl App {
         if let Some(stamp) = stamp {
             self.settings_stamp = Some(stamp);
         }
+        if self.settings_writes_pending == 0 {
+            if let Some(reason) = self.settings_reload_pending.take() {
+                self.reload_settings(reason);
+            }
+        }
     }
 
     /// ウィンドウが前面に戻ったとき、設定ファイルが前回読んだときから変わっていれば読み直す。
@@ -165,9 +170,9 @@ impl App {
             return outcome;
         };
         // 書き出しが残っている間は、今の設定のほうが新しい（読み直すと失う）。
-        if self.settings_writes_pending > 0
-            && matches!(reason, ReloadReason::Activated | ReloadReason::BeforeApply)
-        {
+        if self.settings_writes_pending > 0 {
+            // 基準を先に更新すると、待機中の保存が外部変更をローカル変更と誤認する。
+            self.settings_reload_pending = Some(reason);
             return outcome;
         }
         let file = paths.settings_file();
@@ -204,6 +209,10 @@ impl App {
             SettingsState::Loaded => {}
         }
         self.settings_state = SettingsState::Loaded;
+        *self
+            .settings_baseline
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = loaded.clone();
         let old = std::mem::replace(&mut self.settings, loaded);
         outcome.changes = old.diff(&self.settings);
         let notes = self.apply_settings_changes(&old, &outcome.changes);

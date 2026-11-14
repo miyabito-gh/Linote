@@ -163,6 +163,7 @@ impl App {
             source_path: d.state.path().map(std::path::Path::to_path_buf),
             format: d.state.format,
             file_stamp: d.state.disk_stamp(),
+            lossy: d.lossy,
             title: d.title.clone(),
             version: stamp.version,
             text,
@@ -337,6 +338,7 @@ impl App {
         let id = self.open_text(state, &text, title, language, false)?;
         let i = self.index_of(id)?;
         self.docs[i].slot = Some(Arc::new(slot));
+        self.docs[i].lossy = meta.lossy;
         if let Some(note) = note {
             self.set_status(&note, MessageKind::Warning);
         }

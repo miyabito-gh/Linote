@@ -186,7 +186,8 @@ impl App {
             return;
         }
         self.settings.truncate_recent_files();
-        let json = self.settings.to_json();
+        let current = self.settings.clone();
+        let baseline = self.settings_baseline.clone();
         let sender = self.sender();
         self.settings_state = SettingsState::Loaded;
         // 書き出しが終わるまで、設定ファイルの変更の自動検出（再読み込み）は止める
@@ -208,13 +209,11 @@ impl App {
             // よう、短い間隔で数回やり直す。
             let mut attempt = 0;
             let result = loop {
-                let result = paths.ensure_dir(paths.root()).and_then(|()| {
-                    file::write_atomic(
-                        &paths.settings_file(),
-                        json.as_bytes(),
-                        &TaskContext::detached(),
-                    )
-                });
+                let result = crate::appdata::settings::store::save(
+                    &paths.settings_file(),
+                    &mut baseline.lock().unwrap_or_else(|e| e.into_inner()),
+                    &current,
+                );
                 attempt += 1;
                 if result.is_ok() || attempt >= SETTINGS_WRITE_ATTEMPTS {
                     break result;
@@ -249,19 +248,18 @@ impl App {
             return;
         }
         self.settings.truncate_recent_files();
-        let json = self.settings.to_json();
+        let current = self.settings.clone();
+        let baseline = self.settings_baseline.clone();
         self.settings_state = SettingsState::Loaded;
         let seq = SETTINGS_SEQ.fetch_add(1, Ordering::SeqCst) + 1;
         let mut last = SETTINGS_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
         *last = (*last).max(seq);
         for attempt in 1..=SETTINGS_WRITE_ATTEMPTS {
-            let result = paths.ensure_dir(paths.root()).and_then(|()| {
-                file::write_atomic(
-                    &paths.settings_file(),
-                    json.as_bytes(),
-                    &TaskContext::detached(),
-                )
-            });
+            let result = crate::appdata::settings::store::save(
+                &paths.settings_file(),
+                &mut baseline.lock().unwrap_or_else(|e| e.into_inner()),
+                &current,
+            );
             if result.is_ok() {
                 self.settings_stamp = SettingsStamp::of(&paths.settings_file());
                 break;
@@ -871,7 +869,6 @@ impl App {
                 self.set_status("保存を中止しました", MessageKind::Info);
                 return Ok(());
             }
-            self.docs[i].lossy = false;
         }
         if !is_memo {
             self.tidy_before_save(id)?;
@@ -963,6 +960,9 @@ impl App {
                 {
                     self.report_failure("保存の記録に失敗しました", &e);
                     return;
+                }
+                if let Ok(i) = self.index_of(id) {
+                    self.docs[i].lossy = false;
                 }
                 self.recovery_saved(id, saved.doc.version);
                 if matches!(dest, SaveDest::As(_)) {

@@ -681,7 +681,12 @@ impl App {
             if scope.is_some_and(|r| range.start < r.start || range.end > r.end) {
                 return Ok(false);
             }
-            match searcher.replacement_for(ed, range, replacement)? {
+            match searcher.replacement_for_within(
+                ed,
+                range,
+                replacement,
+                scope.unwrap_or_else(|| TextRange::new(0, ed.length())),
+            )? {
                 Some(text) => {
                     EditTarget::replace(ed, range, &text)?;
                     if let Some(r) = scope {

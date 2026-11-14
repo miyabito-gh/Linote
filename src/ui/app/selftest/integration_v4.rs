@@ -36,6 +36,7 @@ pub(super) fn run(ctx: &Ctx) -> Check {
     broken_then_fixed(&file)?;
     reload_applies_everything(&file)?;
     own_write_is_not_reloaded(&file)?;
+    reload_waits_for_queued_settings(&file)?;
     external_change_is_detected(&file)?;
     open_and_save_settings_file(&file)?;
     scripted_dialog(ctx, &file)?;
@@ -886,5 +887,39 @@ fn keys_page(ctx: &Ctx, file: &Path) -> Check {
     settle()?;
     let text = std::fs::read_to_string(file).map_err(|e| e.to_string())?;
     check!(!text.contains("Ctrl+Alt+K"), "keys が消えた {text}");
+    Ok(())
+}
+
+/// 再読み込みでキュー内の保存の差分基準を先に変えない。
+fn reload_waits_for_queued_settings(file: &Path) -> Check {
+    use crate::ui::app::settingsops::ReloadReason;
+    settle()?;
+    for reason in [ReloadReason::Manual, ReloadReason::SavedInTab] {
+        write(file, "{}")?;
+        cmd("app.reload_settings", Value::Null)?;
+        write(file, r#"{"theme":"dark"}"#)?;
+        step(|app| -> Check {
+            let baseline = app.settings_baseline.lock().unwrap().clone();
+            // ワーカーが待機している状態を決定的に再現する。
+            app.settings_writes_pending = 1;
+            app.reload_settings(reason);
+            check!(app.settings == baseline, "待機中に設定を読み直した");
+            check!(
+                *app.settings_baseline.lock().unwrap() == baseline,
+                "差分の基準が変わった"
+            );
+            check!(
+                app.settings_reload_pending == Some(reason),
+                "再読み込みが予約されない"
+            );
+            app.settings_written(None);
+            check!(
+                app.settings.theme == ThemeMode::Dark,
+                "保存完了後に読み直さない"
+            );
+            check!(app.settings_reload_pending.is_none(), "予約が残る");
+            Ok(())
+        })??;
+    }
     Ok(())
 }

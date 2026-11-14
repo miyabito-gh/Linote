@@ -390,6 +390,7 @@ impl RecoverySlot {
             source_path: snapshot.source_path.clone(),
             format: snapshot.format,
             file_stamp: snapshot.file_stamp,
+            lossy: snapshot.lossy,
             title: snapshot.title.clone(),
             doc_version: snapshot.version,
             created_ms,

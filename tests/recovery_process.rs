@@ -48,6 +48,7 @@ fn snapshot(version: u64, text: String) -> Snapshot {
         source_path: Some(PathBuf::from("C:\\shared\\same.txt")),
         format: TextFormat::DEFAULT,
         file_stamp: None,
+        lossy: false,
         title: "same.txt".into(),
         version: Version::from_raw(version),
         text,

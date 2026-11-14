@@ -99,6 +99,8 @@ pub struct Snapshot {
     pub format: TextFormat,
     /// 開いたとき（保存したとき）の元ファイルの状態。復元時の外部変更の検知に使う。
     pub file_stamp: Option<FileStamp>,
+    /// 読み込み時に不正バイトを置き換えた。保存前の警告を復元後も保つ。
+    pub lossy: bool,
     pub title: String,
     /// この本文の版（書き出しの新旧の照合に使う）。
     pub version: Version,
@@ -113,6 +115,8 @@ pub struct Meta {
     pub source_path: Option<PathBuf>,
     pub format: TextFormat,
     pub file_stamp: Option<FileStamp>,
+    /// 読み込み時に不正バイトを置き換えた。保存前の警告を復元後も保つ。
+    pub lossy: bool,
     pub title: String,
     /// 書き出したプロセスでの版。他のプロセスでは意味を持たず、参考情報。
     pub doc_version: Version,
@@ -185,6 +189,7 @@ pub(crate) fn encode(meta: &Meta, text: &str) -> Vec<u8> {
         "bom": meta.format.bom,
         "eol": meta.format.eol.label(),
         "file_stamp": stamp,
+        "lossy": meta.lossy,
         "title": meta.title,
         "doc_version": meta.doc_version.as_u64(),
         "created_ms": meta.created_ms,
@@ -281,6 +286,12 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<(Meta, String), DecodeError> {
         source_path,
         format: TextFormat { encoding, bom, eol },
         file_stamp,
+        // 旧形式にはフラグがない。置換文字がある本文は安全側で保存確認する。
+        lossy: match h.get("lossy") {
+            Some(Value::Bool(value)) => *value,
+            None => text.contains('\u{fffd}'),
+            Some(_) => return Err(corrupt("`lossy` が不正")),
+        },
         title: get_str(h, "title")?.to_owned(),
         doc_version: Version::from_raw(get_u64(h, "doc_version")?),
         created_ms: get_u64(h, "created_ms")?,
@@ -313,6 +324,7 @@ mod tests {
                     index: 0x0123_4567_89ab_cdef_0011_2233_4455_6677,
                 }),
             }),
+            lossy: false,
             title: "メモ.txt".into(),
             doc_version: Version::from_raw(7),
             created_ms: 10,
@@ -331,6 +343,25 @@ mod tests {
         let (got, body) = decode(&bytes).unwrap();
         assert_eq!(got, meta);
         assert_eq!(body, text);
+    }
+
+    #[test]
+    fn lossy_flag_and_legacy_replacement_text_remain_protected() {
+        let mut meta = sample_meta("lossy-1");
+        meta.lossy = true;
+        assert!(decode(&encode(&meta, "replaced")).unwrap().0.lossy);
+        meta.lossy = false;
+        assert!(!decode(&encode(&meta, "\u{fffd}")).unwrap().0.lossy);
+        let bytes = encode(&meta, "\u{fffd}");
+        let legacy = String::from_utf8(bytes)
+            .unwrap()
+            .replace("\"lossy\":false,", "");
+        assert!(decode(legacy.as_bytes()).unwrap().0.lossy);
+        let malformed = legacy.replacen("\"kind\":", "\"lossy\":1,\"kind\":", 1);
+        assert!(matches!(
+            decode(malformed.as_bytes()),
+            Err(DecodeError::Corrupt(_))
+        ));
     }
 
     #[test]

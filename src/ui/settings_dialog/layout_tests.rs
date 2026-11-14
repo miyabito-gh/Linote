@@ -222,3 +222,60 @@ fn capture(dlg: HWND, dpi: u32, page: &str) {
         let _ = std::fs::write(root.join(format!("{dpi}-{page}.bmp")), bmp);
     }
 }
+
+#[test]
+fn invalid_setting_on_hidden_page_is_revealed_and_selected() {
+    let owner = unsafe {
+        CreateWindowExW(
+            WINDOW_EX_STYLE::default(),
+            windows::core::w!("STATIC"),
+            windows::core::w!("settings validation test"),
+            WS_OVERLAPPEDWINDOW,
+            0,
+            0,
+            1000,
+            700,
+            None,
+            None,
+            None,
+            None,
+        )
+    }
+    .expect("test owner");
+    let mut session = Session;
+    let mut driver = |dlg| {
+        assert!(select_page(dlg, "view"));
+        let ctl = item_control(dlg, "view.font_size").expect("font size control");
+        set_text(ctl, "999");
+        assert!(select_page(dlg, "general"));
+        assert!(!unsafe { IsWindowVisible(ctl) }.as_bool());
+        let state = state_of(dlg).expect("dialog state");
+        let (page, invalid, _) = read_controls(dlg, state).expect_err("invalid font size");
+        assert_eq!(invalid, ctl);
+        reveal_invalid_control(dlg, state, page, invalid);
+        assert!(unsafe { IsWindowVisible(ctl) }.as_bool());
+        let list = dialog_control(dlg, ID_PAGE_LIST).unwrap();
+        assert_eq!(send(list, super::LB_GETCURSEL, 0, 0), page as isize);
+        assert_eq!(
+            unsafe { windows::Win32::UI::Input::KeyboardAndMouse::GetFocus() },
+            ctl
+        );
+        // EM_GETSEL returns the selection bounds packed into the result.
+        assert_eq!(send(ctl, 0xB0, 0, 0) as u32, 3 << 16);
+        let mut control_rect = RECT::default();
+        let mut page_rect = RECT::default();
+        unsafe {
+            GetWindowRect(ctl, &mut control_rect).unwrap();
+            GetWindowRect(GetParent(ctl).unwrap(), &mut page_rect).unwrap();
+        }
+        assert!(control_rect.top >= page_rect.top);
+        assert!(control_rect.bottom <= page_rect.bottom);
+        set_text(ctl, "12");
+        assert!(read_controls(dlg, state).is_ok());
+        press(dlg, IDCANCEL.0);
+    };
+    run_at_dpi(owner, &mut session, Some(&mut driver), 192);
+    unsafe {
+        let _ = DestroyWindow(owner);
+    }
+}

@@ -54,6 +54,7 @@ use crate::text::{Encoding, Eol, TextFormat};
 
 mod items;
 pub mod keybind;
+pub mod store;
 
 pub use items::{
     apply_edits, edited_items, pages, Choice, Item, ItemKind, ItemValue, Page, PageKind,

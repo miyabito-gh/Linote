@@ -88,6 +88,7 @@ pub(super) fn run(ctx: &Ctx) -> Check {
     closing(ctx)?;
     reopen_with_encoding(ctx)?;
     recovery(ctx)?;
+    lossy_recovery_and_failed_save(ctx)?;
     memos(ctx)?;
     editing_commands(ctx)?;
     clipboard_tab()?;
@@ -507,6 +508,7 @@ fn recovery(ctx: &Ctx) -> Check {
                 source_path: None,
                 format: TextFormat::DEFAULT,
                 file_stamp: None,
+                lossy: false,
                 title: title.to_owned(),
                 version: Version::INITIAL.next(),
                 text: text.to_owned(),
@@ -802,5 +804,88 @@ fn menu_keys_and_settings(ctx: &Ctx) -> Check {
         std::fs::read_to_string(&broken).map_err(|e| e.to_string())? == "{ broken",
         "壊れた設定ファイルを上書きした"
     );
+    Ok(())
+}
+
+/// 不可逆な読み込みの警告は復元・保存失敗後も保持し、成功時だけ解除する。
+fn lossy_recovery_and_failed_save(ctx: &Ctx) -> Check {
+    let source = ctx.dir.join("lossy-recovery.txt");
+    std::fs::write(&source, b"\xef\xbb\xbf\xff").map_err(|e| e.to_string())?;
+    let id = open_and_wait(&source)?;
+    step(|app| app.with_text(id, |ed| ed.set_text("\u{fffd} edited")))?.map_err(super::e2s)?;
+    step(|app| app.flush_pending_writes())?;
+    wait("不正バイト文書の復元書き出し", |app| {
+        app.document(id)
+            .is_some_and(|d| d.slot.is_some() && !d.write_in_flight)
+    })?;
+    let store = RecoveryStore::new(&ctx.paths);
+    check!(
+        store
+            .scan()
+            .map_err(|e| e.to_string())?
+            .live
+            .iter()
+            .any(|entry| {
+                entry
+                    .meta
+                    .as_ref()
+                    .is_some_and(|meta| meta.source_path.as_deref() == Some(&source) && meta.lossy)
+            }),
+        "復元ファイルに警告状態が保存されない"
+    );
+    // クラッシュのように復元データを残してタブを閉じる。
+    let slot = step(|app| {
+        let i = app.index_of(id).unwrap();
+        app.docs[i].slot.take().unwrap()
+    })?;
+    wait("復元書き出しの参照解放", |_| {
+        std::sync::Arc::strong_count(&slot) == 1
+    })?;
+    std::sync::Arc::try_unwrap(slot)
+        .map_err(|_| "復元枠が使用中")?
+        .release_keeping_data();
+    step(|app| app.close_document(id, true))?.map_err(super::e2s)?;
+    let report = store.scan().map_err(|e| e.to_string())?;
+    ctx.prompts
+        .restore
+        .borrow_mut()
+        .push_back(RestoreChoice::Restore);
+    step(|app| app.offer_restore(report))?;
+    let restored = step(|app| {
+        app.docs
+            .iter()
+            .find(|d| d.state.path() == Some(source.as_path()))
+            .map(|d| d.id())
+    })?
+    .ok_or("復元した文書がない")?;
+    step(|app| app.activate(restored))?.map_err(super::e2s)?;
+    check!(
+        step(|app| app.document(restored).unwrap().lossy)?,
+        "復元後の警告状態が消えた"
+    );
+    let before = std::fs::read(&source).map_err(|e| e.to_string())?;
+    // 確認に承諾しても、保存先がフォルダーなら保存は失敗する。
+    ctx.prompts.confirm.borrow_mut().push_back(true);
+    cmd("file.save_as", json!({"path": ctx.dir.to_string_lossy()}))?;
+    wait("保存失敗", |app| {
+        app.document(restored).is_some_and(|d| !d.saving)
+    })?;
+    check!(
+        step(|app| app.document(restored).unwrap().lossy)?,
+        "保存失敗で警告が消えた"
+    );
+    ctx.prompts.confirm.borrow_mut().push_back(false);
+    save_and_wait(restored)?;
+    check!(
+        std::fs::read(&source).map_err(|e| e.to_string())? == before,
+        "警告を断ったのに上書きした"
+    );
+    ctx.prompts.confirm.borrow_mut().push_back(true);
+    save_and_wait(restored)?;
+    check!(
+        !step(|app| app.document(restored).unwrap().lossy)?,
+        "保存成功後も警告状態が残る"
+    );
+    step(|app| app.close_document(restored, true))?.map_err(super::e2s)?;
     Ok(())
 }

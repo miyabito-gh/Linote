@@ -10,6 +10,7 @@ fn snap(version: u64, text: &str) -> Snapshot {
         source_path: Some(PathBuf::from("C:\\a.txt")),
         format: TextFormat::DEFAULT,
         file_stamp: None,
+        lossy: false,
         title: "a.txt".into(),
         version: Version::from_raw(version),
         text: text.into(),

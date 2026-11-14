@@ -16,6 +16,8 @@ use crate::document::{EditTarget, TextRange, TextSource};
 const CHUNK: u64 = 1 << 20;
 const MAX_WINDOW: u64 = 64 << 20;
 const OVERLAP: u64 = 64 << 10;
+// 前後の Unicode 文字を残し、窓の境界を文書や単語の境界と誤認しない。
+const CONTEXT: u64 = 4;
 const MAX_PATTERN_BYTES: usize = 4096;
 const REGEX_SIZE_LIMIT: usize = 4 << 20;
 /// 現在の選択を置換するときに読む最大の長さ。
@@ -181,14 +183,15 @@ impl Searcher {
             if ctx.cancel.is_cancelled() {
                 return Ok(Completion::Cancelled);
             }
-            let raw = read_window(src, pos, window)?;
+            let read_start = pos.saturating_sub(CONTEXT);
+            let raw = read_window(src, read_start, window + pos - read_start)?;
             if raw.is_empty() {
                 break;
             }
-            let skip = if pos > 0 { lead_skip(&raw) } else { 0 };
-            let at_eof = pos + raw.len() as u64 >= len;
+            let skip = if read_start > 0 { lead_skip(&raw) } else { 0 };
+            let at_eof = read_start + raw.len() as u64 >= len;
             let (segments, consumed) = valid_segments(&raw[skip..]);
-            let base = pos + skip as u64;
+            let base = read_start + skip as u64;
             let mut next = base + consumed as u64;
             if !at_eof {
                 // 窓の終わりで切れた一致を次の窓で拾うため、少し重ねる。
@@ -198,11 +201,25 @@ impl Searcher {
             'segments: for (i, (offset, text)) in segments.iter().enumerate() {
                 let last = i + 1 == segments.len();
                 let is_final = !last || at_eof || consumed < raw.len() - skip;
-                for caps in self.regex.captures_iter(text) {
+                let segment_base = base + *offset as u64;
+                let mut at = min_start.max(pos).saturating_sub(segment_base) as usize;
+                // カーソルが UTF-8 の文字の途中なら、その文字の次から検索する。
+                while at < text.len() && !text.is_char_boundary(at) {
+                    at += 1;
+                }
+                while at <= text.len() {
+                    let Some(caps) = self.regex.captures_at(text, at) else {
+                        break;
+                    };
                     let m = caps.get(0).expect("group 0");
                     if m.is_empty() {
+                        let Some(ch) = text[m.end()..].chars().next() else {
+                            break;
+                        };
+                        at = m.end() + ch.len_utf8();
                         continue;
                     }
+                    at = m.end();
                     let start = base + (*offset + m.start()) as u64;
                     let end = base + (*offset + m.end()) as u64;
                     if start < min_start {
@@ -229,7 +246,7 @@ impl Searcher {
             }
             window = CHUNK;
             if next <= pos {
-                next = pos + raw.len() as u64;
+                next = read_start + raw.len() as u64;
             }
             pos = next;
             ctx.report(pos.saturating_sub(from), Some(len.saturating_sub(from)));
@@ -250,7 +267,7 @@ impl Searcher {
                 return Ok((None, Completion::Cancelled));
             }
             let ws = end.saturating_sub(CHUNK);
-            let raw = read_window(src, ws, end - ws)?;
+            let raw = read_window(src, ws, end - ws + CONTEXT)?;
             let skip = if ws > 0 { lead_skip(&raw) } else { 0 };
             let base = ws + skip as u64;
             let safe_from = if ws == 0 { 0 } else { ws + OVERLAP };
@@ -259,7 +276,10 @@ impl Searcher {
                 let mut best = None;
                 for m in self.regex.find_iter(text) {
                     let start = base + (*offset + m.start()) as u64;
-                    if !m.is_empty() && start >= safe_from {
+                    if !m.is_empty()
+                        && start >= safe_from
+                        && base + (*offset + m.end()) as u64 <= end
+                    {
                         best = Some(start..base + (*offset + m.end()) as u64);
                     }
                 }
@@ -391,13 +411,57 @@ impl Searcher {
         range: TextRange,
         replacement: &str,
     ) -> Result<Option<String>> {
-        if range.is_empty() {
+        self.replacement_for_within(src, range, replacement, TextRange::new(0, src.len()))
+    }
+
+    /// 検索対象 `scope` の前後を含めて一致を検査する（範囲の外側は文脈に含めない）。
+    pub fn replacement_for_within(
+        &self,
+        src: &dyn TextSource,
+        range: TextRange,
+        replacement: &str,
+        scope: TextRange,
+    ) -> Result<Option<String>> {
+        scope.check_within(src.len())?;
+        range.check_within(src.len())?;
+        if range.is_empty() || range.start < scope.start || range.end > scope.end {
             return Ok(None);
         }
-        let bytes = src.read_range(range, MAX_REPLACE_TARGET)?;
-        Ok(std::str::from_utf8(&bytes)
-            .ok()
-            .and_then(|t| self.expand(t, replacement)))
+        if range.len() > MAX_REPLACE_TARGET {
+            return Err(Error::LimitExceeded {
+                what: "読み取る範囲".into(),
+                limit: MAX_REPLACE_TARGET,
+            });
+        }
+        let start = range.start.saturating_sub(CONTEXT).max(scope.start);
+        let end = range.end.saturating_add(CONTEXT).min(scope.end);
+        let bytes = src.read_range(TextRange::new(start, end), MAX_REPLACE_TARGET + 2 * CONTEXT)?;
+        let (segments, _) = valid_segments(&bytes);
+        for (offset, text) in segments {
+            let base = start + offset as u64;
+            if base > range.start || base + (text.len() as u64) < range.end {
+                continue;
+            }
+            let at = (range.start - base) as usize;
+            if !text.is_char_boundary(at) {
+                return Ok(None);
+            }
+            let Some(caps) = self.regex.captures_at(text, at) else {
+                return Ok(None);
+            };
+            let matched = caps.get(0).expect("group 0");
+            if matched.start() != at || base + matched.end() as u64 != range.end {
+                return Ok(None);
+            }
+            let mut out = String::new();
+            if self.regex_mode {
+                caps.expand(replacement, &mut out);
+            } else {
+                out.push_str(replacement);
+            }
+            return Ok(Some(out));
+        }
+        Ok(None)
     }
 
     /// すべて置換する。Undo は 1 単位。上限・中止で途中になる場合は何も変更しない
@@ -469,6 +533,114 @@ mod tests {
         s.find(&MemoryText::new(text), from, dir, wrap, &ctx())
             .unwrap()
             .value
+    }
+
+    #[test]
+    fn search_from_caret_preserves_anchors_and_word_boundaries() {
+        let regex = |query: &str| SearchOptions {
+            query: query.into(),
+            regex: true,
+            ..Default::default()
+        };
+        assert!(find("abcabc", &regex("^abc"), 3, Direction::Forward, false).is_none());
+        assert!(find("abcXYZ", &regex("abc$"), 3, Direction::Backward, false).is_none());
+        let word = SearchOptions {
+            whole_word: true,
+            ..SearchOptions::literal("cat")
+        };
+        assert!(find("concat", &word, 3, Direction::Forward, false).is_none());
+        assert!(find("catfish", &word, 3, Direction::Backward, false).is_none());
+        // 文脈を残しても、検索開始より前の貪欲な一致に結果を吸収させない。
+        let hit = find("aaaaa", &regex("a+"), 3, Direction::Forward, false).unwrap();
+        assert_eq!(hit.range, TextRange::new(3, 5));
+        let hit = find("x\nabc", &regex("(?m)^abc"), 2, Direction::Forward, false).unwrap();
+        assert_eq!(hit.range, TextRange::new(2, 5));
+        assert!(find("あcat", &word, 3, Direction::Forward, false).is_none());
+    }
+
+    #[test]
+    fn window_edges_are_not_regex_anchors_or_word_boundaries() {
+        let src = MemoryText::new("x".repeat(3 * CHUNK as usize));
+        for query in ["^x", "x$", r"\bx", r"x\b"] {
+            let options = SearchOptions {
+                query: query.into(),
+                regex: true,
+                ..Default::default()
+            };
+            let searcher = options.compile().unwrap();
+            assert_eq!(searcher.count(&src, &ctx()).unwrap().value, 1, "{query}");
+        }
+        // 後ろ向きの各窓の右端も、文書末尾としては扱わない。
+        let opts = SearchOptions {
+            query: "x$".into(),
+            regex: true,
+            ..Default::default()
+        };
+        assert!(find(
+            &"x".repeat(3 * CHUNK as usize),
+            &opts,
+            2 * CHUNK,
+            Direction::Backward,
+            false
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn single_replace_checks_context_and_respects_search_scope() {
+        let src = MemoryText::new("concatenate");
+        let opts = SearchOptions {
+            whole_word: true,
+            ..SearchOptions::literal("cat")
+        };
+        let searcher = opts.compile().unwrap();
+        let range = TextRange::new(3, 6);
+        assert_eq!(searcher.replacement_for(&src, range, "DOG").unwrap(), None);
+        assert_eq!(
+            searcher
+                .replacement_for_within(&src, range, "DOG", range)
+                .unwrap()
+                .as_deref(),
+            Some("DOG")
+        );
+        for query in ["^cat", "cat$", r"\Acat", r"cat\z"] {
+            let searcher = SearchOptions {
+                query: query.into(),
+                regex: true,
+                ..Default::default()
+            }
+            .compile()
+            .unwrap();
+            assert_eq!(
+                searcher.replacement_for(&src, range, "DOG").unwrap(),
+                None,
+                "{query}"
+            );
+            assert_eq!(
+                searcher
+                    .replacement_for_within(&src, range, "DOG", range)
+                    .unwrap()
+                    .as_deref(),
+                Some("DOG"),
+                "{query}"
+            );
+        }
+        let src = MemoryText::new("😀😀cat😀");
+        let searcher = opts.compile().unwrap();
+        assert_eq!(
+            searcher
+                .replacement_for(&src, TextRange::new(8, 11), "DOG")
+                .unwrap()
+                .as_deref(),
+            Some("DOG")
+        );
+        let src = MemoryText::new("あcatい");
+        assert_eq!(
+            searcher
+                .replacement_for(&src, TextRange::new(3, 6), "DOG")
+                .unwrap(),
+            None
+        );
     }
 
     #[test]

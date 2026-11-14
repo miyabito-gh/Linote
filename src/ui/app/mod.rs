@@ -43,6 +43,7 @@ mod session;
 mod settingsops;
 mod tabextras;
 mod tabops;
+mod tabwheel;
 mod viewopts;
 
 use std::cell::{Cell, RefCell};
@@ -313,11 +314,13 @@ pub struct App {
     receiver: UiReceiver<UiMessage>,
     untitled_counter: u32,
     tracking_mouse: bool,
+    tab_wheel: tabwheel::TabWheel,
     dragging_splitter: bool,
     exit_without_confirmation: bool,
     /// データの保存場所（決められなければ `None`。メモ・復元・設定の保存は使えない）。
     paths: Option<AppPaths>,
     settings: Settings,
+    settings_baseline: std::sync::Arc<std::sync::Mutex<Settings>>,
     settings_state: fileio::SettingsState,
     /// 次に開く設定画面を「キー」ページから始める（ヘルプ > キーボード ショートカット）。
     settings_open_keys: bool,
@@ -326,6 +329,7 @@ pub struct App {
     settings_stamp: Option<crate::appdata::settings::SettingsStamp>,
     /// 書き出し中の設定の保存の数。0 でない間は、設定ファイルの変更の自動検出を止める。
     settings_writes_pending: u32,
+    settings_reload_pending: Option<settingsops::ReloadReason>,
     prompts: Rc<dyn Prompts>,
     keymap: KeyMap,
     menu: Option<MenuModel>,
@@ -621,7 +625,8 @@ pub fn message_loop() -> i32 {
             break;
         }
         let handled = with_app(|app| {
-            app.translate_shortcut(&msg)
+            app.translate_tab_wheel(&msg)
+                || app.translate_shortcut(&msg)
                 || match app.hooks.pre_translate {
                     Some(f) => f(app, &msg),
                     None => false,
@@ -704,11 +709,14 @@ impl App {
             receiver,
             untitled_counter: 0,
             tracking_mouse: false,
+            tab_wheel: tabwheel::TabWheel::default(),
             dragging_splitter: false,
             exit_without_confirmation: false,
             paths,
             settings_stamp: paths_stamp,
             settings_writes_pending: 0,
+            settings_reload_pending: None,
+            settings_baseline: std::sync::Arc::new(std::sync::Mutex::new(settings.clone())),
             settings,
             settings_state,
             settings_open_keys: false,
@@ -1635,6 +1643,7 @@ impl App {
         let x = (lparam.0 & 0xFFFF) as i16 as i32;
         let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
         match msg {
+            windows::Win32::UI::WindowsAndMessaging::WM_MOUSEWHEEL => self.on_tab_wheel(wparam, lparam).then_some(LRESULT(0)),
             WM_SIZE => {
                 self.relayout();
                 Some(LRESULT(0))
