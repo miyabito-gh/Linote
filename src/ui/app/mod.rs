@@ -325,6 +325,8 @@ pub struct App {
     memo_panel: Option<MemoPanel>,
     /// 検索・置換・Grep の小窓（初めて使うときに作る）。
     find_panel: Option<FindPanel>,
+    /// 「選択範囲内」をオンにしている文書（範囲はその文書のインジケーターが持つ）。
+    scope_doc: Option<DocumentId>,
     /// 最後に使った検索条件（F3 用）。
     last_search: Option<SearchOptions>,
     /// 検索の一致の強調表示（U3）。
@@ -674,6 +676,7 @@ impl App {
             hotkey: None,
             memo_panel: None,
             find_panel: None,
+            scope_doc: None,
             last_search: None,
             highlight: highlight::Highlight::default(),
             search_cancel: None,
@@ -1119,6 +1122,9 @@ impl App {
         if self.highlight_doc().is_some_and(|d| d != id) {
             self.clear_highlight();
         }
+        if self.scope_doc.is_some_and(|d| d != id) {
+            self.clear_scope();
+        }
         if let Some(cur) = self.active {
             match self.docs[cur].view {
                 DocView::Scintilla(_) => self.docs[cur].view_state = self.editor.view_state(),
@@ -1263,6 +1269,7 @@ impl App {
     fn deactivate_all(&mut self) {
         self.sync();
         self.clear_highlight();
+        self.clear_scope();
         if let Some(cur) = self.active.take() {
             match self.docs[cur].view {
                 DocView::Scintilla(_) => {

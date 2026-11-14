@@ -108,6 +108,8 @@ pub(super) fn run(ctx: &Ctx) -> Check {
     f3_without_panel()?;
     big_mode_f3(ctx)?;
     replace_in_selection()?;
+    scope_search()?;
+    search_history()?;
     line_commands()?;
     text_commands()?;
     brace()?;
@@ -425,16 +427,26 @@ fn big_mode_f3(ctx: &Ctx) -> Check {
     close(id)
 }
 
+fn scope_of_doc(id: DocumentId) -> Result<Option<(u64, u64)>, String> {
+    step(|app| app.with_text(id, |ed| ed.search_scope().map(|r| (r.start, r.end))))?
+        .map_err(super::e2s)
+}
+
 fn replace_in_selection() -> Check {
     reset_search()?;
     let original = "foo foo\nfoo foo\n";
     let id = new_doc(original)?;
     select(id, 0, 7)?;
+    step(|app| app.set_scope(true))?;
+    check!(
+        scope_of_doc(id)? == Some((0, 7)),
+        "範囲の印 {:?}",
+        scope_of_doc(id)?
+    );
     step(|app| {
         app.on_find_event(FindEvent::ReplaceAll {
             options: options("foo", true),
             replacement: "XY".into(),
-            in_selection: true,
         })
     })?;
     check!(
@@ -447,12 +459,22 @@ fn replace_in_selection() -> Check {
         "置換後の範囲を選ぶ {:?}",
         step(selection)?
     );
+    check!(
+        scope_of_doc(id)? == Some((0, 5)),
+        "置換後の範囲の印 {:?}",
+        scope_of_doc(id)?
+    );
     cmd("edit.undo", Value::Null)?;
     check!(text(id)? == original, "Undo 1 回で戻る {:?}", text(id)?);
-    // 選択がなければ何もしない。
+    step(|app| app.set_scope(false))?;
+    check!(scope_of_doc(id)?.is_none(), "解除で印が消える");
+    // 選択がなければオンにできない（何も置換しない）。
     select(id, 3, 3)?;
-    step(|app| app.replace_in_selection(options("foo", true), "Q".into()))?;
-    check!(text(id)? == original, "選択なしは置換しない");
+    step(|app| app.set_scope(true))?;
+    check!(
+        step(|app| app.scope_doc.is_none())?,
+        "選択なしでは範囲にならない"
+    );
     check!(
         step(|app| status(app).contains("選択範囲がありません"))?,
         "案内 {:?}",
@@ -461,8 +483,9 @@ fn replace_in_selection() -> Check {
     // 正規表現（$1）とワーカー。
     step(|app| app.worker_search_bytes = 0)?;
     select(id, 8, 15)?;
+    step(|app| app.set_scope(true))?;
     step(|app| {
-        app.replace_in_selection(
+        app.replace_all(
             SearchOptions {
                 query: "(f)(oo)".into(),
                 regex: true,
@@ -476,7 +499,131 @@ fn replace_in_selection() -> Check {
         text_of(app, id) == "foo foo\noof oof\n"
     })?;
     step(|app| app.worker_search_bytes = super::super::search::WORKER_SEARCH_BYTES)?;
+    step(|app| app.set_scope(false))?;
     close(id)
+}
+
+/// 選択範囲内の検索（次へ・前へ・強調・件数）と、編集で範囲がずれても追従すること、
+/// 別のタブへ切り替えると解除されること、文書 0 件でも安全なこと。
+fn scope_search() -> Check {
+    reset_search()?;
+    let id = new_doc("foo\nfoo foo\nfoo\n")?;
+    step(|app| {
+        let _ = app.show_find(false);
+        if let Some(p) = app.find_panel {
+            p.set_query("foo");
+        }
+    })?;
+    select(id, 4, 11)?;
+    step(|app| app.set_scope(true))?;
+    wait("範囲内だけ強調", |app| app.highlight_count() == 2)?;
+    select(id, 0, 0)?;
+    let o = options("foo", true);
+    for (dir, want) in [
+        (crate::search::Direction::Forward, (4, 7)),
+        (crate::search::Direction::Forward, (8, 11)),
+        (crate::search::Direction::Forward, (4, 7)),
+        (crate::search::Direction::Backward, (8, 11)),
+    ] {
+        let o = o.clone();
+        step(move |app| app.search_step(o, dir))?;
+        check!(
+            step(selection)? == want,
+            "範囲内の移動 {:?} != {want:?}",
+            step(selection)?
+        );
+    }
+    // 範囲の手前に挿入すると、範囲もずれる。
+    step(|app| {
+        app.with_text(id, |ed| {
+            crate::document::EditTarget::replace(ed, crate::document::TextRange::new(0, 0), "ab\n")
+        })
+    })?
+    .map_err(super::e2s)?
+    .map_err(super::e2s)?;
+    check!(
+        scope_of_doc(id)? == Some((7, 14)),
+        "範囲が追従する {:?}",
+        scope_of_doc(id)?
+    );
+    // 「置換」は範囲の外の一致を置換しない。
+    select(id, 0, 0)?;
+    step(|app| app.replace_one(options("foo", true), "Q"))?;
+    check!(
+        text(id)? == "ab\nfoo\nfoo foo\nfoo\n" && step(selection)? == (7, 10),
+        "範囲外は置換せず範囲内の次へ {:?} {:?}",
+        text(id)?,
+        step(selection)?
+    );
+    // 別のタブへ切り替えると範囲は解除される。
+    step(|app| {
+        if let Some(p) = app.find_panel {
+            p.set_in_selection(true);
+        }
+    })?;
+    let other = new_doc("zzz")?;
+    check!(
+        step(|app| app.scope_doc.is_none() && !app.find_panel.is_some_and(|p| p.in_selection()))?,
+        "タブ切り替えで解除"
+    );
+    check!(scope_of_doc(id)?.is_none(), "元の文書の印も消える");
+    close(other)?;
+    // 解除すれば全体が対象に戻る。
+    step(move |app| app.activate(id)).and_then(|r| r.map_err(super::e2s))?;
+    wait("全体を強調", |app| {
+        app.highlight_count() == 0 || app.highlight_count() == 4
+    })?;
+    close(id)?;
+    // 文書 0 件でも、オン・オフ・検索・置換が安全。
+    cmd("file.close_all", Value::Null)?;
+    step(|app| {
+        app.set_scope(true);
+        app.search_step(options("foo", true), crate::search::Direction::Forward);
+        app.replace_all(options("foo", true), "x".into());
+        app.set_scope(false);
+        app.clear_scope();
+    })?;
+    check!(step(|app| app.active_id().is_none())?, "0 件のまま");
+    cmd("file.new", Value::Null)?;
+    Ok(())
+}
+
+/// 検索・置換・Grep の起点の履歴: 新しい順、重複は先頭へ、最大 20 件、空は残さない。
+fn search_history() -> Check {
+    step(|app| {
+        app.settings.search_history = Default::default();
+        for w in ["a", "b", "a"] {
+            app.on_find_event(FindEvent::Ran {
+                find: w.into(),
+                replace: Some(format!("{w}!")),
+                grep_dir: None,
+            });
+        }
+        app.on_find_event(FindEvent::Ran {
+            find: String::new(),
+            replace: Some(String::new()),
+            grep_dir: Some("C:\\src".into()),
+        });
+        for i in 0..30 {
+            app.on_find_event(FindEvent::Ran {
+                find: format!("w{i}"),
+                replace: None,
+                grep_dir: None,
+            });
+        }
+    })?;
+    step(|app| -> Check {
+        let h = &app.settings.search_history;
+        check!(h.replace == ["a!", "b!"], "置換の履歴 {:?}", h.replace);
+        check!(h.grep_dir == ["C:\\src"], "Grep の履歴 {:?}", h.grep_dir);
+        check!(
+            h.find.len() == 20 && h.find[0] == "w29",
+            "検索の履歴 {:?}",
+            h.find
+        );
+        Ok(())
+    })??;
+    step(|app| app.settings.search_history = Default::default())
 }
 
 /// 元に戻す 1 回で `original` に戻ることを確かめる。

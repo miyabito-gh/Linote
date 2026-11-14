@@ -99,13 +99,17 @@ fn panel_greps_opens_hits_and_disables_replace() {
                 FindEvent::Next(o) => format!("next {}", o.query),
                 FindEvent::Prev(o) => format!("prev {}", o.query),
                 FindEvent::Replace { replacement, .. } => format!("replace {replacement}"),
-                FindEvent::ReplaceAll { in_selection, .. } => {
-                    if in_selection {
-                        "replace_all_in_selection".into()
-                    } else {
-                        "replace_all".into()
-                    }
-                }
+                FindEvent::ReplaceAll { .. } => "replace_all".into(),
+                FindEvent::Scope(on) => format!("scope {on}"),
+                FindEvent::Ran {
+                    find,
+                    replace,
+                    grep_dir,
+                } => format!(
+                    "ran {find}|{}|{}",
+                    replace.unwrap_or_default(),
+                    grep_dir.is_some()
+                ),
                 FindEvent::Changed(o) => format!("changed {}", o.query),
                 FindEvent::OpenHit { path, line, column } => format!(
                     "open {} {line}:{column}",
@@ -156,20 +160,30 @@ fn panel_greps_opens_hits_and_disables_replace() {
     command(hwnd, 210, 0);
     assert_eq!(events.borrow().last().unwrap(), "replace_all");
 
-    // 「選択範囲内のみ置換」を入れると、すべて置換にその印が付く。
-    // SAFETY: 小窓の子のチェックボックスを探して印を付ける。
+    // 「選択範囲内」のチェックを押すと、切り替えの通知が届く（範囲は ui::app が決める）。
+    // SAFETY: 小窓の子のチェックボックスを探して押す。
     unsafe {
         let check = FindWindowExW(
             Some(hwnd),
             None,
             w!("BUTTON"),
-            w!("選択範囲内のみ置換（すべて置換）"),
+            w!("選択範囲内（検索・置換を選択範囲に限る）"),
         )
-        .expect("選択範囲内の置換の項目");
+        .expect("選択範囲内の項目");
         SendMessageW(check, 0x00F1, Some(WPARAM(1)), None); // BM_SETCHECK
     }
+    assert!(panel.in_selection());
+    command(hwnd, 215, 0);
+    assert_eq!(events.borrow().last().unwrap(), "scope true");
+    panel.set_in_selection(false);
+    assert!(!panel.in_selection());
+
+    // 実行した語が届く（履歴用）。置換は置換語つき。
     command(hwnd, 210, 0);
-    assert_eq!(events.borrow().last().unwrap(), "replace_all_in_selection");
+    {
+        let ev = events.borrow();
+        assert_eq!(ev[ev.len() - 2], "ran needle||false");
+    }
 
     // 検索欄の入力が変わると、条件の変更が届く（強調表示の更新用）。
     panel.set_query("changed-query");
@@ -177,6 +191,19 @@ fn panel_greps_opens_hits_and_disables_replace() {
         pump(|| events.borrow().iter().any(|e| e == "changed changed-query")),
         "条件の変更の通知"
     );
+
+    // 履歴の一覧: 項目数、入力中の文字列は保つ。
+    panel.set_history(
+        &["x".into(), "y".into(), "z".into()],
+        &["r".into()],
+        &["C:\\src".into()],
+    );
+    // SAFETY: 小窓の検索欄（最初のコンボボックス）の項目数を読む。
+    unsafe {
+        let combo = FindWindowExW(Some(hwnd), None, w!("COMBOBOX"), None).unwrap();
+        assert_eq!(SendMessageW(combo, 0x0146, None, None).0, 3); // CB_GETCOUNT
+    }
+    assert_eq!(panel.options().unwrap().query, "changed-query");
 
     panel.hide();
     assert!(!panel.is_visible());

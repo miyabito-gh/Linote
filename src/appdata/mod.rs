@@ -22,7 +22,7 @@ pub mod handoff;
 pub mod session;
 pub mod settings;
 
-pub use settings::{Settings, ThemeMode, WindowSettings};
+pub use settings::{SearchHistory, Settings, ThemeMode, WindowSettings};
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};

@@ -13,6 +13,8 @@ use crate::document::{Selection, TextRange};
 const INDIC_ALL: usize = 9;
 /// 現在の一致を強調するインジケーター。
 const INDIC_CURRENT: usize = 10;
+/// 「選択範囲内」の検索の対象範囲を示すインジケーター（編集で範囲がずれても追従する）。
+const INDIC_SCOPE: usize = 11;
 
 impl Editor {
     /// 検索の強調のインジケーターの見た目を決める（作成時に 1 回）。色は明暗どちらの
@@ -28,6 +30,50 @@ impl Editor {
             self.send(SCI_INDICSETOUTLINEALPHA, indic, outline as isize);
             self.send(SCI_INDICSETUNDER, indic, 1);
         }
+        // 検索範囲: 青系の薄い枠（一致の強調と区別できるように）。
+        self.send(SCI_INDICSETSTYLE, INDIC_SCOPE, INDIC_FULLBOX as isize);
+        self.send(SCI_INDICSETFORE, INDIC_SCOPE, 0xE0A040);
+        self.send(SCI_INDICSETALPHA, INDIC_SCOPE, 45);
+        self.send(SCI_INDICSETOUTLINEALPHA, INDIC_SCOPE, 120);
+        self.send(SCI_INDICSETUNDER, INDIC_SCOPE, 1);
+    }
+
+    /// 検索範囲のインジケーターを `range` に付け替える（前の範囲は消す）。
+    pub fn set_search_scope(&self, range: TextRange) {
+        self.clear_search_scope();
+        self.send(SCI_SETINDICATORCURRENT, INDIC_SCOPE, 0);
+        self.send(
+            SCI_INDICATORFILLRANGE,
+            range.start as usize,
+            range.len() as isize,
+        );
+    }
+
+    /// 検索範囲のインジケーターを消す。
+    pub fn clear_search_scope(&self) {
+        self.send(SCI_SETINDICATORCURRENT, INDIC_SCOPE, 0);
+        self.send(SCI_INDICATORCLEARRANGE, 0, self.length() as isize);
+    }
+
+    /// 検索範囲（インジケーターが付いている区間）。編集でずれた後の位置を返す。
+    /// 付いていない（または空になった）ときは `None`。
+    pub fn search_scope(&self) -> Option<TextRange> {
+        let len = self.length();
+        // 位置 0 から見て、付いていない区間の終わりが範囲の始まり（0 から付いていれば 0）。
+        let start = self.send(SCI_INDICATOREND, INDIC_SCOPE, 0).max(0) as u64;
+        let start = if self.send(SCI_INDICATORVALUEAT, INDIC_SCOPE, 0) != 0 {
+            0
+        } else {
+            start
+        };
+        if start >= len {
+            return None;
+        }
+        let end = (self
+            .send(SCI_INDICATOREND, INDIC_SCOPE, start as isize)
+            .max(0) as u64)
+            .min(len);
+        (end > start).then(|| TextRange::new(start, end))
     }
 
     /// すべての一致を強調する（前の強調は消す）。

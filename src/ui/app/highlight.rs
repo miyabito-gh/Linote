@@ -14,6 +14,7 @@ use crate::document::{MemoryText, TextRange};
 use crate::search::SearchOptions;
 use crate::ui::find::FindPanel;
 
+use super::search::Scope;
 use super::{App, UiMessage};
 
 /// 強調する一致の上限。
@@ -32,8 +33,20 @@ pub(super) struct Highlight {
 struct Shown {
     doc: DocumentId,
     options: SearchOptions,
+    /// 「選択範囲内」のときの範囲（一致はこの中だけ）。
+    scope: Option<TextRange>,
     ranges: Vec<TextRange>,
     truncated: bool,
+}
+
+/// 範囲の先頭からの位置で求めた一致を、文書の位置に直す。
+fn shift_ranges(mut ranges: Vec<TextRange>, base: u64) -> Vec<TextRange> {
+    if base != 0 {
+        for r in &mut ranges {
+            *r = TextRange::new(r.start + base, r.end + base);
+        }
+    }
+    ranges
 }
 
 /// 現在の一致（選択と同じ範囲）が何番目か。
@@ -111,11 +124,19 @@ impl App {
             self.clear_highlight();
             return;
         }
+        let scope = match self.scope_of(id) {
+            Scope::Off => None,
+            Scope::Range(r) => Some(r),
+            Scope::Missing => {
+                self.clear_highlight();
+                return;
+            }
+        };
         let same = self
             .highlight
             .shown
             .as_ref()
-            .is_some_and(|s| s.doc == id && &s.options == options);
+            .is_some_and(|s| s.doc == id && &s.options == options && s.scope == scope);
         if same {
             self.update_current_match();
         } else {
@@ -133,19 +154,33 @@ impl App {
         let Ok(searcher) = options.compile() else {
             return;
         };
-        let Ok(len) = self.with_text(id, |ed| ed.length()) else {
+        let scope = match self.scope_of(id) {
+            Scope::Off => None,
+            Scope::Range(r) => Some(r),
+            Scope::Missing => return,
+        };
+        let base = scope.map_or(0, |r| r.start);
+        let Ok(doc_len) = self.with_text(id, |ed| ed.length()) else {
             return;
         };
+        let len = scope.map_or(doc_len, |r| r.len());
         let worker_bytes = self.worker_search_bytes.min(HIGHLIGHT_WORKER_BYTES);
         if (len as usize) < worker_bytes {
             let ctx = TaskContext::detached();
-            let found = self.with_text(id, |ed| searcher.find_all(ed, &ctx, MAX_HIGHLIGHTS));
+            let found = match scope {
+                None => self.with_text(id, |ed| searcher.find_all(ed, &ctx, MAX_HIGHLIGHTS)),
+                Some(r) => self.scope_snapshot(id, Some(r)).map(|(_, text)| {
+                    searcher.find_all(&MemoryText::new(text), &ctx, MAX_HIGHLIGHTS)
+                }),
+            };
             if let Ok(Ok(outcome)) = found {
-                self.show_highlight(id, options, outcome.value, report);
+                let (ranges, truncated) = outcome.value;
+                let ranges = shift_ranges(ranges, base);
+                self.show_highlight(id, options, scope, (ranges, truncated), report);
             }
             return;
         }
-        let Ok((stamp, text)) = self.text_snapshot(id) else {
+        let Ok((stamp, text)) = self.scope_snapshot(id, scope) else {
             return;
         };
         let token = CancelToken::new();
@@ -158,7 +193,7 @@ impl App {
             let src = MemoryText::new(text);
             let result = searcher.find_all(&src, &ctx, MAX_HIGHLIGHTS);
             sender.send(UiMessage::Run(Box::new(move |app| {
-                app.finish_highlight(stamp, generation, options, result, report)
+                app.finish_highlight(stamp, generation, options, scope, result, report)
             })));
         });
     }
@@ -168,6 +203,7 @@ impl App {
         stamp: DocStamp,
         generation: u64,
         options: SearchOptions,
+        scope: Option<TextRange>,
         result: Result<Outcome<(Vec<TextRange>, bool)>>,
         report: bool,
     ) {
@@ -180,7 +216,10 @@ impl App {
         }
         if let Ok(outcome) = result {
             if outcome.completion == Completion::Complete {
-                self.show_highlight(stamp.document, options, outcome.value, report);
+                let (ranges, truncated) = outcome.value;
+                let base = scope.map_or(0, |r| r.start);
+                let found = (shift_ranges(ranges, base), truncated);
+                self.show_highlight(stamp.document, options, scope, found, report);
             }
         }
     }
@@ -189,6 +228,7 @@ impl App {
         &mut self,
         id: DocumentId,
         options: SearchOptions,
+        scope: Option<TextRange>,
         found: (Vec<TextRange>, bool),
         report: bool,
     ) {
@@ -202,6 +242,7 @@ impl App {
         self.highlight.shown = Some(Shown {
             doc: id,
             options,
+            scope,
             ranges,
             truncated,
         });

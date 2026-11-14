@@ -41,17 +41,17 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     EnableWindow, GetKeyState, SetFocus, VK_ESCAPE, VK_RETURN, VK_SHIFT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallWindowProcW, CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect,
+    CallWindowProcW, CreateWindowExW, DefWindowProcW, DestroyWindow, FindWindowExW, GetClientRect,
     GetWindowLongPtrW, GetWindowRect, GetWindowTextLengthW, GetWindowTextW, IsWindowVisible,
     LoadCursorW, MoveWindow, PostMessageW, RegisterClassExW, SendMessageW, SetWindowLongPtrW,
-    SetWindowPos, SetWindowTextW, ShowWindow, BM_GETCHECK, BN_CLICKED, BS_AUTOCHECKBOX,
-    BS_PUSHBUTTON, CREATESTRUCTW, ES_AUTOHSCROLL, GWLP_USERDATA, GWLP_WNDPROC, HMENU, IDC_ARROW,
-    LBN_DBLCLK, LBS_NOINTEGRALHEIGHT, LBS_NOTIFY, LB_ADDSTRING, LB_GETCURSEL, LB_RESETCONTENT,
-    LB_SETCURSEL, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_SHOW, WM_ACTIVATE, WM_CHAR, WM_CLOSE,
-    WM_COMMAND, WM_CREATE, WM_CTLCOLOREDIT, WM_CTLCOLORLISTBOX, WM_CTLCOLORSTATIC, WM_ERASEBKGND,
-    WM_KEYDOWN, WM_NCDESTROY, WM_SETFONT, WM_SIZE, WNDCLASSEXW, WNDPROC, WS_BORDER, WS_CAPTION,
-    WS_CHILD, WS_CLIPCHILDREN, WS_EX_CLIENTEDGE, WS_EX_TOOLWINDOW, WS_POPUP, WS_SYSMENU,
-    WS_TABSTOP, WS_THICKFRAME, WS_VISIBLE, WS_VSCROLL,
+    SetWindowPos, SetWindowTextW, ShowWindow, BM_GETCHECK, BM_SETCHECK, BN_CLICKED,
+    BS_AUTOCHECKBOX, BS_PUSHBUTTON, CREATESTRUCTW, ES_AUTOHSCROLL, GWLP_USERDATA, GWLP_WNDPROC,
+    HMENU, IDC_ARROW, LBN_DBLCLK, LBS_NOINTEGRALHEIGHT, LBS_NOTIFY, LB_ADDSTRING, LB_GETCURSEL,
+    LB_RESETCONTENT, LB_SETCURSEL, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_SHOW, WM_ACTIVATE,
+    WM_CHAR, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_CTLCOLOREDIT, WM_CTLCOLORLISTBOX,
+    WM_CTLCOLORSTATIC, WM_ERASEBKGND, WM_KEYDOWN, WM_NCDESTROY, WM_SETFONT, WM_SIZE, WNDCLASSEXW,
+    WNDPROC, WS_CAPTION, WS_CHILD, WS_CLIPCHILDREN, WS_EX_CLIENTEDGE, WS_EX_TOOLWINDOW, WS_POPUP,
+    WS_SYSMENU, WS_TABSTOP, WS_THICKFRAME, WS_VISIBLE, WS_VSCROLL,
 };
 
 use crate::core::{
@@ -84,7 +84,18 @@ const ID_STATUS: usize = 213;
 const ID_LIST: usize = 214;
 const ID_INSEL: usize = 215;
 
-const EN_CHANGE: u32 = 0x0300;
+/// コンボボックスのメッセージと通知（`CBS_DROPDOWN`: 入力もできる一覧）。
+const CBS_DROPDOWN: u32 = 0x0002;
+const CBN_SELCHANGE: u32 = 1;
+const CBN_EDITCHANGE: u32 = 5;
+const CB_ADDSTRING: u32 = 0x0143;
+const CB_RESETCONTENT: u32 = 0x014B;
+const CB_GETCURSEL: u32 = 0x0147;
+const CB_GETLBTEXT: u32 = 0x0148;
+const CB_GETLBTEXTLEN: u32 = 0x0149;
+const CB_SETEDITSEL: u32 = 0x0142;
+/// 閉じているときの高さに足す、開いた一覧の高さ（96 DPI の px）。
+const DROPDOWN_EXTRA: i32 = 220;
 const BST_CHECKED: usize = 1;
 
 /// 小窓から `ui::app` への通知。`on_event` は小窓のウィンドウプロシージャの中から
@@ -104,8 +115,14 @@ pub enum FindEvent {
     ReplaceAll {
         options: SearchOptions,
         replacement: String,
-        /// 「選択範囲内のみ置換」: 選択範囲の中だけを置換する。
-        in_selection: bool,
+    },
+    /// 「選択範囲内」のチェックが切り替わった（`true` ならオンにした時点の選択範囲が対象）。
+    Scope(bool),
+    /// 検索・置換・Grep を実行した。履歴に残す語（実行しなかった欄は `None`）。
+    Ran {
+        find: String,
+        replace: Option<String>,
+        grep_dir: Option<String>,
     },
     /// 検索欄の条件が変わった（入力・オプションの切り替え）。強調表示の更新に使う。
     /// 空や無効なパターンでも届く。
@@ -166,6 +183,10 @@ struct State {
     word: HWND,
     regex: HWND,
     in_selection: HWND,
+    /// 3 つのコンボボックスの中の入力欄（キー操作を受ける）。
+    edits: [HWND; 3],
+    /// 履歴の差し替え中は入力の通知を無視する。
+    quiet: bool,
     buttons: [HWND; 6],
     status: HWND,
     list: HWND,
@@ -300,7 +321,12 @@ impl FindPanel {
             // SAFETY: 自分の子ウィンドウ。EM_SETSEL(0, -1) で全選択。
             unsafe {
                 let _ = SetFocus(Some(s.query));
-                SendMessageW(s.query, 0x00B1, Some(WPARAM(0)), Some(LPARAM(-1)));
+                SendMessageW(
+                    s.query,
+                    CB_SETEDITSEL,
+                    Some(WPARAM(0)),
+                    Some(LPARAM(-1 << 16)),
+                );
             }
             s.validate();
         });
@@ -333,7 +359,7 @@ impl FindPanel {
             s.replace_enabled = enabled;
             // SAFETY: 自分の子ウィンドウ。
             unsafe {
-                for h in [s.replace, s.in_selection, s.buttons[2], s.buttons[3]] {
+                for h in [s.replace, s.buttons[2], s.buttons[3]] {
                     let _ = EnableWindow(h, enabled);
                 }
             }
@@ -343,9 +369,51 @@ impl FindPanel {
         });
     }
 
+    /// 3 つの欄の履歴（新しい順）を差し替える。入力中の文字列は保つ。
+    pub fn set_history(&self, find: &[String], replace: &[String], grep_dir: &[String]) {
+        with_state(self.hwnd, |s| {
+            s.quiet = true;
+            for (h, list) in [(s.query, find), (s.replace, replace), (s.folder, grep_dir)] {
+                let text = text_of(h);
+                // SAFETY: 自分のコンボボックス。文字列は呼び出しの間有効。
+                unsafe {
+                    SendMessageW(h, CB_RESETCONTENT, None, None);
+                    for item in list {
+                        let wide = to_wide(item);
+                        SendMessageW(h, CB_ADDSTRING, None, Some(LPARAM(wide.as_ptr() as isize)));
+                    }
+                }
+                set_text(h, &text);
+            }
+            s.quiet = false;
+        });
+    }
+
+    /// 「選択範囲内」のチェックを付け外しする（通知は出ない）。
+    pub fn set_in_selection(&self, on: bool) {
+        with_state(self.hwnd, |s| {
+            // SAFETY: 自分のチェックボックス。
+            unsafe {
+                SendMessageW(s.in_selection, BM_SETCHECK, Some(WPARAM(on as usize)), None);
+            }
+        });
+    }
+
+    /// 「選択範囲内」がオンか。
+    pub fn in_selection(&self) -> bool {
+        with_state(self.hwnd, |s| is_checked(s.in_selection)).unwrap_or(false)
+    }
+
     /// 検索欄の文字列を差し替える（条件が変わった通知が届く）。
     pub fn set_query(&self, text: &str) {
-        with_state(self.hwnd, |s| set_text(s.query, text));
+        with_state(self.hwnd, |s| {
+            // コンボボックスは文字列の差し替えを通知しないことがあるので、通知は自分で出す。
+            s.quiet = true;
+            set_text(s.query, text);
+            s.quiet = false;
+            s.validate();
+            s.emit(FindEvent::Changed(s.options()));
+        });
     }
 
     /// Grep の起点のフォルダーの初期値（空のときだけ入れる）。
@@ -463,6 +531,30 @@ fn set_text(h: HWND, text: &str) {
     }
 }
 
+/// コンボボックスの一覧で選ばれている項目の文字列。
+fn selected_text(combo: HWND) -> Option<String> {
+    // SAFETY: 自分のコンボボックス。長さ + 1 の領域を渡す。
+    unsafe {
+        let i = SendMessageW(combo, CB_GETCURSEL, None, None).0;
+        if i < 0 {
+            return None;
+        }
+        let len = SendMessageW(combo, CB_GETLBTEXTLEN, Some(WPARAM(i as usize)), None).0;
+        if len < 0 {
+            return None;
+        }
+        let mut buf = vec![0u16; len as usize + 1];
+        let n = SendMessageW(
+            combo,
+            CB_GETLBTEXT,
+            Some(WPARAM(i as usize)),
+            Some(LPARAM(buf.as_mut_ptr() as isize)),
+        )
+        .0;
+        (n >= 0).then(|| String::from_utf16_lossy(&buf[..n as usize]))
+    }
+}
+
 fn is_checked(h: HWND) -> bool {
     // SAFETY: 自分のチェックボックス。
     unsafe { SendMessageW(h, BM_GETCHECK, None, None).0 as usize == BST_CHECKED }
@@ -540,7 +632,8 @@ impl State {
             }
         };
         for e in [self.query, self.replace, self.folder] {
-            mv(e, m, y, inner, row);
+            // 高さには開いた一覧の分も含める（閉じているときの見た目は変わらない）。
+            mv(e, m, y, inner, row + scale(DROPDOWN_EXTRA, d));
             y += row + gap;
         }
         let cw = inner / 3;
@@ -606,6 +699,11 @@ impl State {
             return;
         }
         let o = self.options();
+        self.emit(FindEvent::Ran {
+            find: o.query.clone(),
+            replace: None,
+            grep_dir: None,
+        });
         self.emit(if forward {
             FindEvent::Next(o)
         } else {
@@ -619,12 +717,15 @@ impl State {
         }
         let options = self.options();
         let replacement = text_of(self.replace);
-        let in_selection = is_checked(self.in_selection);
+        self.emit(FindEvent::Ran {
+            find: options.query.clone(),
+            replace: Some(replacement.clone()),
+            grep_dir: None,
+        });
         self.emit(if all {
             FindEvent::ReplaceAll {
                 options,
                 replacement,
-                in_selection,
             }
         } else {
             FindEvent::Replace {
@@ -648,6 +749,11 @@ impl State {
             self.show_status("フォルダーが見つかりません", true);
             return;
         }
+        self.emit(FindEvent::Ran {
+            find: self.options().query,
+            replace: None,
+            grep_dir: Some(root.to_string_lossy().into_owned()),
+        });
         self.generation += 1;
         let generation = self.generation;
         let cancel = CancelToken::new();
@@ -771,8 +877,9 @@ extern "system" fn panel_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPAR
                 dpi,
                 on_event,
             } = *params;
-            let edit_style = WS_TABSTOP.0 | WS_BORDER.0 | ES_AUTOHSCROLL as u32;
-            let edit = |id| child(hwnd, w!("EDIT"), w!(""), edit_style, WS_EX_CLIENTEDGE.0, id);
+            // 履歴の一覧つきの入力欄（`CBS_DROPDOWN`）。
+            let edit_style = WS_TABSTOP.0 | WS_VSCROLL.0 | CBS_DROPDOWN | ES_AUTOHSCROLL as u32;
+            let edit = |id| child(hwnd, w!("COMBOBOX"), w!(""), edit_style, 0, id);
             let check = |text: PCWSTR, id| {
                 child(
                     hwnd,
@@ -799,7 +906,7 @@ extern "system" fn panel_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPAR
                 check(w!("単語単位"), ID_WORD),
                 check(w!("正規表現"), ID_REGEX),
             );
-            let in_selection = check(w!("選択範囲内のみ置換（すべて置換）"), ID_INSEL);
+            let in_selection = check(w!("選択範囲内（検索・置換を選択範囲に限る）"), ID_INSEL);
             let buttons = [
                 button(w!("次へ"), ID_NEXT),
                 button(w!("前へ"), ID_PREV),
@@ -827,6 +934,8 @@ extern "system" fn panel_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPAR
                 word,
                 regex,
                 in_selection,
+                edits: [HWND::default(); 3],
+                quiet: false,
                 buttons,
                 status,
                 list,
@@ -851,7 +960,10 @@ extern "system" fn panel_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPAR
             state.apply_font();
             // SAFETY: 元の処理を控えて、キー操作を受ける処理に差し替える。
             unsafe {
-                for h in [query, replace, folder] {
+                for (i, combo) in [query, replace, folder].into_iter().enumerate() {
+                    // コンボボックスの中の入力欄がキー操作を受ける。
+                    let h = FindWindowExW(Some(combo), None, w!("EDIT"), None).unwrap_or(combo);
+                    state.edits[i] = h;
                     let old =
                         SetWindowLongPtrW(h, GWLP_WNDPROC, key_proc as *const () as usize as isize);
                     state.edit_proc = std::mem::transmute::<isize, WNDPROC>(old);
@@ -916,10 +1028,24 @@ extern "system" fn panel_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPAR
             let id = wparam.0 & 0xFFFF;
             let code = ((wparam.0 >> 16) & 0xFFFF) as u32;
             with_state(hwnd, |s| match (id, code) {
-                (ID_QUERY, EN_CHANGE) | (ID_CASE | ID_WORD | ID_REGEX, BN_CLICKED) => {
+                (ID_QUERY | ID_REPLACE | ID_FOLDER, CBN_SELCHANGE) => {
+                    // 一覧で選んだ語を入力欄に入れる（通知の時点では入力欄はまだ古い）。
+                    let combo = match id {
+                        ID_QUERY => s.query,
+                        ID_REPLACE => s.replace,
+                        _ => s.folder,
+                    };
+                    if let Some(text) = selected_text(combo) {
+                        set_text(combo, &text);
+                    }
+                }
+                (ID_QUERY, CBN_EDITCHANGE) | (ID_CASE | ID_WORD | ID_REGEX, BN_CLICKED)
+                    if !s.quiet =>
+                {
                     s.validate();
                     s.emit(FindEvent::Changed(s.options()));
                 }
+                (ID_INSEL, BN_CLICKED) => s.emit(FindEvent::Scope(is_checked(s.in_selection))),
                 (ID_NEXT, BN_CLICKED) => s.find(true),
                 (ID_PREV, BN_CLICKED) => s.find(false),
                 (ID_REPLACE_ONE, BN_CLICKED) => s.replace(false),
@@ -975,9 +1101,16 @@ extern "system" fn panel_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPAR
 
 /// 入力欄と一覧のキー操作（Enter、Esc）。ほかは元の処理に渡す。
 extern "system" fn key_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    // SAFETY: 親は小窓。
-    let parent =
-        unsafe { windows::Win32::UI::WindowsAndMessaging::GetParent(hwnd).unwrap_or_default() };
+    // SAFETY: 親は小窓（入力欄は、コンボボックスの中にあるので 1 つ上）。
+    let parent = unsafe {
+        use windows::Win32::UI::WindowsAndMessaging::GetParent;
+        let p = GetParent(hwnd).unwrap_or_default();
+        if with_state(p, |_| ()).is_some() {
+            p
+        } else {
+            GetParent(p).unwrap_or_default()
+        }
+    };
     let key = wparam.0 as u16;
     let handled = match msg {
         WM_KEYDOWN if key == VK_ESCAPE.0 => {
@@ -991,11 +1124,11 @@ extern "system" fn key_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
             // SAFETY: キー状態の問い合わせだけ。
             let shift = unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0;
             with_state(parent, |s| {
-                if hwnd == s.query {
+                if hwnd == s.edits[0] {
                     s.find(!shift);
-                } else if hwnd == s.replace {
+                } else if hwnd == s.edits[1] {
                     s.replace(false);
-                } else if hwnd == s.folder {
+                } else if hwnd == s.edits[2] {
                     s.start_grep();
                 } else {
                     s.open_selected();

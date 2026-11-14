@@ -29,6 +29,8 @@
 //! - `restore_session`: 起動時に前回のタブを開き直す（既定 `true`。記録は `session.json`）。
 //! - `window`: 前回のウィンドウの位置と大きさ（通常状態の矩形と最大化の有無。V1）。値が
 //!   不正なら無視して既定の位置で開く。
+//! - `search_history`: 検索欄・置換欄・Grep の起点欄の履歴（`find`／`replace`／`grep_dir`。
+//!   各欄は新しい順、重複なし、最大 [`MAX_SEARCH_HISTORY`] 件。V3）。壊れた値は空として読む。
 //! - 知らない項目は読み込んだまま保持し、書き戻すときに失わない
 //!   （新しい版が書いた設定を古い版が消さないため）。
 //! - ファイルがなければ既定値。ファイルは設定を変更して保存するときに初めて作る。
@@ -52,6 +54,8 @@ pub const SETTINGS_VERSION: u64 = 1;
 
 /// 最近使ったファイルの最大件数。
 pub const MAX_RECENT_FILES: usize = 10;
+/// 検索・置換・Grep の起点の履歴の、欄ごとの最大件数。
+pub const MAX_SEARCH_HISTORY: usize = 20;
 
 /// 明暗テーマの選び方。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -377,6 +381,84 @@ impl WindowSettings {
     }
 }
 
+/// 検索欄・置換欄・Grep の起点欄の履歴（各欄、新しい順、最大 [`MAX_SEARCH_HISTORY`] 件）。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SearchHistory {
+    pub find: Vec<String>,
+    pub replace: Vec<String>,
+    pub grep_dir: Vec<String>,
+}
+
+/// 履歴の先頭に `text` を置く（重複は先頭へ移す。空文字列は無視）。変化したら `true`。
+fn push_history(list: &mut Vec<String>, text: &str) -> bool {
+    if text.is_empty() || list.first().is_some_and(|f| f == text) {
+        return false;
+    }
+    list.retain(|p| p != text);
+    list.insert(0, text.to_owned());
+    list.truncate(MAX_SEARCH_HISTORY);
+    true
+}
+
+impl SearchHistory {
+    pub fn push_find(&mut self, text: &str) -> bool {
+        push_history(&mut self.find, text)
+    }
+
+    pub fn push_replace(&mut self, text: &str) -> bool {
+        push_history(&mut self.replace, text)
+    }
+
+    pub fn push_grep_dir(&mut self, text: &str) -> bool {
+        push_history(&mut self.grep_dir, text)
+    }
+
+    fn list_from(value: Option<&Value>) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        if let Some(Value::Array(items)) = value {
+            for item in items {
+                if let Value::String(s) = item {
+                    if !s.is_empty() && out.len() < MAX_SEARCH_HISTORY && !out.contains(s) {
+                        out.push(s.clone());
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// 壊れた値（オブジェクトでない、配列でない要素）は読み飛ばす。
+    fn from_value(value: &Value) -> Self {
+        let Value::Object(map) = value else {
+            return Self::default();
+        };
+        SearchHistory {
+            find: Self::list_from(map.get("find")),
+            replace: Self::list_from(map.get("replace")),
+            grep_dir: Self::list_from(map.get("grep_dir")),
+        }
+    }
+
+    fn to_value(&self, base: Option<&Value>) -> Value {
+        // 知らない項目は残し、この 3 項目だけ差し替える。
+        let mut m = match base {
+            Some(Value::Object(m)) => m.clone(),
+            _ => Map::new(),
+        };
+        for (k, v) in [
+            ("find", &self.find),
+            ("replace", &self.replace),
+            ("grep_dir", &self.grep_dir),
+        ] {
+            m.insert(
+                k.into(),
+                Value::Array(v.iter().map(|s| Value::from(s.as_str())).collect()),
+            );
+        }
+        Value::Object(m)
+    }
+}
+
 /// 設定。
 #[derive(Debug, Clone, PartialEq)]
 pub struct Settings {
@@ -395,6 +477,8 @@ pub struct Settings {
     pub restore_session: bool,
     /// 前回のウィンドウの位置と大きさ。
     pub window: Option<WindowSettings>,
+    /// 検索・置換・Grep の履歴。
+    pub search_history: SearchHistory,
     /// このプログラムが知らない項目。読み込んだまま書き戻す。
     extra: Map<String, Value>,
 }
@@ -410,6 +494,7 @@ impl Default for Settings {
             print: PrintSettings::default(),
             restore_session: true,
             window: None,
+            search_history: SearchHistory::default(),
             extra: Map::new(),
         }
     }
@@ -493,6 +578,20 @@ impl Settings {
         if let Some(Value::Object(w)) = map.remove("window") {
             settings.window = WindowSettings::from_value(&w);
         }
+        if let Some(h) = map.remove("search_history") {
+            settings.search_history = SearchHistory::from_value(&h);
+            // 壊れた値でも、知らない項目は書き戻しで保つ。
+            if let Value::Object(mut m) = h {
+                for k in ["find", "replace", "grep_dir"] {
+                    m.remove(k);
+                }
+                if !m.is_empty() {
+                    settings
+                        .extra
+                        .insert("search_history".into(), Value::Object(m));
+                }
+            }
+        }
         if let Some(mcp) = map.remove("mcp") {
             let Value::Object(mut mcp) = mcp else {
                 return Err(corrupt("mcp がオブジェクトではありません"));
@@ -541,6 +640,8 @@ impl Settings {
             Some(w) => map.insert("window".into(), Value::Object(w.to_value())),
             None => map.remove("window"),
         };
+        let history = self.search_history.to_value(map.get("search_history"));
+        map.insert("search_history".into(), history);
         let mcp = map
             .entry("mcp")
             .or_insert_with(|| Value::Object(Map::new()));
@@ -750,6 +851,39 @@ mod tests {
         s.remove_recent("C:\\work\\11.txt");
         assert_eq!(s.recent_files[1], "C:\\work\\10.txt");
         assert_eq!(Settings::from_json(&s.to_json()).unwrap(), s);
+    }
+
+    #[test]
+    fn search_history_is_deduplicated_limited_and_round_trips() {
+        let mut s = Settings::default();
+        for i in 0..25 {
+            assert!(s.search_history.push_find(&format!("w{i}")));
+        }
+        assert!(!s.search_history.push_find("w24"), "先頭と同じなら変化なし");
+        assert!(!s.search_history.push_find(""));
+        assert!(s.search_history.push_find("w20"));
+        assert_eq!(s.search_history.find.len(), MAX_SEARCH_HISTORY);
+        assert_eq!(s.search_history.find[0], "w20");
+        assert_eq!(s.search_history.find[1], "w24");
+        assert_eq!(
+            s.search_history.find.iter().filter(|w| *w == "w20").count(),
+            1
+        );
+        s.search_history.push_replace("x");
+        s.search_history.push_grep_dir("C:\\src");
+        assert_eq!(Settings::from_json(&s.to_json()).unwrap(), s);
+    }
+
+    #[test]
+    fn broken_search_history_is_ignored_and_unknown_keys_kept() {
+        let s = Settings::from_json(r#"{"search_history": 5}"#).unwrap();
+        assert_eq!(s.search_history, SearchHistory::default());
+        let s = Settings::from_json(
+            r#"{"search_history": {"find": ["a", 3, "a", "b"], "future": [1]}}"#,
+        )
+        .unwrap();
+        assert_eq!(s.search_history.find, ["a", "b"]);
+        assert!(s.to_json().contains("\"future\""));
     }
 
     #[test]

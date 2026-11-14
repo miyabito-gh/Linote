@@ -80,6 +80,28 @@ impl EditTarget for Recorder {
     fn end_undo_group(&mut self) {}
 }
 
+/// 「選択範囲内」の状態（アクティブな文書について）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Scope {
+    /// 範囲を限っていない（文書全体）。
+    Off,
+    /// この範囲（編集でずれた後の位置）に限る。
+    Range(TextRange),
+    /// 「選択範囲内」だが、範囲が消えた（範囲の本文をすべて削除した場合など）。
+    Missing,
+}
+
+const SCOPE_MISSING: &str =
+    "検索の範囲が失われました（「選択範囲内」を外すか、範囲を選び直してください）";
+
+/// 範囲の先頭からの位置で求めた一致を、文書の位置に直す。
+fn shift_hit(hit: Option<Hit>, base: u64) -> Option<Hit> {
+    hit.map(|h| Hit {
+        range: TextRange::new(h.range.start + base, h.range.end + base),
+        wrapped: h.wrapped,
+    })
+}
+
 /// 検索のエラーを検索欄に出す文にする。
 fn describe(e: &Error) -> String {
     match e {
@@ -102,6 +124,7 @@ impl App {
             });
             let panel = FindPanel::create(self.hwnd, &self.theme, self.dpi, on_event)?;
             self.find_panel = Some(panel);
+            self.sync_find_history();
         }
         let Some(panel) = self.find_panel else {
             return Ok(());
@@ -115,6 +138,125 @@ impl App {
         self.update_find_context();
         panel.show(prefill.as_deref());
         Ok(())
+    }
+
+    /// 設定の履歴を検索欄のドロップダウンに反映する。
+    fn sync_find_history(&self) {
+        if let Some(p) = self.find_panel {
+            let h = &self.settings.search_history;
+            p.set_history(&h.find, &h.replace, &h.grep_dir);
+        }
+    }
+
+    /// 実行した語を履歴の先頭に置く。変わったら設定に保存する（壊れた設定ファイルには書かない）。
+    fn record_history(&mut self, find: &str, replace: Option<&str>, grep_dir: Option<&str>) {
+        let h = &mut self.settings.search_history;
+        let mut changed = h.push_find(find);
+        if let Some(r) = replace {
+            changed |= h.push_replace(r);
+        }
+        if let Some(d) = grep_dir {
+            changed |= h.push_grep_dir(d);
+        }
+        if !changed {
+            return;
+        }
+        self.sync_find_history();
+        if self.settings_state.writable() {
+            self.persist_settings();
+        }
+    }
+
+    // ---------------------------------------------------------------- 選択範囲内
+
+    /// `id` の検索の範囲。
+    pub(super) fn scope_of(&mut self, id: DocumentId) -> Scope {
+        if self.scope_doc != Some(id) {
+            return Scope::Off;
+        }
+        match self.with_text(id, |ed| ed.search_scope()) {
+            Ok(Some(r)) => Scope::Range(r),
+            _ => Scope::Missing,
+        }
+    }
+
+    /// 「選択範囲内」を解除する（印も消し、検索欄のチェックも外す）。
+    pub(super) fn clear_scope(&mut self) {
+        if let Some(id) = self.scope_doc.take() {
+            let _ = self.with_text(id, |ed| ed.clear_search_scope());
+        }
+        if let Some(p) = self.find_panel {
+            p.set_in_selection(false);
+        }
+    }
+
+    /// 範囲の本文（文字として読めなければエラー）。
+    fn scoped_text(&mut self, id: DocumentId, r: TextRange) -> Result<String> {
+        let bytes = self.with_text(id, |ed| ed.text_range(r.start, r.end))?;
+        String::from_utf8(bytes)
+            .map_err(|_| Error::invalid_argument("選択範囲", "選択範囲を文字として読めません"))
+    }
+
+    /// 検索用の本文の写し（`scope` があればその範囲だけ）。
+    pub(super) fn scope_snapshot(
+        &mut self,
+        id: DocumentId,
+        scope: Option<TextRange>,
+    ) -> Result<(DocStamp, String)> {
+        let Some(r) = scope else {
+            return self.text_snapshot(id);
+        };
+        self.sync();
+        let stamp = self
+            .state(id)
+            .map(|s| s.stamp())
+            .ok_or_else(|| Error::not_found(format!("文書 {id}")))?;
+        Ok((stamp, self.scoped_text(id, r)?))
+    }
+
+    /// 「選択範囲内」のオン・オフ。オンにした時点の選択範囲を検索の範囲にする。
+    pub fn set_scope(&mut self, on: bool) {
+        if !on {
+            self.clear_scope();
+            self.refresh_query_highlight();
+            return;
+        }
+        let Some(id) = self.active_id() else {
+            self.clear_scope();
+            return;
+        };
+        if self.bigviews.contains_key(&id) {
+            self.clear_scope();
+            self.find_message("巨大ファイルでは「選択範囲内」は使えません", true);
+            return;
+        }
+        let sel = self
+            .with_text(id, |ed| ed.selection().range())
+            .unwrap_or(TextRange::new(0, 0));
+        if sel.is_empty() {
+            self.clear_scope();
+            self.find_message(
+                "選択範囲がありません（範囲を選んでから「選択範囲内」をオンにしてください）",
+                true,
+            );
+            return;
+        }
+        // 別の文書の範囲が残っていれば消す。
+        if let Some(old) = self.scope_doc.filter(|d| *d != id) {
+            let _ = self.with_text(old, |ed| ed.clear_search_scope());
+        }
+        let _ = self.with_text(id, |ed| ed.set_search_scope(sel));
+        self.scope_doc = Some(id);
+        self.refresh_query_highlight();
+        self.find_message("選択範囲内を対象にしました", false);
+    }
+
+    /// 検索欄の現在の条件で強調を付け直す（範囲の切り替えのあと）。
+    fn refresh_query_highlight(&mut self) {
+        match self.find_panel.and_then(|p| p.options()) {
+            Some(o) if !o.query.is_empty() => self.on_query_changed(o),
+            _ => self.clear_highlight(),
+        }
     }
 
     /// 検索欄が開いているか。
@@ -274,15 +416,16 @@ impl App {
             FindEvent::ReplaceAll {
                 options,
                 replacement,
-                in_selection,
             } => {
                 self.last_search = Some(options.clone());
-                if in_selection {
-                    self.replace_in_selection(options, replacement);
-                } else {
-                    self.replace_all(options, replacement);
-                }
+                self.replace_all(options, replacement);
             }
+            FindEvent::Scope(on) => self.set_scope(on),
+            FindEvent::Ran {
+                find,
+                replace,
+                grep_dir,
+            } => self.record_history(&find, replace.as_deref(), grep_dir.as_deref()),
             FindEvent::Changed(options) => self.on_query_changed(options),
             FindEvent::OpenHit { path, line, column } => self.open_hit(path, line, column),
             FindEvent::Closed => self.focus_active(),
@@ -306,24 +449,49 @@ impl App {
                 return;
             }
         };
+        let scope = match self.scope_of(id) {
+            Scope::Off => None,
+            Scope::Range(r) => Some(r),
+            Scope::Missing => {
+                self.find_message(SCOPE_MISSING, true);
+                return;
+            }
+        };
         let Ok((len, sel)) = self.with_text(id, |ed| (ed.length(), ed.selection())) else {
             return;
         };
         let range = sel.range();
-        let from = match direction {
+        let mut from = match direction {
             Direction::Forward => range.end,
             Direction::Backward => range.start,
         };
-        if len as usize >= self.worker_search_bytes {
-            self.search_on_worker(id, searcher, from, direction);
+        let base = scope.map_or(0, |r| r.start);
+        let size = scope.map_or(len, |r| r.len());
+        if let Some(r) = scope {
+            // 範囲の外から始めるときは、範囲の端から。
+            from = from.clamp(r.start, r.end) - r.start;
+        }
+        if size as usize >= self.worker_search_bytes {
+            self.search_on_worker(id, searcher, from, direction, scope);
             return;
         }
         self.cancel_search();
-        let result = self.with_text(id, |ed| {
-            searcher.find(ed, from, direction, true, &TaskContext::detached())
-        });
+        let result = match scope {
+            None => self.with_text(id, |ed| {
+                searcher.find(ed, from, direction, true, &TaskContext::detached())
+            }),
+            Some(r) => self.scoped_text(id, r).map(|text| {
+                searcher.find(
+                    &MemoryText::new(text),
+                    from,
+                    direction,
+                    true,
+                    &TaskContext::detached(),
+                )
+            }),
+        };
         match result {
-            Ok(Ok(outcome)) => self.apply_hit(id, outcome.value, direction),
+            Ok(Ok(outcome)) => self.apply_hit(id, shift_hit(outcome.value, base), direction),
             Ok(Err(e)) | Err(e) => self.find_message(&describe(&e), true),
         }
     }
@@ -340,8 +508,10 @@ impl App {
         searcher: Searcher,
         from: u64,
         direction: Direction,
+        scope: Option<TextRange>,
     ) {
-        let (stamp, text) = match self.text_snapshot(id) {
+        let base = scope.map_or(0, |r| r.start);
+        let (stamp, text) = match self.scope_snapshot(id, scope) {
             Ok(r) => r,
             Err(e) => {
                 self.find_message(&describe(&e), true);
@@ -359,7 +529,7 @@ impl App {
             let src = MemoryText::new(text);
             let result = searcher.find(&src, from, direction, true, &ctx);
             sender.send(UiMessage::Run(Box::new(move |app| {
-                app.finish_search(stamp, direction, result)
+                app.finish_search(stamp, direction, base, result)
             })));
         });
     }
@@ -368,6 +538,7 @@ impl App {
         &mut self,
         stamp: DocStamp,
         direction: Direction,
+        base: u64,
         result: Result<Outcome<Option<Hit>>>,
     ) {
         // 検索している間に編集された・タブが替わったときは、結果を使わない。
@@ -376,7 +547,9 @@ impl App {
         }
         match result {
             Ok(outcome) if outcome.completion == Completion::Cancelled => {}
-            Ok(outcome) => self.apply_hit(stamp.document, outcome.value, direction),
+            Ok(outcome) => {
+                self.apply_hit(stamp.document, shift_hit(outcome.value, base), direction)
+            }
             Err(e) if e.is_cancelled() => {}
             Err(e) => self.find_message(&describe(&e), true),
         }
@@ -475,11 +648,28 @@ impl App {
                 return;
             }
         };
+        let scope = match self.scope_of(id) {
+            Scope::Off => None,
+            Scope::Range(r) => Some(r),
+            Scope::Missing => {
+                self.find_message(SCOPE_MISSING, true);
+                return;
+            }
+        };
         let result = self.with_text(id, |ed| -> Result<bool> {
             let range = ed.selection().range();
+            // 範囲の外の一致は置換しない（範囲内の次の一致へ移るだけ）。
+            if scope.is_some_and(|r| range.start < r.start || range.end > r.end) {
+                return Ok(false);
+            }
             match searcher.replacement_for(ed, range, replacement)? {
                 Some(text) => {
                     EditTarget::replace(ed, range, &text)?;
+                    if let Some(r) = scope {
+                        // 範囲の端の置換でも印が縮まないよう、付け直す。
+                        let end = (r.end + text.len() as u64).saturating_sub(range.len());
+                        ed.set_search_scope(TextRange::new(r.start, end.max(r.start)));
+                    }
                     Ok(true)
                 }
                 None => Ok(false),
@@ -519,6 +709,17 @@ impl App {
                 return;
             }
         };
+        match self.scope_of(id) {
+            Scope::Off => {}
+            Scope::Range(r) => {
+                self.replace_in_scope(id, searcher, replacement, r);
+                return;
+            }
+            Scope::Missing => {
+                self.find_message(SCOPE_MISSING, true);
+                return;
+            }
+        }
         let Ok(len) = self.with_text(id, |ed| ed.length()) else {
             return;
         };
@@ -554,34 +755,16 @@ impl App {
         }
     }
 
-    /// 選択範囲の中だけをすべて置換する。Undo は 1 回で元に戻る。選択範囲の本文だけを
-    /// 検索の対象にするので、`^`・`\b` などは選択範囲の端を文書の端として扱う。
-    pub fn replace_in_selection(&mut self, options: SearchOptions, replacement: String) {
-        let Some(id) = self.active_id() else { return };
-        if !self.can_replace(id) {
-            return;
-        }
-        let searcher = match options.compile() {
-            Ok(s) => s,
-            Err(e) => {
-                self.find_message(&describe(&e), true);
-                return;
-            }
-        };
-        let Ok(sel) = self.with_text(id, |ed| ed.selection().range()) else {
-            return;
-        };
-        if sel.is_empty() {
-            self.find_message(
-                "選択範囲がありません（置換する範囲を選んでから実行してください）",
-                true,
-            );
-            return;
-        }
-        let Ok(bytes) = self.with_text(id, |ed| ed.text_range(sel.start, sel.end)) else {
-            return;
-        };
-        let Ok(text) = String::from_utf8(bytes) else {
+    /// 範囲の中だけをすべて置換する。Undo は 1 回で元に戻る。範囲の本文だけを検索の
+    /// 対象にするので、`^`・`\b` などは範囲の端を文書の端として扱う。
+    fn replace_in_scope(
+        &mut self,
+        id: DocumentId,
+        searcher: Searcher,
+        replacement: String,
+        sel: TextRange,
+    ) {
+        let Ok(text) = self.scoped_text(id, sel) else {
             self.find_message("選択範囲を文字として読めませんでした", true);
             return;
         };
@@ -690,6 +873,8 @@ impl App {
                         caret: end,
                     },
                 );
+                // 範囲の印も、置換後の範囲に付け直す。
+                ed.set_search_scope(TextRange::new(scope.start, end));
             }
             result
         });
