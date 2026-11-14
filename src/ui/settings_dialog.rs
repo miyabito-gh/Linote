@@ -45,6 +45,8 @@ use crate::ui::window::UiFont;
 
 /// 「適用」ボタンの ID。
 pub const ID_APPLY: i32 = 3003;
+/// 「設定ファイルを開く」ボタンの ID（左下）。
+pub const ID_OPEN_FILE: i32 = 3004;
 const ID_BANNER: i32 = 3001;
 const ID_PAGE_LIST: i32 = 3002;
 const ID_PAGE_HOST_BASE: i32 = 3500;
@@ -616,11 +618,32 @@ fn build(dlg: HWND, state: &mut State<'_>, owner: HWND) {
             &state.font,
         );
     }
+    // 左下: 直接編集したい人向けの入口（メニューからは外した）。
+    let open_w = (dip(state.font.measure_text("設定ファイルを開く", None).cx) + 24).max(bw);
+    child(
+        dlg,
+        windows::core::w!("BUTTON"),
+        "設定ファイルを開く",
+        BS_PUSHBUTTON | WS_TABSTOP,
+        0,
+        (px(margin), px(by), px(open_w), px(button_h)),
+        ID_OPEN_FILE,
+        &state.font,
+    );
     send(dlg, DM_SETDEFID, IDOK.0 as usize, 0);
 
     refresh_controls(dlg, state);
-    send(list, LB_SETCURSEL, 0, 0);
-    show_page(state, 0);
+    // ヘルプ > キーボード ショートカットからは「キー」ページで開く。
+    let first = if state.session.initial_keys_page() {
+        pages()
+            .iter()
+            .position(|p| p.kind == PageKind::Keys)
+            .unwrap_or(0)
+    } else {
+        0
+    };
+    send(list, LB_SETCURSEL, first, 0);
+    show_page(state, first);
     // SAFETY: 自分のダイアログの部品。
     unsafe {
         let _ = SetFocus(Some(list));
@@ -1266,6 +1289,23 @@ unsafe extern "system" fn dialog_proc(
                 // SAFETY: 自分のダイアログを閉じる。
                 unsafe {
                     let _ = EndDialog(dlg, IDCANCEL.0 as isize);
+                }
+                1
+            } else if id == ID_OPEN_FILE && notify == BN_CLICKED {
+                // 未適用の変更があれば、捨ててよいか確かめる。
+                let unchanged = read_controls(dlg, state).is_ok_and(|e| e == state.baseline);
+                if unchanged
+                    || state.session.confirm(
+                        dlg,
+                        "設定ファイルを開く",
+                        "適用していない変更は破棄されます。設定ファイルを開きますか？",
+                    )
+                {
+                    // SAFETY: 自分のダイアログを閉じる。
+                    unsafe {
+                        let _ = EndDialog(dlg, IDCANCEL.0 as isize);
+                    }
+                    state.session.open_settings_file();
                 }
                 1
             } else if id == ID_APPLY && notify == BN_CLICKED {

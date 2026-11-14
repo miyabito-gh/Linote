@@ -48,7 +48,29 @@ pub const APP_OPEN_SETTINGS_FILE: CommandDef = CommandDef::new(
     "settings.json を Linote のタブで開く（なければ今の設定で作ってから開く）。保存すると自動で再読み込みする。",
 );
 
+pub const HELP_KEYS: CommandDef = CommandDef::new(
+    CommandId::new("help.keys"),
+    "キーボードショートカット...",
+    "設定画面の「キー」ページを開く（コマンドとキーの一覧。割り当ての変更もできる）。",
+);
+
+pub const HELP_ABOUT: CommandDef = CommandDef::new(
+    CommandId::new("help.about"),
+    "バージョン情報",
+    "Linote の版と、設定・メモ・復元データの保存場所を表示する。",
+);
+
 pub(super) fn register(registry: &mut Registry<App>) -> Result<()> {
+    registry.register(HELP_KEYS, |app, _| {
+        app.settings_open_keys = true;
+        app.open_settings_dialog();
+        app.settings_open_keys = false;
+        Ok(Value::Null)
+    })?;
+    registry.register(HELP_ABOUT, |app, _| {
+        app.show_about();
+        Ok(Value::Null)
+    })?;
     registry.register(APP_SETTINGS, |app, _| {
         app.open_settings_dialog();
         Ok(Value::Null)
@@ -290,6 +312,25 @@ impl App {
 
     // ---------------------------------------------------------------- 設定画面
 
+    /// バージョン情報。
+    fn show_about(&mut self) {
+        let data = self
+            .paths
+            .as_ref()
+            .map(|p| p.root().display().to_string())
+            .unwrap_or_else(|| "（なし）".to_owned());
+        let text = format!(
+            "Linote {}\n\nWindows 用の軽量テキストエディタ\n\n設定・メモ・復元データの保存場所:\n{data}",
+            env!("CARGO_PKG_VERSION")
+        );
+        self.prompts.notice(
+            self.hwnd,
+            crate::ui::dialogs::NoticeKind::Info,
+            "バージョン情報",
+            &text,
+        );
+    }
+
     /// 設定画面を開く（モーダル）。
     pub(super) fn open_settings_dialog(&mut self) {
         let owner = self.hwnd;
@@ -360,6 +401,16 @@ struct AppSettingsSession<'a> {
 }
 
 impl SettingsSession for AppSettingsSession<'_> {
+    fn initial_keys_page(&self) -> bool {
+        self.app.settings_open_keys
+    }
+
+    fn open_settings_file(&mut self) {
+        if let Err(e) = self.app.open_settings_file() {
+            self.app.set_status(&e.to_string(), MessageKind::Warning);
+        }
+    }
+
     fn current(&self) -> Settings {
         self.app.settings.clone()
     }

@@ -77,10 +77,18 @@ fn commands_and_menu() -> Check {
             "Ctrl+, は設定画面"
         );
         let entries = app.menu().ok_or("メニューがない")?.entries().to_vec();
+        // 設定ファイルの直接編集・再読み込みは頻度が低いのでメニューから外した
+        // （設定画面の「設定ファイルを開く」、前面に戻したときの自動の再読み込み）。
+        for id in ["app.open_settings_file", "app.reload_settings"] {
+            check!(
+                !entries.iter().any(|e| e.command == CommandId::new(id)),
+                "メニューに {id} が残っている"
+            );
+        }
         for (id, label) in [
             ("app.settings", "設定..."),
-            ("app.open_settings_file", "設定ファイルを開く"),
-            ("app.reload_settings", "設定を再読み込み"),
+            ("help.keys", "キーボードショートカット..."),
+            ("help.about", "バージョン情報"),
         ] {
             let e = entries
                 .iter()

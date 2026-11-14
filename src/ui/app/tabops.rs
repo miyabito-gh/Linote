@@ -167,6 +167,65 @@ impl App {
         let _ = self.execute(&inv);
     }
 
+    /// 本文の右クリックメニュー（Scintilla 既定の英語のメニューの代わり）。項目はメニューバーと
+    /// 同じコマンドで、キーの割り当てを右に表示する。使えない項目は灰色。
+    pub(super) fn show_editor_menu(&mut self) {
+        let registry = self.registry();
+        // SAFETY: 作ったポップアップメニューを、このウィンドウの上で出して破棄する。
+        let chosen = unsafe {
+            let Ok(menu) = CreatePopupMenu() else { return };
+            for (n, item) in EDITOR_MENU.iter().enumerate() {
+                match item {
+                    None => {
+                        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, windows::core::PCWSTR::null());
+                    }
+                    Some((command, label)) => {
+                        let id = crate::command::CommandId::new(command);
+                        let key = self
+                            .keymap()
+                            .chord_for(id)
+                            .map(|c| format!("\t{c}"))
+                            .unwrap_or_default();
+                        let text = format!("{label}{key}");
+                        let wide: Vec<u16> = text.encode_utf16().chain(Some(0)).collect();
+                        let usable = !(self.active.is_none() && self.needs_document(id))
+                            && registry
+                                .check_available(self, &Invocation::user(id))
+                                .is_ok();
+                        let flags = if usable {
+                            MF_STRING
+                        } else {
+                            MF_STRING | MF_GRAYED
+                        };
+                        let _ =
+                            AppendMenuW(menu, flags, n + 1, windows::core::PCWSTR(wide.as_ptr()));
+                    }
+                }
+            }
+            let mut p = POINT::default();
+            let _ = GetCursorPos(&mut p);
+            let paint_state = crate::ui::menu::drawing::popup(menu);
+            let r = TrackPopupMenu(
+                menu,
+                TPM_RETURNCMD | TPM_RIGHTBUTTON,
+                p.x,
+                p.y,
+                None,
+                self.hwnd,
+                None,
+            );
+            crate::ui::menu::drawing::popup_closed(paint_state);
+            let _ = DestroyMenu(menu);
+            r.0 as usize
+        };
+        if let Some(Some((command, _))) = chosen.checked_sub(1).and_then(|n| EDITOR_MENU.get(n)) {
+            self.run_command(
+                crate::command::CommandId::new(command),
+                serde_json::Value::Null,
+            );
+        }
+    }
+
     // ---------------------------------------------------------------- 別ウィンドウへ移す（送り側）
 
     /// 受け渡す内容を作る。移せない文書は理由つきで断る。
@@ -521,3 +580,21 @@ fn spawn_adopter(file: &Path, position: Option<(i32, i32)>) -> Result<std::proce
     cmd.spawn()
         .map_err(|e| Error::io("新しいウィンドウの起動", &exe, e))
 }
+
+/// 本文の右クリックメニューの項目（コマンド、表示）。`None` は区切り。
+pub(crate) const EDITOR_MENU: &[Option<(&str, &str)>] = &[
+    Some(("edit.undo", "元に戻す")),
+    Some(("edit.redo", "やり直し")),
+    None,
+    Some(("edit.cut", "切り取り")),
+    Some(("edit.copy", "コピー")),
+    Some(("edit.paste", "貼り付け")),
+    None,
+    Some(("edit.select_all", "すべて選択")),
+    None,
+    Some(("search.find_selection", "選択文字列を検索")),
+    Some(("search.find", "検索...")),
+    Some(("search.replace", "置換...")),
+    None,
+    Some(("search.toggle_bookmark", "ブックマークの設定/解除")),
+];

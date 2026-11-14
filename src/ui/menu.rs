@@ -302,14 +302,10 @@ static MENUS: &[MenuDef] = &[
             Item::Cmd(CommandId::new("file.new_window")),
             Item::Cmd(CommandId::new("file.close")),
             Item::Cmd(CommandId::new("file.close_others")),
-            Item::Cmd(CommandId::new("file.close_right")),
-            Item::Cmd(CommandId::new("file.move_to_new_window")),
             Item::Cmd(CommandId::new("file.close_all")),
             Item::Cmd(CommandId::new("file.reopen_closed")),
             Item::Separator,
             Item::Cmd(CommandId::new("app.settings")),
-            Item::Cmd(CommandId::new("app.open_settings_file")),
-            Item::Cmd(CommandId::new("app.reload_settings")),
             Item::Separator,
             Item::Cmd(CommandId::new("file.exit")),
         ],
@@ -375,9 +371,6 @@ static MENUS: &[MenuDef] = &[
     MenuDef {
         title: "表示(&V)",
         items: &[
-            Item::Cmd(CommandId::new("view.next_tab")),
-            Item::Cmd(CommandId::new("view.prev_tab")),
-            Item::Separator,
             Item::Sub(
                 "折り返し(&W)",
                 &[
@@ -400,17 +393,9 @@ static MENUS: &[MenuDef] = &[
                         "mode",
                         "column",
                     ),
-                    Item::Separator,
-                    Item::Cmd(CommandId::new("view.toggle_edge_guide")),
                 ],
             ),
             Item::Cmd(CommandId::new("view.font")),
-            Item::CmdArg(
-                CommandId::new("view.font"),
-                "既定のフォントに戻す",
-                "font",
-                "",
-            ),
             Item::Cmd(CommandId::new("view.zoom_in")),
             Item::Cmd(CommandId::new("view.zoom_out")),
             Item::Cmd(CommandId::new("view.zoom_reset")),
@@ -419,8 +404,6 @@ static MENUS: &[MenuDef] = &[
             Item::Cmd(CommandId::new("view.toggle_eol")),
             Item::Cmd(CommandId::new("view.toggle_line_numbers")),
             Item::Cmd(CommandId::new("view.status_bar")),
-            Item::Cmd(CommandId::new("view.toggle_current_line")),
-            Item::Cmd(CommandId::new("view.toggle_braces")),
             Item::Separator,
             Item::Sub(
                 "タブ幅(&T)",
@@ -430,8 +413,6 @@ static MENUS: &[MenuDef] = &[
                     Item::CmdArg(CommandId::new("view.tab_width"), "8", "width", "8"),
                 ],
             ),
-            Item::Cmd(CommandId::new("view.toggle_tab_spaces")),
-            Item::Cmd(CommandId::new("view.toggle_auto_indent")),
             Item::Separator,
             Item::Cmd(CommandId::new("view.toggle_theme")),
             Item::Separator,
@@ -501,6 +482,14 @@ static MENUS: &[MenuDef] = &[
             Item::Cmd(CommandId::new("memo.rename")),
             Item::Separator,
             Item::Cmd(CommandId::new("clipboard.new_tab")),
+        ],
+    },
+    MenuDef {
+        title: "ヘルプ(&H)",
+        items: &[
+            Item::Cmd(CommandId::new("help.keys")),
+            Item::Separator,
+            Item::Cmd(CommandId::new("help.about")),
         ],
     },
 ];
@@ -671,6 +660,14 @@ impl MenuModel {
     }
 
     /// 項目の有効・無効を全部直す（試験用）。
+    /// `command` の項目を含むサブメニュー（ステータスバーのクリックで同じ一覧を出すため）。
+    pub fn popup_containing(&self, command: CommandId) -> Option<HMENU> {
+        self.entries
+            .iter()
+            .find(|e| e.command == command)
+            .map(|e| HMENU(e.popup as *mut _))
+    }
+
     pub fn popups(&self) -> Vec<HMENU> {
         let mut v: Vec<isize> = self.entries.iter().map(|e| e.popup).collect();
         v.sort_unstable();

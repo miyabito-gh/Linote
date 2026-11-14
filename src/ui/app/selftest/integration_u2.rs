@@ -88,15 +88,24 @@ fn menu_and_keys() -> Check {
             "view.toggle_whitespace",
             "view.toggle_eol",
             "view.toggle_line_numbers",
+        ] {
+            check!(
+                entries.iter().any(|e| e.command == CommandId::new(command)),
+                "メニューに {command} がない"
+            );
+        }
+        // 一度決めたら変えない表示の設定は、設定画面だけに置く（コマンドとキーは残す）。
+        for command in [
             "view.toggle_current_line",
             "view.toggle_braces",
             "view.toggle_edge_guide",
             "view.toggle_tab_spaces",
             "view.toggle_auto_indent",
         ] {
+            check!(app.registry().find(command).is_some(), "{command} が未登録");
             check!(
-                entries.iter().any(|e| e.command == CommandId::new(command)),
-                "メニューに {command} がない"
+                !entries.iter().any(|e| e.command == CommandId::new(command)),
+                "メニューに {command} が残っている"
             );
         }
         let wraps = entries

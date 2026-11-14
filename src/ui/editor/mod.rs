@@ -252,6 +252,9 @@ impl Editor {
         self.send(SCI_SETCODEPAGE, SC_CP_UTF8, 0);
         // 日本語 IME: 変換中の文字列を本文の位置にそのまま表示する。
         self.send(SCI_SETIMEINTERACTION, SC_IME_INLINE, 0);
+        // 既定の右クリックメニュー（英語）は使わない。WM_CONTEXTMENU が親に届き、
+        // アプリが日本語のメニューを出す。
+        self.send(SCI_USEPOPUP, 0 /* SC_POPUP_NEVER */, 0);
         self.send(
             SCI_SETMODEVENTMASK,
             (SC_MOD_INSERTTEXT | SC_MOD_DELETETEXT) as usize,
