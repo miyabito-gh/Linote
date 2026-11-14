@@ -1,39 +1,27 @@
 #![cfg_attr(not(test), windows_subsystem = "windows")]
 
-#[cfg(windows)]
-mod smoke {
-    use linote::sci_sys::*;
-    use windows::core::*;
-    use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-    use windows::Win32::UI::WindowsAndMessaging::*;
+//! Linote の起動入口。GUI の起動と、隠しオプション `--self-test`（画面の自己診断）を扱う。
+//! 将来の `--mcp-stdio` の分岐もここに置く（要件 C、初版は未実装）。
 
-    pub fn run() {
-        unsafe {
-            let hinst = GetModuleHandleW(None).unwrap();
-            assert!(Scintilla_RegisterClasses(hinst.0 as _) != 0);
-            assert!(!linote_create_lexer(c"rust".as_ptr()).is_null());
-            let hwnd = CreateWindowExW(
-                WINDOW_EX_STYLE::default(),
-                w!("Scintilla"),
-                w!(""),
-                WS_OVERLAPPEDWINDOW,
-                0,
-                0,
-                400,
-                300,
-                None,
-                None,
-                Some(hinst.into()),
-                None,
-            )
-            .unwrap();
-            println!("scintilla ok {:?}", hwnd.0);
-            let _ = DestroyWindow(hwnd);
-        }
+#[cfg(windows)]
+fn main() {
+    use linote::ui::app::{self, selftest, RunOptions};
+    use std::path::PathBuf;
+
+    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    if args.first().is_some_and(|a| a == "--self-test") {
+        std::process::exit(selftest::run_self_test());
     }
+    let files: Vec<PathBuf> = args.into_iter().map(PathBuf::from).collect();
+    let code = app::run(RunOptions {
+        files,
+        ..RunOptions::default()
+    });
+    std::process::exit(code);
 }
 
+#[cfg(not(windows))]
 fn main() {
-    #[cfg(windows)]
-    smoke::run();
+    eprintln!("Linote は Windows 専用です。");
+    std::process::exit(1);
 }
