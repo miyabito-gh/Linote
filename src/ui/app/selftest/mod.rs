@@ -522,6 +522,7 @@ fn checks_misc(app: &mut App) -> Check {
                 crate::file::FileStamp {
                     len: 0,
                     modified: None,
+                    id: None,
                 },
             ),
             pane,

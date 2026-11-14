@@ -1,13 +1,28 @@
 //! OS ごとの「置換」の実装。
 //!
-//! Windows では `kernel32` の `MoveFileExW`／`ReplaceFileW` を直接宣言して呼ぶ
+//! ファイルの実体の ID（[`FileId`]）の取得もここに置く。
+//!
+//! Windows では `kernel32` の `MoveFileExW`／`ReplaceFileW`／`GetFileInformationByHandle(Ex)` を直接宣言して呼ぶ
 //! （中核は `windows` crate を使わない取り決めのため。std の `fs::rename` は
 //! `MOVEFILE_WRITE_THROUGH` を付けず、`ReplaceFileW` 相当もない）。
 
+use std::fs::{File, Metadata};
 use std::io;
 use std::path::Path;
 
 use super::atomic::ReplaceMode;
+use super::{FileId, FileStamp};
+
+/// 開いているファイルの実体の ID。取れなければ `None`。
+pub(super) fn file_id(file: &File, metadata: &Metadata) -> Option<FileId> {
+    imp::file_id(file, metadata)
+}
+
+/// `path` の状態を控える（ファイル ID つき。ID が取れなければ ID なし）。
+/// 存在しなければ `ErrorKind::NotFound`。
+pub(super) fn read_stamp(path: &Path) -> io::Result<FileStamp> {
+    imp::read_stamp(path)
+}
 
 /// `temp` を `target` に置き換える。`target_exists` は直前に確かめた結果。
 /// 失敗した場合、`target` は元のまま（または元から存在しないまま）で、`temp` が残る。
@@ -40,6 +55,33 @@ mod imp {
             let _ = d.sync_all();
         }
     }
+
+    #[cfg(unix)]
+    fn id_of(metadata: &Metadata) -> Option<FileId> {
+        use std::os::unix::fs::MetadataExt;
+        Some(FileId {
+            volume: metadata.dev(),
+            index: u128::from(metadata.ino()),
+        })
+    }
+
+    #[cfg(not(unix))]
+    fn id_of(_: &Metadata) -> Option<FileId> {
+        None
+    }
+
+    pub fn file_id(_: &File, metadata: &Metadata) -> Option<FileId> {
+        id_of(metadata)
+    }
+
+    pub fn read_stamp(path: &Path) -> io::Result<FileStamp> {
+        // 読む権限がなくても状態は取れるよう、ファイルは開かずにメタデータを見る。
+        let metadata = std::fs::metadata(path)?;
+        Ok(FileStamp {
+            id: id_of(&metadata),
+            ..FileStamp::from_metadata(&metadata)
+        })
+    }
 }
 
 #[cfg(windows)]
@@ -56,8 +98,45 @@ mod imp {
     const ERROR_SHARING_VIOLATION: i32 = 32;
     const ERROR_LOCK_VIOLATION: i32 = 33;
 
+    /// `FILE_INFO_BY_HANDLE_CLASS::FileIdInfo`。
+    const FILE_ID_INFO_CLASS: i32 = 18;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    const FILE_SHARE_ALL: u32 = 0x1 | 0x2 | 0x4;
+
+    /// `FILE_ID_INFO`（Windows 8 以降。ReFS の 128 ビットの ID も表せる）。
+    #[repr(C)]
+    #[derive(Default)]
+    struct FileIdInfo {
+        volume_serial_number: u64,
+        file_id: [u8; 16],
+    }
+
+    /// `BY_HANDLE_FILE_INFORMATION`（`FILE_ID_INFO` が取れないときの代わり）。
+    #[repr(C)]
+    #[derive(Default)]
+    struct ByHandleFileInformation {
+        attributes: u32,
+        creation_time: [u32; 2],
+        last_access_time: [u32; 2],
+        last_write_time: [u32; 2],
+        volume_serial_number: u32,
+        size_high: u32,
+        size_low: u32,
+        number_of_links: u32,
+        index_high: u32,
+        index_low: u32,
+    }
+
     #[link(name = "kernel32")]
     extern "system" {
+        fn GetFileInformationByHandleEx(
+            file: *mut c_void,
+            class: i32,
+            info: *mut c_void,
+            size: u32,
+        ) -> i32;
+        fn GetFileInformationByHandle(file: *mut c_void, info: *mut ByHandleFileInformation)
+            -> i32;
         fn MoveFileExW(existing: *const u16, new: *const u16, flags: u32) -> i32;
         fn ReplaceFileW(
             replaced: *const u16,
@@ -177,5 +256,55 @@ mod imp {
 
     pub fn sync_dir(_dir: &Path) {
         // MOVEFILE_WRITE_THROUGH が、置換がディスクに書かれるまで待つ。
+    }
+
+    pub fn file_id(file: &File, _: &Metadata) -> Option<FileId> {
+        use std::os::windows::io::AsRawHandle;
+        let handle = file.as_raw_handle();
+        let mut info = FileIdInfo::default();
+        // SAFETY: handle は `file` が生きている間有効。`info` は FILE_ID_INFO と同じ配置。
+        let ok = unsafe {
+            GetFileInformationByHandleEx(
+                handle,
+                FILE_ID_INFO_CLASS,
+                (&mut info as *mut FileIdInfo).cast(),
+                std::mem::size_of::<FileIdInfo>() as u32,
+            )
+        };
+        let id = if ok != 0 {
+            FileId {
+                volume: info.volume_serial_number,
+                index: u128::from_le_bytes(info.file_id),
+            }
+        } else {
+            let mut info = ByHandleFileInformation::default();
+            // SAFETY: 同上。`info` は BY_HANDLE_FILE_INFORMATION と同じ配置。
+            if unsafe { GetFileInformationByHandle(handle, &mut info) } == 0 {
+                return None;
+            }
+            FileId {
+                volume: u64::from(info.volume_serial_number),
+                index: (u128::from(info.index_high) << 32) | u128::from(info.index_low),
+            }
+        };
+        // ID を返さないファイルシステム（一部のネットワーク共有など）は 0 になる。
+        (id.index != 0).then_some(id)
+    }
+
+    pub fn read_stamp(path: &Path) -> io::Result<FileStamp> {
+        use std::os::windows::fs::OpenOptionsExt;
+        // 内容は読まない（アクセス権 0）。他のプログラムが開いていても妨げない。
+        // フォルダーも開けるよう BACKUP_SEMANTICS を付ける（std::fs::metadata と同じ）。
+        let opened = std::fs::OpenOptions::new()
+            .access_mode(0)
+            .share_mode(FILE_SHARE_ALL)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(path);
+        match opened {
+            Ok(file) => FileStamp::of_file(&file),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Err(e),
+            // 開けなくても状態だけは取れることがある。ID なしで控える。
+            Err(_) => Ok(FileStamp::from_metadata(&std::fs::metadata(path)?)),
+        }
     }
 }

@@ -62,11 +62,13 @@ impl RawFile {
             ));
         }
         let path_meta = std::fs::metadata(path).map_err(|e| Error::io("開く", path, e))?;
+        let handle_stamp = FileStamp::of_file(&file).map_err(|e| Error::io("開く", path, e))?;
         Ok(Self {
             file,
             path: path.to_path_buf(),
-            handle_stamp: FileStamp::from_metadata(&handle_meta),
-            path_stamp: FileStamp::from_metadata(&path_meta),
+            handle_stamp,
+            path_stamp: FileStamp::read(path)?
+                .unwrap_or_else(|| FileStamp::from_metadata(&path_meta)),
             identity: Identity::of(&handle_meta),
         })
     }
@@ -116,15 +118,21 @@ impl RawFile {
 
     /// ハンドルの指すファイルが、開いたときから変わったか（長さ・更新時刻）。
     pub(crate) fn handle_changed(&self) -> io::Result<bool> {
-        let now = FileStamp::from_metadata(&self.file.metadata()?);
-        Ok(now != self.handle_stamp)
+        let now = FileStamp::of_file(&self.file)?;
+        Ok(!now.matches(&self.handle_stamp))
     }
 
     /// パスの指すファイルが、開いたときから変わったか（置換・削除・長さ・更新時刻）。
     pub(crate) fn path_changed(&self) -> io::Result<bool> {
         match std::fs::metadata(&self.path) {
-            Ok(meta) => Ok(FileStamp::from_metadata(&meta) != self.path_stamp
-                || Identity::of(&meta) != self.identity),
+            Ok(meta) => {
+                let now = match FileStamp::read(&self.path) {
+                    Ok(Some(stamp)) => stamp,
+                    Ok(None) => return Ok(true),
+                    Err(_) => FileStamp::from_metadata(&meta),
+                };
+                Ok(!now.matches(&self.path_stamp) || Identity::of(&meta) != self.identity)
+            }
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(true),
             Err(e) => Err(e),
         }

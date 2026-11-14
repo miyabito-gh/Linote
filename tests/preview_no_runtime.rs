@@ -20,6 +20,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     PM_REMOVE, WS_OVERLAPPED,
 };
 
+use linote::core::DocumentId;
 use linote::markdown::PreviewPalette;
 use linote::ui::preview::{PaneStatus, PreviewHost, PreviewPane, PreviewWindow};
 
@@ -87,7 +88,10 @@ fn host_is_lazy_and_pane_reports_unavailable_without_runtime() {
         bottom: 200,
     });
     // 初期化の前に文書を渡しても落ちない。
-    pane.set_document(Arc::from("<html><body>x</body></html>"));
+    pane.set_document(
+        DocumentId::allocate(),
+        Arc::from("<html><body>x</body></html>"),
+    );
 
     assert!(pump(|| pane.status() != PaneStatus::Initializing));
     match pane.status() {
@@ -96,7 +100,10 @@ fn host_is_lazy_and_pane_reports_unavailable_without_runtime() {
         PaneStatus::Initializing => unreachable!(),
     }
     pane.set_palette(&PreviewPalette::light());
-    pane.set_document(Arc::from("<html><body>y</body></html>"));
+    pane.set_document(
+        DocumentId::allocate(),
+        Arc::from("<html><body>y</body></html>"),
+    );
     pane.set_visible(false);
     pane.set_visible(true);
     pane.destroy();
@@ -104,7 +111,10 @@ fn host_is_lazy_and_pane_reports_unavailable_without_runtime() {
 
     // 別ウィンドウ（同じホストを共有）。
     let win = PreviewWindow::create(&host, parent, "プレビュー", &palette).unwrap();
-    win.set_document(Arc::from("<html><body>z</body></html>"));
+    win.set_document(
+        DocumentId::allocate(),
+        Arc::from("<html><body>z</body></html>"),
+    );
     assert!(pump(|| win.status() != Some(PaneStatus::Initializing)));
     win.show();
     assert!(win.is_visible());

@@ -399,6 +399,7 @@ mod tests {
         FileStamp {
             len,
             modified: None,
+            id: None,
         }
     }
 

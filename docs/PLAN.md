@@ -141,7 +141,7 @@ W5 配布・性能 ── N → 🪟性能計測 → O 最終レビュー
 - 統括が追加: アプリケーションマニフェスト（コモンコントロール v6、PerMonitorV2、長いパス）の埋め込み、配布用 ZIP（`scripts/package.sh`）、第三者ライセンスの収集（`scripts/collect-licenses.py`）、README。
 - **未実施**: Fable による重要モジュールのレビュー（R1〜R4）と最終レビュー（O）。必要なら Opus／Sonnet でのレビューに置き換えて実施する。
 - **Windows 実機での確認が必要**: `docs/verification/I1.md`、`docs/verification/I2.md`。特に IME、DPI、WebView2 プレビュー、Direct2D 描画（Wine では GDI に代替）、グローバルショートカットの前面化、性能計測（要件の受け入れ確認 5）。
-- 既知の課題: プレビュー更新でスクロール位置が先頭に戻る、巨大モードの閾値（256 MiB／1000 万行／8 MiB 行）は暫定、巨大モードは UTF-8 のみ、`FileStamp` にファイル ID なし（ADR-14）。
+- 既知の課題: 巨大モードの閾値（256 MiB／1000 万行／8 MiB 行）は暫定、巨大モードは UTF-8 のみ。（プレビュー更新でスクロール位置が先頭に戻る問題と `FileStamp` にファイル ID がない問題は 0.1.3 で修正。）
 
 ### 2026-11-14 改善タスク（U）の中断
 
@@ -189,3 +189,12 @@ W5 配布・性能 ── N → 🪟性能計測 → O 最終レビュー
 - 追加要望のステータスバー表示／非表示を表示メニュー・設定画面へ追加し、保存と再読み込みへ対応。設定内の未知view項目も保持する。
 - 全設定ページの実コントロールを96/144/192 DPI相当で計測する回帰テストと、ページのスクロール・フォーカス追従、ステータスバーの設定・配置・通知保持のテストを追加。
 - 最後の品質関門: fmt・Clippy全ターゲット、Wine＋XvfbのWindowsテスト434件（doctestを含む、子プロセス・計測用7件ignored）、Linux lib 291件、releaseビルド、DLL依存検査を通過。0.1.2インストーラーの導入・EXE一致・版登録・削除とSHA-256を確認。全設定ページの96/144/192 DPI相当の実測テスト・キャプチャ、検索の長文エラー全文保持とEsc、設定スクロール、ステータスバーの表示設定・通知保持を確認した。Windows実機での最終的な見た目・操作は未報告。
+
+### 2026-11-14 0.1.3 既知の課題の修正（ファイル ID・プレビューのスクロール）
+
+- 利用者の指示で、既知の課題のうち「`FileStamp` にファイル ID なし」と「プレビュー更新でスクロール位置が先頭に戻る」を修正。インストーラーは作らない。
+- `FileStamp` に `id: Option<FileId>` を追加（ADR-14 を改訂）。Windows は `GetFileInformationByHandleEx(FileIdInfo)`、取れなければ `GetFileInformationByHandle`。比較は `FileStamp::matches`（片方の ID が無ければ比べない）。復元データとタブの受け渡しに `file_id` を追加（古いデータはそのまま読める）。巨大ファイルのビューの変更検知にも使う。
+- プレビューは同じ文書の更新時、`ExecuteScript` で位置を読み → `NavigateToString` → `NavigationCompleted`（こちらの読み込みの ID と照合）で戻す。文書のスクリプトは無効のまま。別の文書へ替わったときは先頭から。
+- 実機確認の項目を `docs/verification/V.md` の 0.1.3 に追加。ExecuteScript の動作は Wine では確かめられない（WebView2 なし）ので Windows 実機で確認する。
+
+- 最後の品質関門: fmt、Clippy 全ターゲット（Windows・Linux）、Wine＋Xvfb の Windows テスト 439 件（doctest を含む、子プロセス・計測用 7 件 ignored）、Linux lib 294 件、release ビルド、DLL 依存検査を通過。Windows 実機での確認は未報告。

@@ -181,11 +181,12 @@ pub(super) fn write_atomic_checked(
 
     // 置換は済んでいる。状態を取れなくても保存は成功なので、失敗にはしない
     // （更新時刻なしの控えを返す。次の照合で食い違い、外部変更として安全側に倒れる）。
-    Ok(match fs::metadata(&target) {
-        Ok(meta) => FileStamp::from_metadata(&meta),
-        Err(_) => FileStamp {
+    Ok(match FileStamp::read(&target) {
+        Ok(Some(stamp)) => stamp,
+        _ => FileStamp {
             len: written,
             modified: None,
+            id: None,
         },
     })
 }

@@ -39,7 +39,7 @@ use serde_json::{json, Map, Value};
 
 use crate::appdata::AppPaths;
 use crate::core::{Error, MemoId, Result, TaskContext};
-use crate::file::{write_atomic, FileStamp};
+use crate::file::{write_atomic, FileId, FileStamp};
 use crate::text::{Encoding, Eol, TextFormat};
 
 /// 現在の形式の版。
@@ -181,6 +181,7 @@ impl Handoff {
                         json!({
                             "len": s.len,
                             "modified_ns": s.modified.map(time_to_ns),
+                            "file_id": s.id.map(|id| id.to_hex()),
                         })
                     }),
                 );
@@ -240,6 +241,11 @@ impl Handoff {
                     Some(Value::Object(d)) => Some(FileStamp {
                         len: get_u64(d, "len")?,
                         modified: d.get("modified_ns").and_then(Value::as_i64).map(ns_to_time),
+                        // 無い・読めない ID は「ID なし」（比べない）として扱う。
+                        id: d
+                            .get("file_id")
+                            .and_then(Value::as_str)
+                            .and_then(FileId::parse),
                     }),
                     Some(_) => return Err(corrupt("`disk` が不正")),
                 };
@@ -422,6 +428,10 @@ mod tests {
             disk: Some(FileStamp {
                 len: 42,
                 modified: Some(UNIX_EPOCH + Duration::new(1_700_000_000, 123)),
+                id: Some(FileId {
+                    volume: 0x1234_5678_9abc_def0,
+                    index: u128::MAX - 1,
+                }),
             }),
             text: "一行目\r二行目 \"引用\" \\ \u{1F600}\n\0末尾".into(),
         }

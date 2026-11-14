@@ -91,6 +91,44 @@ pub fn oversize_notice_html(palette: &PreviewPalette, bytes: usize) -> String {
     )
 }
 
+/// 更新前のスクロール位置を読むスクリプト（`ExecuteScript` で実行する）。
+///
+/// 文書のスクリプトは無効のまま（`IsScriptEnabled(false)`）。`ExecuteScript` は
+/// アプリ側からの実行なので、その設定や文書の CSP に関係なく動く。実行するのはここの
+/// 固定の文字列と [`scroll_restore_script`] だけで、文書の内容は入れない。
+pub const SCROLL_CAPTURE_SCRIPT: &str = "[window.scrollX, window.scrollY]";
+
+/// スクロール位置（CSS ピクセル）。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ScrollPos {
+    pub x: f64,
+    pub y: f64,
+}
+
+/// [`SCROLL_CAPTURE_SCRIPT`] の結果（JSON の `[x,y]`）を読む。読めなければ `None`。
+pub fn parse_scroll_result(json: &str) -> Option<ScrollPos> {
+    let inner = json.trim().strip_prefix('[')?.strip_suffix(']')?;
+    let mut parts = inner.split(',');
+    let x: f64 = parts.next()?.trim().parse().ok()?;
+    let y: f64 = parts.next()?.trim().parse().ok()?;
+    if parts.next().is_some() || !x.is_finite() || !y.is_finite() {
+        return None;
+    }
+    Some(ScrollPos {
+        x: x.max(0.0),
+        y: y.max(0.0),
+    })
+}
+
+/// 新しい文書を表示したあとで、スクロール位置を戻すスクリプト。先頭なら `None`（不要）。
+/// 文書が短くなっていれば、ブラウザーが末尾に収める。
+pub fn scroll_restore_script(pos: ScrollPos) -> Option<String> {
+    if pos.x < 1.0 && pos.y < 1.0 {
+        return None;
+    }
+    Some(format!("window.scrollTo({:.1}, {:.1})", pos.x, pos.y))
+}
+
 /// ランタイムがないとき（または初期化に失敗したとき）にペインへ表示する案内。
 pub fn guidance_text(reason: &str) -> String {
     format!(
@@ -199,5 +237,42 @@ mod tests {
         let g = guidance_text("見つかりません");
         assert!(g.contains("WebView2"));
         assert!(g.contains("見つかりません"));
+    }
+
+    #[test]
+    fn scroll_result_is_parsed_strictly() {
+        assert_eq!(
+            parse_scroll_result("[0,1234.5]"),
+            Some(ScrollPos { x: 0.0, y: 1234.5 })
+        );
+        assert_eq!(
+            parse_scroll_result(" [ 3 , 4 ] "),
+            Some(ScrollPos { x: 3.0, y: 4.0 })
+        );
+        assert_eq!(
+            parse_scroll_result("[-5,10]"),
+            Some(ScrollPos { x: 0.0, y: 10.0 })
+        );
+        for bad in [
+            "",
+            "null",
+            "\"0,1\"",
+            "[1]",
+            "[1,2,3]",
+            "[a,1]",
+            "[NaN,1]",
+            "[1,Infinity]",
+        ] {
+            assert_eq!(parse_scroll_result(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn restore_script_only_contains_numbers() {
+        assert_eq!(scroll_restore_script(ScrollPos { x: 0.0, y: 0.4 }), None);
+        assert_eq!(
+            scroll_restore_script(ScrollPos { x: 0.0, y: 1234.56 }).as_deref(),
+            Some("window.scrollTo(0.0, 1234.6)")
+        );
     }
 }

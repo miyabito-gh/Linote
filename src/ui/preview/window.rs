@@ -19,7 +19,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use super::host::PreviewHost;
 use super::pane::{PaneStatus, PreviewPane};
-use crate::core::{Error, Result};
+use crate::core::{DocumentId, Error, Result};
 use crate::markdown::PreviewPalette;
 use crate::platform::system::{set_dark_title_bar, to_wide};
 
@@ -121,9 +121,9 @@ impl PreviewWindow {
         *self.inner.on_closed.borrow_mut() = Some(Rc::new(f));
     }
 
-    pub fn set_document(&self, html: Arc<str>) {
+    pub fn set_document(&self, key: DocumentId, html: Arc<str>) {
         if let Some(p) = self.pane() {
-            p.set_document(html);
+            p.set_document(key, html);
         }
     }
 

@@ -304,6 +304,7 @@ impl App {
                     .unwrap_or(FileStamp {
                         len: 0,
                         modified: None,
+                        id: None,
                     });
                 let mut state = DocumentState::open_file(path.clone(), false, meta.format, disk);
                 // 復元の前に、元ファイルが変わっていないか確かめる。

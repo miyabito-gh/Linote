@@ -43,8 +43,10 @@
 //! - 置換は「新しいファイルで置き換える」方式なので、ハードリンクは切れる。
 //! - Windows の属性・ACL・代替データストリームは `ReplaceFileW` が引き継ぐ。
 //!   `ReplaceFileW` が使えないファイルシステムでは単純な置換になり、引き継がれない。
-//! - 外部変更の検知は長さと更新時刻による。同じ長さで、更新時刻の刻み
-//!   （NTFS は 100 ナノ秒、FAT は 2 秒）の中で書き換えられた場合は検知できない。
+//! - 外部変更の検知は長さ・更新時刻・ファイル ID による。ファイル ID が変わる
+//!   「別のファイルで置き換える」形の書き換え（多くのエディタの保存）は、長さと更新時刻が
+//!   同じでも検知する。同じファイルをその場で同じ長さに書き換え、更新時刻の刻み
+//!   （NTFS は 100 ナノ秒、FAT は 2 秒）の中に収まった場合は検知できない。
 
 mod atomic;
 mod failure;
@@ -69,34 +71,86 @@ use std::time::SystemTime;
 
 use crate::core::{Error, Result};
 
+/// ファイルの実体を表す ID（Windows: ボリュームのシリアル番号とファイル ID、
+/// Unix: デバイス番号と i ノード番号）。同じパスでも、別のファイルで置き換えられると変わる。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct FileId {
+    pub volume: u64,
+    pub index: u128,
+}
+
+impl FileId {
+    /// 保存用の文字列（`ボリューム16桁-ID32桁` の16進）。[`FileId::parse`] で戻せる。
+    pub fn to_hex(&self) -> String {
+        format!("{:016x}-{:032x}", self.volume, self.index)
+    }
+
+    pub fn parse(s: &str) -> Option<FileId> {
+        let (volume, index) = s.split_once('-')?;
+        Some(FileId {
+            volume: u64::from_str_radix(volume, 16).ok()?,
+            index: u128::from_str_radix(index, 16).ok()?,
+        })
+    }
+}
+
 /// ディスク上のファイルの状態の控え。外部変更の検知に使う。
 ///
 /// 開いたとき・保存したときに控え、ウィンドウが前面に来たとき・保存の直前・
 /// 復元のときに取り直して比べる。食い違えば外部で変更されたとみなす
 /// （切り詰め・置換・更新時刻の変化を拾う。内容の比較はしない）。
+///
+/// 比べるときは `==` ではなく [`FileStamp::matches`] を使う（ファイル ID はどちらかが
+/// 取れていなければ比べない。古い復元データや ID を返さないファイルシステムのため）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct FileStamp {
     pub len: u64,
     /// 更新時刻。取得できない環境では `None`。
     pub modified: Option<SystemTime>,
+    /// ファイルの実体の ID。取得できない場合（ファイルシステムが返さない、
+    /// ハンドルを開けない、古い保存データ）は `None`。
+    pub id: Option<FileId>,
 }
 
 impl FileStamp {
+    /// メタデータだけから作る（ファイル ID なし）。ID も要るなら [`FileStamp::of_file`]
+    /// か [`FileStamp::read`]。
     pub fn from_metadata(metadata: &Metadata) -> Self {
         Self {
             len: metadata.len(),
             modified: metadata.modified().ok(),
+            id: None,
         }
+    }
+
+    /// 開いているファイルのハンドルから作る（ファイル ID つき）。
+    pub fn of_file(file: &std::fs::File) -> std::io::Result<Self> {
+        let metadata = file.metadata()?;
+        Ok(Self {
+            id: sys::file_id(file, &metadata),
+            ..Self::from_metadata(&metadata)
+        })
     }
 
     /// `path` のいまの状態を控える。存在しなければ `None`。
     /// シンボリックリンクはリンク先を見る。
     pub fn read(path: &Path) -> Result<Option<FileStamp>> {
-        match std::fs::metadata(path) {
-            Ok(metadata) => Ok(Some(Self::from_metadata(&metadata))),
+        match sys::read_stamp(path) {
+            Ok(stamp) => Ok(Some(stamp)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(Error::io("ファイルの状態の確認", path, e)),
         }
+    }
+
+    /// 同じ状態とみなせるか。長さと更新時刻が等しく、ファイル ID が両方とも取れていれば
+    /// それも等しいこと。
+    pub fn matches(&self, other: &FileStamp) -> bool {
+        self.len == other.len
+            && self.modified == other.modified
+            && match (self.id, other.id) {
+                (Some(a), Some(b)) => a == b,
+                _ => true,
+            }
     }
 }
 
@@ -127,7 +181,7 @@ impl ExternalChange {
 pub fn check_external_change(path: &Path, known: Option<FileStamp>) -> Result<ExternalChange> {
     Ok(match (known, FileStamp::read(path)?) {
         (None, None) => ExternalChange::None,
-        (Some(k), Some(now)) if k == now => ExternalChange::None,
+        (Some(k), Some(now)) if k.matches(&now) => ExternalChange::None,
         (Some(_), Some(now)) => ExternalChange::Modified(now),
         (Some(_), None) => ExternalChange::Removed,
         (None, Some(now)) => ExternalChange::Created(now),
@@ -158,5 +212,81 @@ mod tests {
         let after = FileStamp::from_metadata(&std::fs::metadata(&path).unwrap());
         assert_ne!(before, after);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "linote-filestamp-{tag}-{}-{}",
+            std::process::id(),
+            crate::core::MemoId::generate()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn read_includes_a_stable_file_id() {
+        let dir = temp_dir("id");
+        let path = dir.join("a.txt");
+        std::fs::write(&path, b"abc").unwrap();
+        let first = FileStamp::read(&path).unwrap().unwrap();
+        assert!(first.id.is_some(), "ファイル ID が取れること: {first:?}");
+        let second = FileStamp::read(&path).unwrap().unwrap();
+        assert_eq!(first, second);
+        let file = std::fs::File::open(&path).unwrap();
+        assert_eq!(FileStamp::of_file(&file).unwrap(), first);
+        drop(file);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// 長さも更新時刻も同じまま、別のファイルで置き換えられたことを ID で見分ける。
+    #[test]
+    fn replacement_with_same_len_and_time_is_detected() {
+        let dir = temp_dir("replace");
+        let path = dir.join("a.txt");
+        let other = dir.join("b.txt");
+        std::fs::write(&path, b"abc").unwrap();
+        std::fs::write(&other, b"xyz").unwrap();
+        let known = FileStamp::read(&path).unwrap().unwrap();
+        // 更新時刻を揃えてから置き換える（ID がなければ見分けられない状況）。
+        let time = known.modified.unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&other)
+            .unwrap()
+            .set_modified(time)
+            .unwrap();
+        std::fs::rename(&other, &path).unwrap();
+        let now = FileStamp::read(&path).unwrap().unwrap();
+        assert_eq!((now.len, now.modified), (known.len, known.modified));
+        assert!(!known.matches(&now));
+        assert_eq!(
+            check_external_change(&path, Some(known)).unwrap(),
+            ExternalChange::Modified(now)
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn missing_id_is_not_compared() {
+        let a = FileStamp {
+            len: 1,
+            modified: None,
+            id: Some(FileId {
+                volume: 1,
+                index: 2,
+            }),
+        };
+        let b = FileStamp { id: None, ..a };
+        let c = FileStamp {
+            id: Some(FileId {
+                volume: 1,
+                index: 3,
+            }),
+            ..a
+        };
+        assert!(a.matches(&b) && b.matches(&a) && b.matches(&c));
+        assert!(!a.matches(&c));
+        assert!(!a.matches(&FileStamp { len: 2, ..b }));
     }
 }

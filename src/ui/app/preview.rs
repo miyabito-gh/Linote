@@ -444,10 +444,10 @@ impl App {
         let Some(body) = p.body.as_ref() else { return };
         let html: Arc<str> = Arc::from(compose_document(body, &p.stylesheet, &title));
         if let Some(pane) = &p.pane {
-            pane.set_document(html.clone());
+            pane.set_document(id, html.clone());
         }
         if let Some(w) = &p.window {
-            w.set_document(html);
+            w.set_document(id, html);
         }
     }
 
