@@ -36,6 +36,7 @@ pub mod find;
 pub mod memo_panel;
 pub mod menu;
 pub mod preview;
+pub mod print;
 pub mod statusbar;
 pub mod tabs;
 pub mod theme;

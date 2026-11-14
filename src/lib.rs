@@ -23,6 +23,7 @@ pub mod bigfile;
 pub mod file;
 pub mod markdown;
 pub mod memo;
+pub mod printing;
 pub mod recovery;
 pub mod search;
 pub mod text;

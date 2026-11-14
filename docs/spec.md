@@ -131,6 +131,16 @@ CP932 で保存するときだけ起こりえます（UTF-8／UTF-16 は全文�
 - **右クリックメニュー**（タブ上）: 閉じる（`file.close`）／ほかのタブを閉じる（`file.close_others`）／右側のタブを閉じる（`file.close_right`）／新しいウィンドウに移動（`file.move_to_new_window`）／フルパスをコピー（`file.copy_path`）／エクスプローラーで表示（`file.reveal_in_explorer`）。右クリックしたタブがアクティブになり、そのタブを対象に実行します。使えない項目は灰色です（タブが 1 つだけなら「ほかのタブを閉じる」「新しいウィンドウに移動」、一番右なら「右側のタブを閉じる」、ファイルでなければパス関連）。「右側のタブを閉じる」は 4 章の「まとめて閉じる」と同じ確認で、取り消すとそこで止まります。
 - 起動引数: `--adopt <ファイル>`（受け渡しファイルを受け取る。ファイルの引数は併用できる）、`--pos x,y`（ウィンドウの置き場所の目安。画面座標で負の値も可）。通常の利用では送り側が渡すもので、手で使う想定ではありません。
 
+### 4.9 印刷（U5）
+
+- **印刷**（ファイルメニュー、`file.print`、`Ctrl+P`）: Windows の印刷ダイアログ（プリンター、部数、ページ範囲、選択範囲のみ）を開いて、アクティブな文書を印刷します。選択範囲があれば「選択した部分」を選べます。本文は Scintilla の `SCI_FORMATRANGEFULL` でプリンターの DC に描きます。ページの区切りは、描かずに先に計算します（ページ範囲の指定と、フッターの「n / m」に使います）。印刷は UI スレッドで同期的に行うため、長い文書では印刷データを作る間、画面が応答しません。
+- **ページ設定**（ファイルメニュー、`file.page_setup`）: 用紙、向き、余白（Windows のページ設定ダイアログ）。余白（0.01 mm 単位）、用紙の種類、向きは `settings.json` の `print` に保存され、次回の印刷とページ設定の初期値になります（用紙・向きは既定のプリンターの `DEVMODE` に反映します。プリンターの選択そのものは保存しません）。
+- **ヘッダーとフッター**: ヘッダーは左にファイル名またはタブ名、右に印刷日時（`2026/11/14 09:05`）、フッターは中央にページ番号「n / m」（m は印刷する範囲の全ページ数、ページ範囲を指定しても n は全体の通し番号）。それぞれ罫線で本文と区切ります。ヘッダー・フッターの帯の分だけ本文の領域は狭くなります。
+- **印刷の選択肢**（ファイルメニュー > 印刷の設定。`print.toggle_color`／`print.toggle_line_numbers`／`print.toggle_header`／`print.toggle_footer`）: 色分けして印刷する（`SC_PRINT_COLOURONWHITE`、オフなら白黒 `SC_PRINT_BLACKONWHITE`。背景は常に白）、行番号を印刷する、ヘッダー、フッター。メニューにチェックが付き、設定に保存されます。折り返しは、表示の設定に関わらず常に紙の幅で行います（`SCI_SETPRINTWRAPMODE`）。文字サイズは設定の文字サイズどおりで、画面の拡大率は反映しません。
+- **対象外**: 印刷プレビュー。巨大ファイル（読み取り専用）は印刷できません（メニューは灰色、`Ctrl+P` では「巨大ファイル（読み取り専用）は印刷できません。…」と状態欄に出ます。`Capability::Print` を持たないため）。PDF にするには Windows の「Microsoft Print to PDF」を選びます。
+- プリンターが 1 台もなければ「印刷 を使えません: 使えるプリンターがありません…」と表示します。余白が大きすぎて本文の領域がなければ、ページ設定で小さくするよう案内して印刷しません。
+- 要件定義は `docs/tasks/U.md` の U5。印刷結果そのものは Windows 実機で確認します（`docs/verification/U.md`）。
+
 ## 5. タブを閉じる・終了時の確認
 
 | 文書 | 変更あり（未保存）で閉じたとき |
@@ -310,6 +320,12 @@ F3／Shift+F3 も使えます（強調はなし）。検索は使えます（正
 | `file.save_eol` | 保存時の改行（サブメニュー: CRLF／LF／CR） | ファイル | なし |
 | `file.copy_path` | フルパスをコピー | ファイル | なし |
 | `file.reveal_in_explorer` | エクスプローラーで表示 | ファイル | なし |
+| `file.print` | 印刷...（巨大ファイルでは無効） | ファイル | Ctrl+P |
+| `file.page_setup` | ページ設定... | ファイル | なし |
+| `print.toggle_color` | 色分けして印刷（印刷の設定のサブメニュー内。引数 `enabled`） | ファイル | なし |
+| `print.toggle_line_numbers` | 行番号を印刷（同上） | ファイル | なし |
+| `print.toggle_header` | ヘッダーを印刷（同上） | ファイル | なし |
+| `print.toggle_footer` | フッターを印刷（同上） | ファイル | なし |
 | `file.new_window` | 新しいウィンドウ | ファイル | Ctrl+Shift+N |
 | `file.reopen_with_encoding` | 文字コードを指定して開き直す（サブメニュー: UTF-8／UTF-8 (BOM 付き)／UTF-16 LE／UTF-16 BE／Shift_JIS (CP932)） | ファイル | なし |
 | `file.close` | 閉じる | ファイル | Ctrl+W |
@@ -392,6 +408,9 @@ F3／Shift+F3 も使えます（強調はなし）。検索は使えます（正
             "show_whitespace": false, "show_eol": false, "line_numbers": true,
             "highlight_current_line": true, "highlight_braces": true, "edge_guide": true,
             "tab_width": 4, "use_spaces": false, "auto_indent": true },
+  "print": { "margin_left": 2000, "margin_top": 2000, "margin_right": 2000, "margin_bottom": 2000,
+             "landscape": false, "paper_size": 0, "color": true, "line_numbers": false,
+             "header": true, "footer": true },
   "mcp": { "enabled": false }
 }
 ```
@@ -415,6 +434,11 @@ F3／Shift+F3 も使えます（強調はなし）。検索は使えます（正
 | `view.tab_width` | 2／4／8 | 4 | タブ幅（それ以外の値は 4） |
 | `view.use_spaces` | 真偽値 | `false` | Tab キーでスペースを入力 |
 | `view.auto_indent` | 真偽値 | `true` | 自動インデント |
+| `print` | オブジェクト | 下記の既定 | 印刷の設定（4.9）。値が不正な項目は既定値として読む。オブジェクトでなければ壊れているとみなす |
+| `print.margin_left`／`margin_top`／`margin_right`／`margin_bottom` | 整数（0〜10000、0.01 mm） | 2000（20 mm） | 余白 |
+| `print.landscape` | 真偽値 | `false` | 用紙の向きが横 |
+| `print.paper_size` | 整数（Windows の `DMPAPER_*`。0 はプリンターの既定） | 0 | 用紙の種類 |
+| `print.color`／`print.line_numbers`／`print.header`／`print.footer` | 真偽値 | `true`／`false`／`true`／`true` | 色分け、行番号、ヘッダー、フッター |
 | `mcp.enabled` | 真偽値 | `false` | MCP 連携の有効化（現在は読むだけで、何も起動しません） |
 
 - 知らない項目は読み込んだまま保持し、書き戻すときに失いません。
@@ -452,6 +476,7 @@ F3／Shift+F3 も使えます（強調はなし）。検索は使えます（正
 | Grep の絞り込み | 対象フォルダーを指定 | 拡張子・除外フォルダー・隠しファイルの指定は画面から不可（既定の除外のみ） |
 | Markdown のプレビュー対象 | Markdown | 拡張子 `.md`／`.markdown` のみ。構文着色は `.mkd`／`.mdown` も Markdown として扱うが、プレビューは不可 |
 | MCP | 初版は構成のみ | 同左。`--mcp-stdio` も未実装 |
+| 印刷プレビュー | 対象外（U5） | なし。PDF は「Microsoft Print to PDF」で代用 |
 | 単体 EXE | 必要 | 実装済み（`scripts/check-imports.sh` で確認する運用） |
 
 ### 既知の制限
@@ -464,6 +489,7 @@ F3／Shift+F3 も使えます（強調はなし）。検索は使えます（正
 - 通常編集の本文が極端に大きい場合は、巨大モードに切り替わるため、大きなファイルの編集は 256 MiB 以下が目安です。
 - 設定画面、メモの削除操作は用意されていません（メモの削除は未確認）。折り返し・書体・タブ幅などの表示の設定は表示メニューにあります（13.1）。巨大ファイルのビューには、行番号の表示以外の表示の設定（折り返し・書体・拡大・空白の表示など）は適用されません。桁指定の折り返しの「桁」は半角 `0` の幅が基準で、比例フォントや全角文字では文字数と一致しません。括弧の強調は 2 MB 以下の文書だけです。
 - 拡大・縮小、折り返し、空白・改行記号の表示、強調の見た目は Windows 実機での確認が必要です（`docs/verification/U.md`）。
+- 印刷は UI スレッドで同期的に行うため、非常に長い文書では印刷データを作る間、画面が応答しません。巨大ファイルは印刷できません。印刷の見た目（用紙、余白、ヘッダー・フッター、色、行番号、折り返し）は Windows 実機での確認が必要です（`docs/verification/U.md`）。
 - 検索・置換・Grep の小窓のキー操作（Esc など）以外の細かな挙動、IME の動作、DPI の見た目、WebView2 プレビュー、Direct2D 描画、グローバルショートカットの前面化、性能計測は、Windows 実機での確認が必要です（`docs/verification/`）。レビュー工程（R1〜R4、最終レビュー）は未実施です。
 - Wine 上では Direct2D を使えず、巨大ファイルのビューは GDI で描画します。
 

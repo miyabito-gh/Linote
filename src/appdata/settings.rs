@@ -9,6 +9,7 @@
 //!   "keys": { "clipboard.new_tab": "Ctrl+Alt+V", "file.save": "" },
 //!   "recent_files": ["C:\\work\\a.txt"],
 //!   "view": { "wrap": "word", "wrap_column": 80, "zoom": 0, "line_numbers": true },
+//!   "print": { "margin_left": 2000, "landscape": false, "color": true },
 //!   "mcp": { "enabled": false }
 //! }
 //! ```
@@ -21,6 +22,8 @@
 //!   存在確認は読み込みでは行わない（選んだときに確かめる）。
 //! - `view`: 表示の設定（[`ViewSettings`]）。値が不正な項目は既定値にして読む
 //!   （`view` がオブジェクトでなければ壊れているとみなす）。全タブに適用する。
+//! - `print`: 印刷の設定（[`PrintSettings`]。余白は 0.01 mm、用紙の種類と向き、色、行番号、
+//!   ヘッダー、フッター）。値が不正な項目は既定値にして読む。
 //! - 知らない項目は読み込んだまま保持し、書き戻すときに失わない
 //!   （新しい版が書いた設定を古い版が消さないため）。
 //! - ファイルがなければ既定値。ファイルは設定を変更して保存するときに初めて作る。
@@ -37,6 +40,7 @@ use serde_json::{Map, Value};
 use crate::command::keys::KeyParseError;
 use crate::command::{CommandDef, KeyChord};
 use crate::core::{Error, Result};
+use crate::printing::{Margins, MARGIN_MAX};
 
 /// 現在の設定の形式の版。
 pub const SETTINGS_VERSION: u64 = 1;
@@ -230,6 +234,82 @@ impl ViewSettings {
     }
 }
 
+/// 印刷の設定（ページ設定と印刷の選択肢。`settings.json` の `print`）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrintSettings {
+    /// 余白（0.01 mm）。
+    pub margins: Margins,
+    /// 用紙の向きが横。
+    pub landscape: bool,
+    /// 用紙の種類（Windows の `DMPAPER_*`。0 はプリンターの既定）。
+    pub paper_size: u32,
+    /// 色分けして印刷する（偽なら白黒）。
+    pub color: bool,
+    pub line_numbers: bool,
+    /// ヘッダー（ファイル名またはタブ名と印刷日時）。
+    pub header: bool,
+    /// フッター（ページ番号）。
+    pub footer: bool,
+}
+
+impl Default for PrintSettings {
+    fn default() -> Self {
+        PrintSettings {
+            margins: Margins::default(),
+            landscape: false,
+            paper_size: 0,
+            color: true,
+            line_numbers: false,
+            header: true,
+            footer: true,
+        }
+    }
+}
+
+impl PrintSettings {
+    fn from_value(map: &Map<String, Value>) -> Self {
+        let d = PrintSettings::default();
+        let flag = |k: &str, default: bool| map.get(k).and_then(Value::as_bool).unwrap_or(default);
+        let mm = |k: &str, default: i32| {
+            map.get(k)
+                .and_then(Value::as_i64)
+                .map_or(default, |n| n.clamp(0, i64::from(MARGIN_MAX)) as i32)
+        };
+        PrintSettings {
+            margins: Margins {
+                left: mm("margin_left", d.margins.left),
+                top: mm("margin_top", d.margins.top),
+                right: mm("margin_right", d.margins.right),
+                bottom: mm("margin_bottom", d.margins.bottom),
+            },
+            landscape: flag("landscape", d.landscape),
+            paper_size: map
+                .get("paper_size")
+                .and_then(Value::as_i64)
+                .map_or(d.paper_size, |n| n.clamp(0, 1000) as u32),
+            color: flag("color", d.color),
+            line_numbers: flag("line_numbers", d.line_numbers),
+            header: flag("header", d.header),
+            footer: flag("footer", d.footer),
+        }
+    }
+
+    fn to_value(&self) -> Map<String, Value> {
+        let mut m = Map::new();
+        m.insert("margin_left".into(), self.margins.left.into());
+        m.insert("margin_top".into(), self.margins.top.into());
+        m.insert("margin_right".into(), self.margins.right.into());
+        m.insert("margin_bottom".into(), self.margins.bottom.into());
+        m.insert("landscape".into(), self.landscape.into());
+        m.insert("paper_size".into(), self.paper_size.into());
+        m.insert("color".into(), self.color.into());
+        m.insert("line_numbers".into(), self.line_numbers.into());
+        m.insert("header".into(), self.header.into());
+        m.insert("footer".into(), self.footer.into());
+        m
+    }
+}
+
 /// 設定。
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Settings {
@@ -242,6 +322,8 @@ pub struct Settings {
     pub recent_files: Vec<String>,
     /// 表示の設定。
     pub view: ViewSettings,
+    /// 印刷の設定。
+    pub print: PrintSettings,
     /// このプログラムが知らない項目。読み込んだまま書き戻す。
     extra: Map<String, Value>,
 }
@@ -311,6 +393,12 @@ impl Settings {
             };
             settings.view = ViewSettings::from_value(&view);
         }
+        if let Some(print) = map.remove("print") {
+            let Value::Object(print) = print else {
+                return Err(corrupt("print がオブジェクトではありません"));
+            };
+            settings.print = PrintSettings::from_value(&print);
+        }
         if let Some(mcp) = map.remove("mcp") {
             let Value::Object(mut mcp) = mcp else {
                 return Err(corrupt("mcp がオブジェクトではありません"));
@@ -353,6 +441,7 @@ impl Settings {
             ),
         );
         map.insert("view".into(), Value::Object(self.view.to_value()));
+        map.insert("print".into(), Value::Object(self.print.to_value()));
         let mcp = map
             .entry("mcp")
             .or_insert_with(|| Value::Object(Map::new()));
@@ -425,6 +514,26 @@ mod tests {
         let value: Value = serde_json::from_str(&text).unwrap();
         assert_eq!(value["version"], 1);
         assert_eq!(value["mcp"]["enabled"], true);
+    }
+
+    #[test]
+    fn print_settings_round_trip_and_clamp() {
+        let mut s = Settings::default();
+        s.print.landscape = true;
+        s.print.paper_size = 9;
+        s.print.color = false;
+        s.print.line_numbers = true;
+        s.print.margins.left = 1500;
+        assert_eq!(Settings::from_json(&s.to_json()).unwrap(), s);
+        let bad = Settings::from_json(
+            r#"{"print":{"margin_left":-4,"margin_top":99999999,"color":"x","paper_size":-1}}"#,
+        )
+        .unwrap();
+        assert_eq!(bad.print.margins.left, 0);
+        assert_eq!(bad.print.margins.top, crate::printing::MARGIN_MAX);
+        assert!(bad.print.color);
+        assert_eq!(bad.print.paper_size, 0);
+        assert!(Settings::from_json(r#"{"print":[]}"#).is_err());
     }
 
     #[test]

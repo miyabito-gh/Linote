@@ -641,6 +641,7 @@ pub fn register(registry: &mut Registry<App>) -> Result<()> {
         }
     })?;
     super::viewopts::register(registry)?;
+    super::printing::register(registry)?;
     Ok(())
 }
 
@@ -740,6 +741,13 @@ impl App {
 
     /// コマンドを利用者の操作として実行する（失敗は状態表示に出る）。
     pub fn run_command(&mut self, command: CommandId, args: Value) {
+        if command == super::printing::FILE_PRINT.id
+            && self.active.is_some()
+            && !self.active_can_print()
+        {
+            self.set_status(super::printing::LARGE_FILE_GUIDANCE, MessageKind::Warning);
+            return;
+        }
         let mut invocation = Invocation::user(command);
         if !args.is_null() {
             invocation = invocation.with_args(args);
@@ -822,6 +830,7 @@ impl App {
         });
         menu.update_checked(popup, |entry| {
             self.view_menu_checked(entry.command, &entry.args)
+                .or_else(|| self.print_menu_checked(entry.command))
         });
         self.menu = Some(menu);
     }

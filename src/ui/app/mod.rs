@@ -33,6 +33,7 @@ mod fileops;
 mod highlight;
 mod memos;
 mod preview;
+mod printing;
 mod recover;
 mod search;
 pub mod selftest;

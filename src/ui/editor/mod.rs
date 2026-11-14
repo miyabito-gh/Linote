@@ -18,6 +18,7 @@
 //! 担当: タスク B。
 
 pub mod language;
+pub mod printing;
 pub mod sci;
 mod textcmds;
 pub mod transform;

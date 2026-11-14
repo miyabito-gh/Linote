@@ -297,3 +297,34 @@ mod tests {
         assert_eq!(std::mem::size_of::<ScNotification>(), 160);
     }
 }
+
+// --- 印刷 ---
+pub const SCI_FORMATRANGEFULL: u32 = 2777;
+pub const SCI_SETPRINTMAGNIFICATION: u32 = 2146;
+pub const SCI_SETPRINTCOLOURMODE: u32 = 2148;
+pub const SCI_GETPRINTCOLOURMODE: u32 = 2149;
+pub const SCI_SETPRINTWRAPMODE: u32 = 2406;
+pub const SCI_GETPRINTWRAPMODE: u32 = 2407;
+pub const SC_PRINT_BLACKONWHITE: usize = 2;
+pub const SC_PRINT_COLOURONWHITE: usize = 3;
+
+/// `Sci_Rectangle`。
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct SciRectangle {
+    pub left: c_int,
+    pub top: c_int,
+    pub right: c_int,
+    pub bottom: c_int,
+}
+
+/// `Sci_RangeToFormatFull`。
+#[repr(C)]
+pub struct RangeToFormatFull {
+    pub hdc: *mut c_void,
+    pub hdc_target: *mut c_void,
+    pub rc: SciRectangle,
+    pub rc_page: SciRectangle,
+    pub cp_min: isize,
+    pub cp_max: isize,
+}

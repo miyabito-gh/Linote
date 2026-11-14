@@ -259,6 +259,18 @@ static MENUS: &[MenuDef] = &[
                 ],
             ),
             Item::Separator,
+            Item::Cmd(CommandId::new("file.print")),
+            Item::Cmd(CommandId::new("file.page_setup")),
+            Item::Sub(
+                "印刷の設定(&T)",
+                &[
+                    Item::Cmd(CommandId::new("print.toggle_color")),
+                    Item::Cmd(CommandId::new("print.toggle_line_numbers")),
+                    Item::Cmd(CommandId::new("print.toggle_header")),
+                    Item::Cmd(CommandId::new("print.toggle_footer")),
+                ],
+            ),
+            Item::Separator,
             Item::Cmd(CommandId::new("file.copy_path")),
             Item::Cmd(CommandId::new("file.reveal_in_explorer")),
             Item::Separator,

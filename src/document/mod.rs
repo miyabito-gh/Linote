@@ -43,7 +43,7 @@ impl DocumentKind {
     /// この種類の文書が基本として持つ機能。
     pub fn capabilities(&self) -> Capabilities {
         use Capability::*;
-        let editing = Capabilities::of(&[Edit, Undo, SaveAs, Highlight, Wrap, Preview]);
+        let editing = Capabilities::of(&[Edit, Undo, SaveAs, Highlight, Wrap, Preview, Print]);
         match self {
             DocumentKind::File => editing.with(Save).with(Recover),
             DocumentKind::LargeFile => Capabilities::NONE,
@@ -88,10 +88,12 @@ pub enum Capability {
     Wrap = 7,
     /// Markdown プレビューの元にできる。
     Preview = 8,
+    /// 印刷できる（編集欄で表示している文書。巨大ファイルは含まない）。
+    Print = 9,
 }
 
 impl Capability {
-    pub const ALL: [Capability; 9] = [
+    pub const ALL: [Capability; 10] = [
         Capability::Edit,
         Capability::Undo,
         Capability::Save,
@@ -101,6 +103,7 @@ impl Capability {
         Capability::Highlight,
         Capability::Wrap,
         Capability::Preview,
+        Capability::Print,
     ];
 
     /// 機械可読な安定した名前。
@@ -115,6 +118,7 @@ impl Capability {
             Capability::Highlight => "highlight",
             Capability::Wrap => "wrap",
             Capability::Preview => "preview",
+            Capability::Print => "print",
         }
     }
 }
@@ -406,6 +410,8 @@ mod tests {
         assert!(!file.contains(AutoSave));
 
         assert_eq!(DocumentKind::LargeFile.capabilities(), Capabilities::NONE);
+        assert!(!DocumentKind::LargeFile.capabilities().contains(Print));
+        assert!(file.contains(Print));
 
         for kind in [DocumentKind::Untitled, DocumentKind::Clipboard] {
             let caps = kind.capabilities();
