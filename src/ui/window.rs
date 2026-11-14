@@ -15,9 +15,9 @@ use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, REC
 use windows::Win32::Graphics::Gdi::{
     BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateFontIndirectW, CreatePen,
     CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW, Ellipse, FillRect, GetStockObject,
-    GetTextExtentPoint32W, LineTo, MoveToEx, SelectObject, SetBkMode, SetTextColor,
-    DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_VCENTER, HBITMAP, HDC,
-    HFONT, HGDIOBJ, LOGFONTW, NULL_PEN, PS_SOLID, SRCCOPY, TRANSPARENT,
+    GetTextExtentPoint32W, GetTextMetricsW, LineTo, MoveToEx, SelectObject, SetBkMode,
+    SetTextColor, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_VCENTER,
+    HBITMAP, HDC, HFONT, HGDIOBJ, LOGFONTW, NULL_PEN, PS_SOLID, SRCCOPY, TEXTMETRICW, TRANSPARENT,
 };
 use windows::Win32::UI::HiDpi::SystemParametersInfoForDpi;
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -47,7 +47,7 @@ pub const ID_FACTORY: isize = 101;
 /// 配置の寸法（96 DPI の値）。
 pub mod dims {
     /// タブバーの高さ。
-    pub const TAB_BAR_HEIGHT: i32 = 32;
+    pub const TAB_BAR_HEIGHT: i32 = 24;
     /// ステータスバーの高さ。
     pub const STATUS_HEIGHT: i32 = 24;
     /// 右ペインとの区切りの幅（ドラッグできる範囲）。
@@ -84,8 +84,25 @@ pub fn compute_layout(
     right_ratio: Option<f32>,
     bottom_height: Option<i32>,
 ) -> Layout {
+    compute_layout_with_tab_height(
+        client,
+        dpi,
+        right_ratio,
+        bottom_height,
+        scale(dims::TAB_BAR_HEIGHT, dpi),
+    )
+}
+
+/// UI 書体の実測に合わせたタブ高さ（ピクセル）で配置する。
+pub fn compute_layout_with_tab_height(
+    client: RECT,
+    dpi: u32,
+    right_ratio: Option<f32>,
+    bottom_height: Option<i32>,
+    tab_height: i32,
+) -> Layout {
     let (l, t, r, b) = (client.left, client.top, client.right, client.bottom);
-    let tab_h = scale(dims::TAB_BAR_HEIGHT, dpi).min((b - t).max(0));
+    let tab_h = tab_height.max(0).min((b - t).max(0));
     let status_h = scale(dims::STATUS_HEIGHT, dpi).min((b - t - tab_h).max(0));
     let tabs = rect(l, t, r, t + tab_h);
     let status = rect(l, b - status_h, r, b);
@@ -142,6 +159,7 @@ pub fn contains(r: &RECT, x: i32, y: i32) -> bool {
 #[derive(Debug)]
 pub struct UiFont {
     font: HFONT,
+    text_height: i32,
 }
 
 impl UiFont {
@@ -175,12 +193,39 @@ impl UiFont {
         lf.lfQuality = windows::Win32::Graphics::Gdi::CLEARTYPE_QUALITY;
         // SAFETY: 有効な LOGFONTW。
         let font = unsafe { CreateFontIndirectW(&lf) };
-        UiFont { font }
+        // SAFETY: 測定専用のDCへ選択し、元の書体を戻してから破棄する。
+        let text_height = unsafe {
+            let dc = CreateCompatibleDC(None);
+            if dc.is_invalid() {
+                lf.lfHeight.abs()
+            } else {
+                let old = SelectObject(dc, font.into());
+                let mut text = TEXTMETRICW::default();
+                let measured = GetTextMetricsW(dc, &mut text).as_bool();
+                SelectObject(dc, old);
+                let _ = DeleteDC(dc);
+                if measured {
+                    text.tmHeight
+                } else {
+                    lf.lfHeight.abs()
+                }
+            }
+        };
+        UiFont { font, text_height }
+    }
+
+    /// UI の文字高と上下 4 DIP の余白。大きな OS 書体を切らず、標準時は 24 DIP。
+    pub fn tab_height(&self, dpi: u32) -> i32 {
+        tab_height_for_text(self.text_height, dpi)
     }
 
     pub fn handle(&self) -> HFONT {
         self.font
     }
+}
+
+fn tab_height_for_text(text_height: i32, dpi: u32) -> i32 {
+    (text_height.max(0) + scale(8, dpi)).max(scale(dims::TAB_BAR_HEIGHT, dpi))
 }
 
 impl Drop for UiFont {
@@ -439,16 +484,16 @@ mod tests {
     #[test]
     fn layout_stacks_tabs_editor_and_status() {
         let l = compute_layout(client(800, 600), 96, None, None);
-        assert_eq!(l.tabs, rect(0, 0, 800, 32));
+        assert_eq!(l.tabs, rect(0, 0, 800, 24));
         assert_eq!(l.status, rect(0, 576, 800, 600));
-        assert_eq!(l.editor, rect(0, 32, 800, 576));
+        assert_eq!(l.editor, rect(0, 24, 800, 576));
         assert!(l.right.is_none() && l.splitter.is_none() && l.bottom.is_none());
     }
 
     #[test]
     fn layout_scales_with_dpi() {
         let l = compute_layout(client(1600, 1200), 192, None, Some(40));
-        assert_eq!(l.tabs.bottom, 64);
+        assert_eq!(l.tabs.bottom, 48);
         assert_eq!(l.status.top, 1200 - 48);
         let bottom = l.bottom.unwrap();
         assert_eq!((bottom.top, bottom.bottom), (1200 - 48 - 80, 1200 - 48));
@@ -484,6 +529,19 @@ mod tests {
         ] {
             assert!(r.right >= r.left && r.bottom >= r.top, "{r:?}");
         }
+    }
+
+    #[test]
+    fn tab_height_tracks_ui_text_and_dpi_without_clipping() {
+        assert_eq!(tab_height_for_text(15, 96), 24);
+        assert_eq!(tab_height_for_text(20, 96), 28);
+        assert_eq!(tab_height_for_text(30, 192), 48);
+        assert_eq!(tab_height_for_text(42, 192), 58);
+        let l = compute_layout_with_tab_height(client(800, 600), 96, None, None, 28);
+        assert_eq!(l.tabs.bottom, 28);
+        assert_eq!(l.editor.top, 28);
+        let tiny = compute_layout_with_tab_height(client(10, 4), 96, None, None, 28);
+        assert_eq!(tiny.tabs.bottom, 4);
     }
 
     #[test]

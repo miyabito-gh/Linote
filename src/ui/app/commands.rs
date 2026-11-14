@@ -712,7 +712,12 @@ impl App {
             .collect();
         // 新しいメニューを付けてから、古いものを破棄する（代入で古い方が落ちる）。
         match MenuModel::install(self.hwnd, &self.registry, &self.keymap) {
-            Ok(menu) => self.menu = Some(menu),
+            Ok(menu) => {
+                self.menu = Some(menu);
+                if let Some(menu) = &self.menu {
+                    menu.apply_theme(self.hwnd, &self.theme, self.dpi);
+                }
+            }
             Err(e) => notes.push(format!("メニューを作れません: {e}")),
         }
         notes
@@ -907,6 +912,9 @@ impl App {
                 .or_else(|| self.print_menu_checked(entry.command))
         });
         self.menu = Some(menu);
+        if let Some(menu) = &self.menu {
+            menu.apply_theme(self.hwnd, &self.theme, self.dpi);
+        }
     }
 
     /// `WM_HOTKEY`: ウィンドウを前面に出し、クリップボードから新しいタブを作る。

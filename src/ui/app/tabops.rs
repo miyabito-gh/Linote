@@ -145,6 +145,7 @@ impl App {
             let mut p = POINT::default();
             let _ = GetCursorPos(&mut p);
             let _ = windows::Win32::UI::WindowsAndMessaging::SetForegroundWindow(self.hwnd);
+            let paint_state = crate::ui::menu::drawing::popup(menu);
             let r = TrackPopupMenu(
                 menu,
                 TPM_RETURNCMD | TPM_RIGHTBUTTON,
@@ -154,6 +155,7 @@ impl App {
                 self.hwnd,
                 None,
             );
+            crate::ui::menu::drawing::popup_closed(paint_state);
             let _ = DestroyMenu(menu);
             r.0 as usize
         };

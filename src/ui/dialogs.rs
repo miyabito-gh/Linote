@@ -33,7 +33,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use crate::appdata::settings::{FONT_SIZE_MAX, FONT_SIZE_MIN};
 use crate::appdata::Settings;
-use crate::platform::system::{from_wide, os_from_wide, to_wide};
+use crate::platform::system::{dpi_for_window, from_wide, os_from_wide, to_wide};
 
 /// 未保存の文書を閉じるときの利用者の選択。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -389,8 +389,8 @@ impl Prompts for Win32Prompts {
 
     fn choose_font(&self, owner: HWND, current: &str, points: u32) -> Option<(String, u32)> {
         let mut lf = LOGFONTW {
-            // 96 DPI での高さ（負の値は文字の高さ）。ダイアログが DPI に合わせて読み替える。
-            lfHeight: -((points as i32 * 96 + 36) / 72),
+            // LOGFONT の高さはピクセル。所有ウィンドウのモニターに合わせる。
+            lfHeight: font_height(points, dpi_for_window(owner)),
             lfCharSet: DEFAULT_CHARSET,
             ..Default::default()
         };
@@ -419,6 +419,11 @@ impl Prompts for Win32Prompts {
         let points = ((cf.iPointSize + 5) / 10).max(1) as u32;
         (!name.is_empty()).then_some((name, points))
     }
+}
+
+/// ポイント数から LOGFONT の文字高へ変換する（負数はセルではなく文字自体の高さ）。
+fn font_height(points: u32, dpi: u32) -> i32 {
+    -(((u64::from(points) * u64::from(dpi) + 36) / 72).min(i32::MAX as u64) as i32)
 }
 
 /// `OFN_ALLOWMULTISELECT | OFN_EXPLORER` の結果を読む。1 件なら完全なパス、複数なら
@@ -719,6 +724,14 @@ fn input_dialog(owner: HWND, caption: &str, label: &str, initial: &str) -> Optio
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn font_height_follows_the_owners_dpi() {
+        assert_eq!(font_height(12, 96), -16);
+        assert_eq!(font_height(12, 144), -24);
+        assert_eq!(font_height(12, 192), -32);
+        assert_eq!(font_height(11, 120), -18);
+    }
 
     fn wide(parts: &[&str]) -> Vec<u16> {
         let mut v = Vec::new();

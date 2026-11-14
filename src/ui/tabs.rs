@@ -90,7 +90,7 @@ pub enum TabHit {
 
 /// 各タブの横の位置（`None` は、あふれて見えないタブ）。
 ///
-/// 自然な幅の合計が `avail` に収まればそのまま並べる。収まらなければ等しい幅に縮め、
+/// 自然な幅の合計が `avail` に収まればそのまま並べる。収まらなければ長いタブから縮め、
 /// それでも最小幅を下回るなら、選択中のタブが見えるように `scroll`（先頭に見せるタブ）を
 /// 動かして、見える分だけを並べる。
 pub fn layout(
@@ -106,22 +106,15 @@ pub fn layout(
         *scroll = 0;
         return out;
     }
-    let total: i32 = natural.iter().sum();
-    if total <= avail {
+    let total: i64 = natural.iter().map(|&w| i64::from(w)).sum();
+    let fit = (avail / metrics.min_width.max(1)).max(1) as usize;
+    if total <= i64::from(avail) || fit >= n {
         *scroll = 0;
+        let widths = fit_widths(natural, avail);
         let mut x = 0;
-        for (slot, &w) in out.iter_mut().zip(natural) {
+        for (slot, w) in out.iter_mut().zip(widths) {
             *slot = Some((x, w));
             x += w;
-        }
-        return out;
-    }
-    let fit = (avail / metrics.min_width).max(1) as usize;
-    if fit >= n {
-        *scroll = 0;
-        let w = avail / n as i32;
-        for (i, slot) in out.iter_mut().enumerate() {
-            *slot = Some((i as i32 * w, w));
         }
         return out;
     }
@@ -133,11 +126,40 @@ pub fn layout(
         }
     }
     *scroll = (*scroll).min(n - fit);
-    let w = avail / fit as i32;
-    for k in 0..fit {
-        out[*scroll + k] = Some((k as i32 * w, w));
+    let mut x = 0;
+    for (k, w) in fit_widths(&natural[*scroll..*scroll + fit], avail)
+        .into_iter()
+        .enumerate()
+    {
+        out[*scroll + k] = Some((x, w));
+        x += w;
     }
     out
+}
+
+/// 短い題名の自然幅を残し、長い題名だけを共通の上限まで縮める。
+/// 端数も配り、1px の狭い領域でも合計幅が領域を超えない。
+fn fit_widths(natural: &[i32], avail: i32) -> Vec<i32> {
+    let mut low = 0;
+    let mut high = natural.iter().copied().max().unwrap_or(0).max(0);
+    while low < high {
+        let cap = low + (high - low + 1) / 2;
+        let total: i64 = natural.iter().map(|&w| i64::from(w.min(cap))).sum();
+        if total <= i64::from(avail) {
+            low = cap;
+        } else {
+            high = cap - 1;
+        }
+    }
+    let mut widths: Vec<_> = natural.iter().map(|&w| w.min(low)).collect();
+    let mut remainder = avail - widths.iter().sum::<i32>();
+    for (&natural, width) in natural.iter().zip(&mut widths) {
+        if remainder > 0 && *width < natural {
+            *width += 1;
+            remainder -= 1;
+        }
+    }
+    widths
 }
 
 /// タブバーの状態。
@@ -215,13 +237,24 @@ impl TabBar {
 
     fn close_rect(&self, tab: &RECT) -> RECT {
         let m = TabMetrics::scaled(self.dpi);
+        // 極端な狭幅では閉じるボタンを隠し、タブの選択領域を確保する。
+        let size = m.close.min((tab.bottom - tab.top).max(0));
+        let width = (tab.right - tab.left).max(0);
+        if width < m.pad_left + size + m.pad_right {
+            return RECT {
+                left: tab.right,
+                right: tab.right,
+                top: tab.top,
+                bottom: tab.top,
+            };
+        }
         let cy = (tab.top + tab.bottom) / 2;
         let right = tab.right - m.pad_right;
         RECT {
-            left: right - m.close,
-            top: cy - m.close / 2,
+            left: right - size,
+            top: cy - size / 2,
             right,
-            bottom: cy - m.close / 2 + m.close,
+            bottom: cy - size / 2 + size,
         }
     }
 
@@ -334,9 +367,16 @@ impl TabBar {
                 }
             }
             let close = self.close_rect(&r);
+            let text_left = (r.left + m.pad_left).min(r.right);
+            let has_close = close.right > close.left;
+            let text_right = if has_close {
+                close.left - m.gap
+            } else {
+                r.right - m.pad_right
+            };
             let text_rect = RECT {
-                left: r.left + m.pad_left,
-                right: close.left - m.gap,
+                left: text_left,
+                right: text_right.max(text_left),
                 ..r
             };
             let fg = if active && !item.read_only {
@@ -355,7 +395,7 @@ impl TabBar {
             if close_hovered {
                 c.fill(&close, ui.close_hover_bg);
             }
-            if show_close {
+            if show_close && has_close {
                 let cx = (close.left + close.right) / 2;
                 let cy = (close.top + close.bottom) / 2;
                 let k = c.px(4);
@@ -367,7 +407,7 @@ impl TabBar {
                 let pen = c.px(1).max(1);
                 c.line(cx - k, cy - k, cx + k + 1, cy + k + 1, pen, color);
                 c.line(cx - k, cy + k, cx + k + 1, cy - k - 1, pen, color);
-            } else if item.dirty {
+            } else if item.dirty && has_close {
                 let cx = (close.left + close.right) / 2;
                 let cy = (close.top + close.bottom) / 2;
                 c.dot(cx, cy, m.dot, ui.dirty);
@@ -551,6 +591,57 @@ mod tests {
             pos,
             vec![Some((0, 150)), Some((150, 150)), Some((300, 150))]
         );
+    }
+
+    #[test]
+    fn short_names_keep_their_width_while_long_names_shrink() {
+        let mut scroll = 0;
+        let pos = layout(&[72, 220, 220], 400, &M, Some(0), &mut scroll);
+        assert_eq!(pos, vec![Some((0, 72)), Some((72, 164)), Some((236, 164))]);
+        let pos = layout(&[200, 200, 200], 451, &M, Some(0), &mut scroll);
+        assert_eq!(
+            pos,
+            vec![Some((0, 151)), Some((151, 150)), Some((301, 150))]
+        );
+    }
+
+    #[test]
+    fn dpi_long_names_and_tab_counts_stay_inside_the_bar() {
+        for dpi in [96, 144, 192] {
+            let m = TabMetrics::scaled(dpi);
+            for count in [1, 2, 8, 30] {
+                let names = vec![m.max_width; count];
+                for avail in [1, 30, 100, 680, 1600] {
+                    let mut scroll = 0;
+                    let pos = layout(&names, avail, &m, Some(count - 1), &mut scroll);
+                    assert!(pos[count - 1].is_some());
+                    for (x, width) in pos.into_iter().flatten() {
+                        assert!(x >= 0 && width > 0 && x + width <= avail);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn narrow_tabs_hide_the_close_button_and_keep_selection_clickable() {
+        let mut bar = TabBar::new();
+        bar.set_items(vec![item(1, "長い日本語のファイル名.txt")], Some(0));
+        bar.relayout(
+            RECT {
+                left: 0,
+                top: 0,
+                right: 20,
+                bottom: 24,
+            },
+            96,
+            &|_| 400,
+        );
+        let r = bar.tab_rect(0).unwrap();
+        let close = bar.close_rect(&r);
+        assert_eq!(close.left, close.right);
+        assert_eq!(bar.hit_test(5, 10), Some(TabHit::Tab(0)));
+        assert_eq!(bar.hit_test(19, 10), Some(TabHit::Tab(0)));
     }
 
     #[test]

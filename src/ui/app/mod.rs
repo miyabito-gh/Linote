@@ -430,6 +430,18 @@ fn unregister_editor_hwnd(hwnd: HWND) {
 
 /// メインウィンドウのメッセージの入口（`window.rs` のウィンドウプロシージャから呼ぶ）。
 pub(crate) fn dispatch(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LRESULT> {
+    if msg == windows::Win32::UI::WindowsAndMessaging::WM_MENUCHAR {
+        if let Some(result) = crate::ui::menu::drawing::character(wparam, lparam) {
+            return Some(result);
+        }
+    }
+    if let Some(result) = crate::ui::menu::drawing::nonclient(hwnd, msg, wparam, lparam) {
+        return Some(result);
+    }
+    if let Some(result) = crate::ui::menu::drawing::handle(msg, lparam) {
+        return Some(result);
+    }
+
     match msg {
         WM_NOTIFY => {
             // SAFETY: WM_NOTIFY の lParam。
@@ -1456,11 +1468,12 @@ impl App {
         unsafe {
             let _ = GetClientRect(self.hwnd, &mut client);
         }
-        self.layout = window::compute_layout(
+        self.layout = window::compute_layout_with_tab_height(
             client,
             self.dpi,
             self.right.map(|r| r.ratio),
             self.bottom.map(|b| b.height_dip),
+            self.font.tab_height(self.dpi),
         );
         let l = self.layout;
         let place = |h: HWND, r: RECT| {
@@ -1534,6 +1547,9 @@ impl App {
             return;
         }
         self.theme = theme;
+        if let Some(menu) = &self.menu {
+            menu.apply_theme(self.hwnd, &self.theme, self.dpi);
+        }
         system::set_dark_title_bar(self.hwnd, self.theme.dark);
         let language = self
             .active
@@ -1651,6 +1667,7 @@ impl App {
             WM_DPICHANGED => {
                 self.dpi = ((wparam.0 >> 16) & 0xFFFF) as u32;
                 self.font = UiFont::for_dpi(self.dpi);
+                if let Some(menu) = &self.menu { menu.apply_theme(self.hwnd, &self.theme, self.dpi); }
                 // SAFETY: lParam は推奨の位置（RECT）を指す。
                 let r = unsafe { *(lparam.0 as *const RECT) };
                 // SAFETY: 自分のウィンドウを推奨の位置へ。

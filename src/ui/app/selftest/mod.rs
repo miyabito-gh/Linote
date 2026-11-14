@@ -37,6 +37,7 @@ mod integration_u2;
 mod integration_u3;
 mod integration_u4;
 mod integration_u5;
+mod integration_ui_polish;
 mod integration_v1;
 mod integration_v2;
 mod integration_v4;

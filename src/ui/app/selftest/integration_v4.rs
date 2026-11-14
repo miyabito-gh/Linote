@@ -598,6 +598,22 @@ fn real_dialog(file: &Path) -> Check {
         dialog::select_choice(dlg, "view.tab_width", "8");
         dialog::select_choice(dlg, "view.wrap", "column");
         dialog::set_number_text(dlg, "view.wrap_column", "120");
+        // フォントの既定ボタンで、ほかの未適用項目が巻き戻らない。
+        let font_default = dialog::item_control_id("view.font", Some(false)).unwrap();
+        dialog::press(dlg, font_default);
+        bad(
+            "フォント操作後のチェック保持",
+            dialog::get_check(dlg, "view.show_eol") == Some(true),
+        );
+        bad(
+            "フォント操作後の選択保持",
+            dialog::get_choice(dlg, "view.wrap").as_deref() == Some("column"),
+        );
+        bad(
+            "フォント操作後の数値保持",
+            dialog::control_text(dlg, "view.wrap_column").as_deref() == Some("120"),
+        );
+
         dialog::press(dlg, dialog::ID_APPLY);
         // 「一般」に戻ってテーマを変え、OK。
         dialog::select_page(dlg, "general");

@@ -247,9 +247,9 @@ fn send(hwnd: HWND, msg: u32, wparam: usize, lparam: isize) -> isize {
 
 fn font_label(name: &str, size: u32) -> String {
     let face = if name.is_empty() {
-        "（既定）"
+        format!("{}（既定）", crate::ui::editor::default_font_name())
     } else {
-        name
+        name.to_owned()
     };
     format!("{face}、{size} pt")
 }
@@ -402,13 +402,16 @@ fn build(dlg: HWND, state: &mut State<'_>, owner: HWND) {
                 ));
             }
             ItemKind::Font => {
+                // フォント名を見せる幅と、意味の分かる選択ボタンの幅を確保する。
+                let font_x = page_x + 104;
+                let choose_x = page_x + page_w - 210;
                 made.push(child(
                     dlg,
                     windows::core::w!("STATIC"),
                     item.label,
                     0,
                     0,
-                    (px(page_x), px(y + 3), px(label_w - 8), px(row_h - 6)),
+                    (px(page_x), px(y + 3), px(100), px(row_h - 6)),
                     id(SUB_LABEL),
                     &state.font,
                 ));
@@ -418,17 +421,22 @@ fn build(dlg: HWND, state: &mut State<'_>, owner: HWND) {
                     "",
                     0,
                     0,
-                    (px(ctl_x), px(y + 3), px(ctl_w - 150), px(row_h - 6)),
+                    (
+                        px(font_x),
+                        px(y + 3),
+                        px(choose_x - font_x - 5),
+                        px(row_h - 6),
+                    ),
                     id(SUB_MAIN),
                     &state.font,
                 ));
                 made.push(child(
                     dlg,
                     windows::core::w!("BUTTON"),
-                    "選択...",
+                    "フォントを選択...",
                     BS_PUSHBUTTON | tab,
                     0,
-                    (px(ctl_x + ctl_w - 145), px(y), px(70), px(row_h - 4)),
+                    (px(choose_x), px(y), px(135), px(row_h - 4)),
                     id(SUB_FONT_CHOOSE),
                     &state.font,
                 ));
@@ -602,10 +610,32 @@ fn choose_font(dlg: HWND, state: &mut State<'_>) {
     } else {
         v.font.clone()
     };
-    if let Some((name, size)) = Win32Prompts.choose_font(dlg, &current, v.font_size) {
+    // 数値欄で編集中のサイズも、まだ適用していなくても初期値として使う。
+    let points = item_control(dlg, "view.font_size")
+        .map(get_text)
+        .and_then(|s| s.parse::<u32>().ok())
+        .filter(|n| {
+            (crate::appdata::settings::FONT_SIZE_MIN..=crate::appdata::settings::FONT_SIZE_MAX)
+                .contains(n)
+        })
+        .unwrap_or(v.font_size);
+    if let Some((name, size)) = Win32Prompts.choose_font(dlg, &current, points) {
         state.working.view.font = name;
         state.working.view.font_size = size;
-        refresh_controls(dlg, state);
+        refresh_font_controls(dlg, state);
+    }
+}
+
+/// 選択・既定ボタンで変えたフォントだけを更新し、ほかの項目の編集中の値を保つ。
+fn refresh_font_controls(dlg: HWND, state: &State<'_>) {
+    if let Some(ctl) = item_control(dlg, "view.font") {
+        set_text(
+            ctl,
+            &font_label(&state.working.view.font, state.working.view.font_size),
+        );
+    }
+    if let Some(ctl) = item_control(dlg, "view.font_size") {
+        set_text(ctl, &state.working.view.font_size.to_string());
     }
 }
 
@@ -1100,7 +1130,7 @@ unsafe extern "system" fn dialog_proc(
                         let d = crate::appdata::settings::ViewSettings::default();
                         state.working.view.font = d.font;
                         state.working.view.font_size = d.font_size;
-                        refresh_controls(dlg, state);
+                        refresh_font_controls(dlg, state);
                     }
                 }
                 1

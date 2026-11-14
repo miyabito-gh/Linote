@@ -368,7 +368,7 @@ static VIEW_ITEMS: &[Item] = &[
     check_item!("view.edge_guide", "折り返し桁のガイド線", view.edge_guide),
     Item {
         id: "view.font",
-        label: "書体",
+        label: "本文フォント",
         kind: ItemKind::Font,
         get: |s| ItemValue::Font(s.view.font.clone(), s.view.font_size),
         set: |s, v| {

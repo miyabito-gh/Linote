@@ -10,6 +10,8 @@
 //!
 //! 担当: タスク I1（統括）。
 
+pub(crate) mod drawing;
+
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
@@ -566,6 +568,14 @@ impl MenuModel {
         })
     }
 
+    pub(crate) fn handle(&self) -> HMENU {
+        HMENU(self.bar as *mut _)
+    }
+
+    pub fn apply_theme(&self, hwnd: HWND, theme: &crate::ui::theme::Theme, dpi: u32) {
+        drawing::apply(hwnd, self.handle(), theme, dpi);
+    }
+
     /// 項目 ID に対応するコマンドと引数。
     pub fn command_for_id(&self, id: u16) -> Option<(CommandId, Value)> {
         self.entries
@@ -577,6 +587,9 @@ impl MenuModel {
     /// 項目の表示文字列（`\t` の後ろがキーの表示。試験用）。
     pub fn label_of(&self, id: u16) -> Option<String> {
         let e = self.entries.iter().find(|e| e.id == id)?;
+        if let Some(label) = drawing::label(HMENU(e.popup as *mut _), id as u32) {
+            return Some(label);
+        }
         let mut buf = vec![0u16; 256];
         // SAFETY: 自分のメニューの項目。出力先は buf。
         let n = unsafe {
