@@ -31,3 +31,10 @@
 - `WM_HOTKEY`（`wParam == CLIPBOARD_HOTKEY_ID`）→ `bring_to_front(hwnd)` → `Registry::execute("clipboard.new_tab")`。ハンドラーで `clipboard::read_text(Some(hwnd))`: `Some` → `DocumentState::clipboard` の未保存タブ、`None` → 「クリップボードにテキストがありません」、`Err(Busy)` → 「クリップボードを開けません」。
 - `clipboard.new_tab` の既定キーを `Ctrl+Alt+V` にそろえる。
 - 実機確認: 他アプリ前面からの前面化、最小化からの復元、競合表示、`Win+` の割り当て、リッチテキスト・画像のみのとき `None`。
+
+## K（検索・置換・Grep）
+- コマンド `search.find`／`search.replace`／`search.grep`: 初回 `FindPanel::create(owner, &theme, dpi, on_event)`、以降 `show(Some(選択文字列))`（改行を含む選択は渡さない）。
+- `FindEvent`: `Next`／`Prev(SearchOptions)` → `compile()` → `Searcher::find(Scintilla の TextSource, 選択端, 向き, wrap=true, ctx)` → 選択、`set_status`。`Replace` → `replacement_for` で置換して次へ。`ReplaceAll` → `replace_all`（長い文書は WorkerPool、`DocStamp` 照合）。`OpenHit{path,line,column}` → 開いてジャンプ。`Closed` → 本文にフォーカス。
+- 巨大モードのタブでは `set_replace_enabled(false, 案内)`、検索は `bigfile::BigFile::find`。`set_grep_folder`／`set_theme`／`set_dpi`。
+- Scintilla を包む `TextSource`／`EditTarget` のアダプタは `ui::editor` 側で用意する。
+- Grep は自前実装になったため `grep-searcher` 系の依存は削除した。
