@@ -890,6 +890,7 @@ mod tests {
             crate::file::FileStamp {
                 len: 0,
                 modified: None,
+                id: None,
             },
         );
         TestHost::new(state, "abc")
@@ -1039,6 +1040,7 @@ mod tests {
             crate::file::FileStamp {
                 len: 0,
                 modified: None,
+                id: None,
             },
         );
         let mut host = TestHost::new(state, "abc");

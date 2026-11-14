@@ -3,6 +3,10 @@
 //!
 //! ペイン自身のウィンドウは、WebView2 が使えないとき（ランタイムなし、初期化中）の案内を
 //! 描く。WebView2 が準備できたらその上を覆う。
+//!
+//! 同じ文書の表示を新しい内容に替えるときは、スクロール位置を保つ: 読み込みの前に
+//! `ExecuteScript` で位置を読み、読み込みが終わったら（`NavigationCompleted`）戻す。
+//! 別の文書に替わったときは先頭から表示する。
 
 use std::cell::{Cell, RefCell};
 use std::rc::{Rc, Weak};
@@ -11,7 +15,8 @@ use std::sync::Arc;
 use webview2_com::take_pwstr;
 use webview2_com::Microsoft::Web::WebView2::Win32::*;
 use webview2_com::{
-    CreateCoreWebView2ControllerCompletedHandler, NavigationStartingEventHandler,
+    CreateCoreWebView2ControllerCompletedHandler, ExecuteScriptCompletedHandler,
+    NavigationCompletedEventHandler, NavigationStartingEventHandler,
     NewWindowRequestedEventHandler, WebResourceRequestedEventHandler,
 };
 use windows::core::{w, Interface, BOOL, PCWSTR, PWSTR};
@@ -33,9 +38,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use super::host::PreviewHost;
 use super::policy::{
-    decide_navigation, fits_navigate_to_string, guidance_text, oversize_notice_html, NavDecision,
+    decide_navigation, fits_navigate_to_string, guidance_text, oversize_notice_html,
+    parse_scroll_result, scroll_restore_script, NavDecision, ScrollPos, SCROLL_CAPTURE_SCRIPT,
 };
-use crate::core::{Error, Result};
+use crate::core::{DocumentId, Error, Result};
 use crate::markdown::{PreviewPalette, Rgb};
 use crate::platform::system::to_wide;
 
@@ -61,10 +67,22 @@ struct PaneInner {
     webview: RefCell<Option<ICoreWebView2>>,
     /// 最後に渡された文書（初期化の完了前に渡されたものも、ここに溜めて後で表示する）。
     document: RefCell<Option<Arc<str>>>,
+    /// `document` がどの文書のものか。
+    document_key: Cell<Option<DocumentId>>,
     /// 最後に表示した文書（同じものの再表示を省く）。
     shown: RefCell<Option<Arc<str>>>,
+    /// `shown` がどの文書のものか。
+    shown_key: Cell<Option<DocumentId>>,
     /// `NavigateToString` を呼んだ直後で、その `NavigationStarting` をまだ見ていない。
     ours: Cell<bool>,
+    /// こちらが始めた読み込みの ID（`NavigationStarting` で知る）。完了を待っている間だけ。
+    loading: Cell<Option<u64>>,
+    /// `NavigateToString` を呼んでから、その読み込みが終わるまでの間。
+    navigating: Cell<bool>,
+    /// スクロール位置を読んでいる最中（`ExecuteScript` の完了待ち）。その文書の ID。
+    capturing: Cell<Option<DocumentId>>,
+    /// 次の読み込みが終わったら戻すスクロール位置。
+    restore: Cell<Option<ScrollPos>>,
     palette: RefCell<PreviewPalette>,
     on_status: RefCell<Option<StatusCallback>>,
 }
@@ -93,8 +111,14 @@ impl PreviewPane {
             controller: RefCell::new(None),
             webview: RefCell::new(None),
             document: RefCell::new(None),
+            document_key: Cell::new(None),
             shown: RefCell::new(None),
+            shown_key: Cell::new(None),
             ours: Cell::new(false),
+            loading: Cell::new(None),
+            navigating: Cell::new(false),
+            capturing: Cell::new(None),
+            restore: Cell::new(None),
             palette: RefCell::new(palette.clone()),
             on_status: RefCell::new(None),
         });
@@ -186,11 +210,13 @@ impl PreviewPane {
         }
     }
 
-    /// 表示する文書（[`crate::markdown::compose_document`] の結果）。初期化の完了前に
-    /// 呼んでもよい（完了後に表示する）。同じ `Arc` の再設定は何もしない。
-    pub fn set_document(&self, html: Arc<str>) {
+    /// 表示する文書（[`crate::markdown::compose_document`] の結果）。`key` はどの文書か
+    /// （同じ文書の更新ならスクロール位置を保つ）。初期化の完了前に呼んでもよい
+    /// （完了後に表示する）。同じ `Arc` の再設定は何もしない。
+    pub fn set_document(&self, key: DocumentId, html: Arc<str>) {
         *self.inner.document.borrow_mut() = Some(html);
-        self.inner.navigate();
+        self.inner.document_key.set(Some(key));
+        PaneInner::navigate(&self.inner);
     }
 
     /// テーマの変更。背景色と案内の配色を替える。文書の見た目は新しい文書で替わる。
@@ -279,18 +305,70 @@ impl PaneInner {
         }
     }
 
-    fn navigate(&self) {
-        if *self.status.borrow() != PaneStatus::Ready {
+    /// 渡された文書を表示する。同じ文書の更新なら、先にスクロール位置を読んでから。
+    fn navigate(this: &Rc<PaneInner>) {
+        if *this.status.borrow() != PaneStatus::Ready || this.capturing.get().is_some() {
+            // 位置の読み取り中なら、その完了で最新の文書を表示する。
             return;
         }
-        let Some(doc) = self.document.borrow().clone() else {
+        let Some(doc) = this.document.borrow().clone() else {
             return;
         };
-        if let Some(shown) = self.shown.borrow().as_ref() {
+        if let Some(shown) = this.shown.borrow().as_ref() {
             if Arc::ptr_eq(shown, &doc) {
                 return;
             }
         }
+        let key = this.document_key.get();
+        let same_document = this.shown.borrow().is_some() && key == this.shown_key.get();
+        if !same_document {
+            this.restore.set(None);
+        } else if !this.navigating.get() && this.restore.get().is_none() {
+            // 表示し終わっている同じ文書の更新。いまの位置を読んでから替える。
+            // （読み込み中なら、前に読んだ位置がまだ `restore` にあるので、それを使う。）
+            if Self::capture_scroll(this, key) {
+                return;
+            }
+        }
+        this.navigate_now();
+    }
+
+    /// スクロール位置を読み始める。始められなければ `false`。
+    fn capture_scroll(this: &Rc<PaneInner>, key: Option<DocumentId>) -> bool {
+        let webview = this.webview.borrow().clone();
+        let Some(wv) = webview else { return false };
+        let Some(key) = key else { return false };
+        let weak = Rc::downgrade(this);
+        let handler = ExecuteScriptCompletedHandler::create(Box::new(move |hr, json| {
+            let Some(inner) = weak.upgrade() else {
+                return Ok(());
+            };
+            inner.capturing.set(None);
+            if inner.destroyed.get() {
+                return Ok(());
+            }
+            // 読んでいる間に別の文書へ替わっていれば、その位置は使わない。
+            if hr.is_ok() && inner.document_key.get() == Some(key) {
+                inner.restore.set(parse_scroll_result(&json));
+            }
+            PaneInner::navigate(&inner);
+            Ok(())
+        }));
+        let script = to_wide(SCROLL_CAPTURE_SCRIPT);
+        this.capturing.set(Some(key));
+        // SAFETY: 有効な WebView。文字列は NUL 終端で呼び出しの間有効。
+        let r = unsafe { wv.ExecuteScript(PCWSTR(script.as_ptr()), &handler) };
+        if r.is_err() {
+            this.capturing.set(None);
+            return false;
+        }
+        true
+    }
+
+    fn navigate_now(&self) {
+        let Some(doc) = self.document.borrow().clone() else {
+            return;
+        };
         let webview = self.webview.borrow().clone();
         let Some(wv) = webview else { return };
         let html: std::borrow::Cow<str> = if fits_navigate_to_string(&doc) {
@@ -300,12 +378,37 @@ impl PaneInner {
         };
         let wide = to_wide(&html);
         self.ours.set(true);
+        // 前の読み込みの完了（中断）は、もう待たない。新しい ID は NavigationStarting で知る。
+        self.loading.set(None);
         // SAFETY: 有効な WebView。文字列は NUL 終端で呼び出しの間有効。
         let r = unsafe { wv.NavigateToString(PCWSTR(wide.as_ptr())) };
         if r.is_err() {
             self.ours.set(false);
+            self.restore.set(None);
         } else {
             *self.shown.borrow_mut() = Some(doc);
+            self.shown_key.set(self.document_key.get());
+            self.navigating.set(true);
+        }
+    }
+
+    /// 読み込みが終わった（`NavigationCompleted`）。こちらの読み込みなら位置を戻す。
+    fn on_navigation_completed(&self, navigation_id: u64) {
+        if self.loading.get() != Some(navigation_id) {
+            return;
+        }
+        self.loading.set(None);
+        self.navigating.set(false);
+        let Some(script) = self.restore.take().and_then(scroll_restore_script) else {
+            return;
+        };
+        let webview = self.webview.borrow().clone();
+        let Some(wv) = webview else { return };
+        let handler = ExecuteScriptCompletedHandler::create(Box::new(|_, _| Ok(())));
+        let script = to_wide(&script);
+        // SAFETY: 有効な WebView。文字列は NUL 終端で呼び出しの間有効。
+        unsafe {
+            let _ = wv.ExecuteScript(PCWSTR(script.as_ptr()), &handler);
         }
     }
 }
@@ -413,6 +516,21 @@ fn configure(
             .add_NavigationStarting(&nav, &mut token)
             .map_err(|e| fail("ナビゲーションの監視", e))?;
 
+        // 読み込みの完了: スクロール位置を戻す。
+        let done_weak = weak.clone();
+        let done = NavigationCompletedEventHandler::create(Box::new(move |_sender, args| {
+            let (Some(args), Some(inner)) = (args, done_weak.upgrade()) else {
+                return Ok(());
+            };
+            let mut id = 0u64;
+            if args.NavigationId(&mut id).is_ok() {
+                inner.on_navigation_completed(id);
+            }
+            Ok(())
+        }));
+        // 失敗しても表示はできる（位置が保たれないだけ）。
+        let _ = webview.add_NavigationCompleted(&done, &mut token);
+
         // 新しいウィンドウは開かせない。
         let nw = NewWindowRequestedEventHandler::create(Box::new(|_s, args| {
             if let Some(args) = args {
@@ -470,7 +588,7 @@ fn configure(
         let _ = controller.SetIsVisible(true);
     }
     inner.set_status(PaneStatus::Ready);
-    inner.navigate();
+    PaneInner::navigate(inner);
     Ok(())
 }
 
@@ -493,10 +611,27 @@ fn handle_navigation(
                 Some(take_pwstr(p))
             })
             .unwrap_or_default();
-        let ours = weak.upgrade().is_some_and(|i| i.ours.replace(false));
+        let inner = weak.upgrade();
+        let ours = inner.as_ref().is_some_and(|i| i.ours.replace(false));
         match decide_navigation(&uri, ours, &source, user.as_bool()) {
-            NavDecision::Allow => {}
-            NavDecision::Cancel => args.SetCancel(true)?,
+            NavDecision::Allow => {
+                if ours {
+                    let mut id = 0u64;
+                    if let (Some(i), Ok(())) = (&inner, args.NavigationId(&mut id)) {
+                        i.loading.set(Some(id));
+                    }
+                }
+            }
+            NavDecision::Cancel => {
+                if ours {
+                    // こちらの読み込みが通らなかった。完了を待たない。
+                    if let Some(i) = &inner {
+                        i.navigating.set(false);
+                        i.restore.set(None);
+                    }
+                }
+                args.SetCancel(true)?
+            }
             NavDecision::OpenExternal(url) => {
                 args.SetCancel(true)?;
                 open_external(&url);

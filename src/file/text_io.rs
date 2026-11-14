@@ -80,7 +80,7 @@ pub fn read_bytes(path: &Path, ctx: &TaskContext) -> Result<(Vec<u8>, FileStamp)
     if meta.is_dir() {
         return Err(read_error(super::failure::is_directory_error()));
     }
-    let stamp = FileStamp::from_metadata(&meta);
+    let stamp = FileStamp::of_file(&file).map_err(read_error)?;
     let too_large = |limit| Error::LimitExceeded {
         what: format!("ファイルの大きさ: {}", path.display()),
         limit,
@@ -181,7 +181,9 @@ impl DiskExpectation {
         let matches = match self {
             DiskExpectation::Any => return Ok(()),
             DiskExpectation::Absent => FileStamp::read(path)?.is_none(),
-            DiskExpectation::Unchanged(stamp) => FileStamp::read(path)? == Some(*stamp),
+            DiskExpectation::Unchanged(stamp) => {
+                FileStamp::read(path)?.is_some_and(|now| stamp.matches(&now))
+            }
         };
         if matches {
             Ok(())

@@ -408,6 +408,7 @@ impl App {
                     .unwrap_or(FileStamp {
                         len: 0,
                         modified: None,
+                        id: None,
                     });
                 let mut state = DocumentState::open_file(path.clone(), false, t.format, disk);
                 if t.disk.is_some()

@@ -15,7 +15,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde_json::{json, Map, Value};
 
 use crate::core::Version;
-use crate::file::FileStamp;
+use crate::file::{FileId, FileStamp};
 use crate::text::{Encoding, Eol, TextFormat};
 
 /// 形式の版。ヘッダーの `version`。互換のない変更で上げる。
@@ -172,6 +172,7 @@ pub(crate) fn encode(meta: &Meta, text: &str) -> Vec<u8> {
         Some(s) => json!({
             "len": s.len,
             "modified_ns": s.modified.and_then(time_to_ns),
+            "file_id": s.id.map(|id| id.to_hex()),
         }),
     };
     let header = json!({
@@ -266,6 +267,11 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<(Meta, String), DecodeError> {
         Some(Value::Object(o)) => Some(FileStamp {
             len: get_u64(o, "len")?,
             modified: o.get("modified_ns").and_then(Value::as_i64).map(ns_to_time),
+            // 古い形式（ID なし）や読めない ID は「ID なし」（比べない）として扱う。
+            id: o
+                .get("file_id")
+                .and_then(Value::as_str)
+                .and_then(FileId::parse),
         }),
         Some(_) => return Err(corrupt("`file_stamp` が不正")),
     };
@@ -302,6 +308,10 @@ mod tests {
             file_stamp: Some(FileStamp {
                 len: 12,
                 modified: Some(UNIX_EPOCH + Duration::new(1_700_000_000, 123_456_700)),
+                id: Some(FileId {
+                    volume: 7,
+                    index: 0x0123_4567_89ab_cdef_0011_2233_4455_6677,
+                }),
             }),
             title: "メモ.txt".into(),
             doc_version: Version::from_raw(7),
