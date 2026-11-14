@@ -217,7 +217,7 @@ core ← text, file ← document ← command ← appdata, mcp
 ```text
 %LOCALAPPDATA%\Linote\
   settings.json            設定（§8）
-  memos\                   一時メモ（中の形式はタスク E が決めてここに追記する）
+  memos\                   一時メモ: `<id>.memo`（UTF-8 の JSON 1 個。原子的に置換）と、変更時だけ取る排他ロック `.lock`。詳細は `src/memo/store.rs` の冒頭
   recovery\                復元データ（中の形式はタスク D が決めてここに追記する）
   mcp\authorization.json   MCP の認可（次の版）
   mcp\operations.jsonl     AI の操作記録（次の版。1 行 1 件の JSON）

@@ -19,3 +19,11 @@
 //! - 検索は [`crate::core::TaskContext`] を受け取り、[`crate::core::Outcome`] を返す。
 //! - 開いているメモのタブは [`crate::document::DocumentKind::Memo`]。自動保存が成功したら
 //!   [`crate::document::DocumentState::record_saved`] を呼ぶ。
+
+mod search;
+mod store;
+mod tab;
+
+pub use search::{fold_for_search, MemoHit};
+pub use store::{Listing, Memo, MemoStore, SaveOutcome, MAX_BODY_BYTES};
+pub use tab::{Finished, MemoTab};
