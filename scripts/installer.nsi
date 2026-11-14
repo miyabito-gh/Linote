@@ -28,6 +28,8 @@ VIAddVersionKey "FileVersion" "${VERSION}.0"
 VIAddVersionKey "LegalCopyright" ""
 
 !define MUI_ABORTWARNING
+!define MUI_ICON "../res/linote.ico"
+!define MUI_UNICON "../res/linote.ico"
 !insertmacro MUI_PAGE_WELCOME
 !insertmacro MUI_PAGE_DIRECTORY
 !insertmacro MUI_PAGE_INSTFILES

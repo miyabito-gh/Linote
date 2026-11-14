@@ -21,9 +21,9 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::UI::HiDpi::SystemParametersInfoForDpi;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, LoadCursorW, RegisterClassExW, CS_DBLCLKS, CS_HREDRAW,
-    CS_VREDRAW, CW_USEDEFAULT, IDC_ARROW, NONCLIENTMETRICSW, SPI_GETNONCLIENTMETRICS, WM_APP,
-    WNDCLASSEXW, WS_CLIPCHILDREN, WS_EX_APPWINDOW, WS_OVERLAPPEDWINDOW,
+    CreateWindowExW, DefWindowProcW, LoadCursorW, LoadIconW, RegisterClassExW, CS_DBLCLKS,
+    CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, IDC_ARROW, NONCLIENTMETRICSW, SPI_GETNONCLIENTMETRICS,
+    WM_APP, WNDCLASSEXW, WS_CLIPCHILDREN, WS_EX_APPWINDOW, WS_OVERLAPPEDWINDOW,
 };
 
 use crate::core::{Error, Result};
@@ -481,6 +481,13 @@ pub fn register_main_class(instance: HINSTANCE) -> Result<()> {
                 lpfnWndProc: Some(main_wndproc),
                 hInstance: instance,
                 hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
+                // EXE に埋め込んだアイコン（res/linote.rc の ID 1）。小さい方は Windows が
+                // 同じ .ico から合う大きさを選ぶ。
+                hIcon: LoadIconW(
+                    Some(instance),
+                    PCWSTR(std::ptr::without_provenance::<u16>(1)),
+                )
+                .unwrap_or_default(),
                 lpszClassName: MAIN_CLASS,
                 ..Default::default()
             };

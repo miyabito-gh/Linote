@@ -184,6 +184,12 @@ fn register_class() -> Result<()> {
                 lpfnWndProc: Some(window_proc),
                 hInstance: GetModuleHandleW(None).unwrap_or_default().into(),
                 hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
+                // アプリのアイコン（EXE の資源 ID 1）。
+                hIcon: windows::Win32::UI::WindowsAndMessaging::LoadIconW(
+                    Some(GetModuleHandleW(None).unwrap_or_default().into()),
+                    PCWSTR(std::ptr::without_provenance::<u16>(1)),
+                )
+                .unwrap_or_default(),
                 lpszClassName: CLASS,
                 ..Default::default()
             };
