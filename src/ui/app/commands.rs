@@ -643,7 +643,17 @@ pub fn register(registry: &mut Registry<App>) -> Result<()> {
     super::viewopts::register(registry)?;
     super::tabextras::register(registry)?;
     super::printing::register(registry)?;
+    super::settingsops::register(registry)?;
     Ok(())
+}
+
+/// グローバルショートカット（クリップボードから新しいタブ）の割り当ての表記（設定になければ既定）。
+pub(super) fn clipboard_hotkey_text(settings: &crate::appdata::Settings) -> String {
+    settings
+        .keys
+        .get(CLIPBOARD_NEW_TAB.id.as_str())
+        .cloned()
+        .unwrap_or_else(|| DEFAULT_CLIPBOARD_CHORD.to_owned())
 }
 
 fn theme_label(mode: ThemeMode) -> &'static str {
@@ -674,20 +684,27 @@ impl App {
 
     /// キー割り当てを決め、メニューバーを付ける。
     pub(super) fn install_menu(&mut self) {
+        self.startup_notes = self.build_keys_and_menu();
+        // メニューバーの分だけ作業領域が変わる。
+        self.relayout();
+    }
+
+    /// 設定からキー割り当てを作り直し、メニューバーを作り直して付け替える（起動時と、設定の
+    /// 再読み込みでキーが変わったとき）。問題（表記の誤り・重複・メニューを作れない）は
+    /// 利用者に知らせる文として返す。
+    pub(super) fn build_keys_and_menu(&mut self) -> Vec<String> {
         let (keymap, problems) = KeyMap::build(self.registry.definitions(), &self.settings);
         self.keymap = keymap;
-        self.startup_notes = problems
+        let mut notes: Vec<String> = problems
             .into_iter()
             .map(|p| format!("キーの設定に問題があります: {p}"))
             .collect();
+        // 新しいメニューを付けてから、古いものを破棄する（代入で古い方が落ちる）。
         match MenuModel::install(self.hwnd, &self.registry, &self.keymap) {
             Ok(menu) => self.menu = Some(menu),
-            Err(e) => self
-                .startup_notes
-                .push(format!("メニューを作れません: {e}")),
+            Err(e) => notes.push(format!("メニューを作れません: {e}")),
         }
-        // メニューバーの分だけ作業領域が変わる。
-        self.relayout();
+        notes
     }
 
     /// 起動時に分かった問題（設定ファイル、保存場所、キーの重複）を知らせる。
@@ -714,12 +731,7 @@ impl App {
 
     /// グローバルホットキー（クリップボードから新しいタブ）を設定から登録する。
     pub(super) fn init_hotkey(&mut self) {
-        let text = self
-            .settings
-            .keys
-            .get(CLIPBOARD_NEW_TAB.id.as_str())
-            .cloned()
-            .unwrap_or_else(|| DEFAULT_CLIPBOARD_CHORD.to_owned());
+        let text = clipboard_hotkey_text(&self.settings);
         self.apply_hotkey(&text);
     }
 

@@ -40,6 +40,7 @@ mod recover;
 mod search;
 pub mod selftest;
 mod session;
+mod settingsops;
 mod tabextras;
 mod tabops;
 mod viewopts;
@@ -318,6 +319,11 @@ pub struct App {
     paths: Option<AppPaths>,
     settings: Settings,
     settings_state: fileio::SettingsState,
+    /// 前回読んだ（または書いた）ときの設定ファイルの印。前面に戻ったとき、これと比べて
+    /// 変わっていれば再読み込みする（V4-1）。
+    settings_stamp: Option<crate::appdata::settings::SettingsStamp>,
+    /// 書き出し中の設定の保存の数。0 でない間は、設定ファイルの変更の自動検出を止める。
+    settings_writes_pending: u32,
     prompts: Rc<dyn Prompts>,
     keymap: KeyMap,
     menu: Option<MenuModel>,
@@ -642,6 +648,9 @@ impl App {
         let mut registry = Registry::new();
         register(&mut registry)?;
         commands::register(&mut registry)?;
+        let paths_stamp = paths
+            .as_ref()
+            .and_then(|p| crate::appdata::settings::SettingsStamp::of(&p.settings_file()));
         let app = App {
             hwnd,
             instance,
@@ -668,6 +677,8 @@ impl App {
             dragging_splitter: false,
             exit_without_confirmation: false,
             paths,
+            settings_stamp: paths_stamp,
+            settings_writes_pending: 0,
             settings,
             settings_state,
             prompts: Rc::new(Win32Prompts),
@@ -1614,6 +1625,8 @@ impl App {
             WM_ACTIVATE => {
                 let active = (wparam.0 & 0xFFFF) != 0;
                 if active {
+                    // 設定ファイルが変わっていれば読み直す（ほかのウィンドウや手での編集。V4-1）。
+                    self.check_settings_file();
                     // 前面に戻ったとき、表示中の文書のファイルがほかで変更されていないか確かめる。
                     if let Some(id) = self.active_id() {
                         self.check_external_change_of(id);

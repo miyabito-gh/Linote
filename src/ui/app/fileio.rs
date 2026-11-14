@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
+use crate::appdata::settings::SettingsStamp;
 use crate::appdata::{AppPaths, Settings};
 use crate::bigfile::{large_mode_reason, FileProfile, LargeModeReason};
 use crate::core::{DocStamp, DocumentId, Error, Limits, Result, TaskContext, WorkerPool};
@@ -184,12 +185,17 @@ impl App {
         let json = self.settings.to_json();
         let sender = self.sender();
         self.settings_state = SettingsState::Loaded;
+        // 書き出しが終わるまで、設定ファイルの変更の自動検出（再読み込み）は止める
+        // （自分の書き込みを外部の変更と取り違えない。V4-1）。
+        self.settings_writes_pending += 1;
         // 続けて何度も保存しても、古い内容が新しい内容を上書きしないよう、書き出しの順番を
         // 守る（古い番号の書き出しは、新しい番号が書いた後なら捨てる）。
         let seq = SETTINGS_SEQ.fetch_add(1, Ordering::SeqCst) + 1;
         WorkerPool::global().spawn(move || {
             let mut last = SETTINGS_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
             if seq < *last {
+                drop(last);
+                sender.send(UiMessage::Run(Box::new(|app| app.settings_written(None))));
                 return;
             }
             *last = seq;
@@ -212,6 +218,14 @@ impl App {
                 std::thread::sleep(std::time::Duration::from_millis(20));
             };
             drop(last);
+            // 書いた直後の印を UI スレッドに渡し、自分の書き込みとして覚えさせる。
+            let stamp = result
+                .is_ok()
+                .then(|| SettingsStamp::of(&paths.settings_file()))
+                .flatten();
+            sender.send(UiMessage::Run(Box::new(move |app| {
+                app.settings_written(stamp)
+            })));
             if let Err(e) = result {
                 sender.send(UiMessage::Status(format!(
                     "設定を保存できませんでした: {}",
@@ -244,6 +258,7 @@ impl App {
                 )
             });
             if result.is_ok() {
+                self.settings_stamp = SettingsStamp::of(&paths.settings_file());
                 break;
             }
             if attempt < SETTINGS_WRITE_ATTEMPTS {
@@ -779,6 +794,10 @@ impl App {
                     self.add_recent(&path);
                 }
                 self.set_status(&format!("保存しました: {name}"), MessageKind::Info);
+                // 設定ファイルを Linote のタブで保存したら、設定を読み直す（V4-1）。
+                if self.is_settings_file(&path) {
+                    self.reload_settings(super::settingsops::ReloadReason::SavedInTab);
+                }
                 match opts.after {
                     After::Nothing => {}
                     After::Close => {

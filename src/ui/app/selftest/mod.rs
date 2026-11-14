@@ -39,6 +39,7 @@ mod integration_u4;
 mod integration_u5;
 mod integration_v1;
 mod integration_v2;
+mod integration_v4;
 
 /// 統合の試験の道具立て。
 pub(crate) struct Ctx {

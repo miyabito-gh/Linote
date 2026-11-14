@@ -31,6 +31,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::appdata::settings::{FONT_SIZE_MAX, FONT_SIZE_MIN};
+use crate::appdata::Settings;
 use crate::platform::system::{from_wide, os_from_wide, to_wide};
 
 /// 未保存の文書を閉じるときの利用者の選択。
@@ -60,6 +61,19 @@ pub enum NoticeKind {
     Error,
 }
 
+/// 設定画面（V4-1）が、アプリの設定を読み書きするための窓口。画面は設定の中身を知らず、
+/// この窓口を通して現在の設定を受け取り、「適用」で編集した内容を渡す。
+pub trait SettingsSession {
+    /// いま実行中の設定（画面の初期値。画面を開いた時点の基準にする）。
+    fn current(&self) -> Settings;
+    /// 保存できない事情（設定ファイルが壊れている、保存場所がない）があれば、画面の上部に
+    /// 出す文。なければ `None`。
+    fn warning(&self) -> Option<String>;
+    /// 編集した設定 `edited` を反映して保存する。`baseline` は編集の前の設定で、これと違う
+    /// 項目だけを、最新の設定に差し替える。反映後の（いま実行中の）設定を返す。
+    fn apply(&mut self, baseline: &Settings, edited: &Settings) -> Settings;
+}
+
 /// 利用者に尋ねる・知らせる操作の一式。
 pub trait Prompts {
     /// ファイルを開くダイアログ（複数選択可）。取り消しは空。
@@ -84,7 +98,12 @@ pub trait Prompts {
     /// フォント選択ダイアログ。現在の書体とポイント数を初期値にし、選んだ（書体、ポイント数）を
     /// 返す。取り消しは `None`。
     fn choose_font(&self, owner: HWND, current: &str, points: u32) -> Option<(String, u32)>;
+    /// 設定画面（モーダル）。OK・適用で `session.apply` を呼ぶ。
+    fn settings_dialog(&self, owner: HWND, session: &mut dyn SettingsSession);
 }
+
+/// 台本の 1 手: 設定画面を開いた利用者の操作（`session` の `current`／`apply` を呼ぶ）。
+pub type SettingsScript = Box<dyn FnOnce(&mut dyn SettingsSession)>;
 
 // ------------------------------------------------------------------ 台本つきの実装
 
@@ -100,6 +119,8 @@ pub struct ScriptedPrompts {
     pub restore: RefCell<VecDeque<RestoreChoice>>,
     pub input: RefCell<VecDeque<Option<String>>>,
     pub font: RefCell<VecDeque<Option<(String, u32)>>>,
+    /// 設定画面での操作（開くたびに 1 つ使う。尽きたら何もせず閉じる＝キャンセル）。
+    pub settings: RefCell<VecDeque<SettingsScript>>,
     /// 見せた文面（種類と本文）。
     pub shown: RefCell<Vec<String>>,
 }
@@ -157,6 +178,13 @@ impl Prompts for ScriptedPrompts {
     fn choose_font(&self, _: HWND, current: &str, points: u32) -> Option<(String, u32)> {
         self.record("font", &format!("{current} {points}"));
         self.font.borrow_mut().pop_front().flatten()
+    }
+
+    fn settings_dialog(&self, _: HWND, session: &mut dyn SettingsSession) {
+        self.record("settings", &session.warning().unwrap_or_default());
+        if let Some(script) = self.settings.borrow_mut().pop_front() {
+            script(session);
+        }
     }
 }
 
@@ -348,6 +376,10 @@ impl Prompts for Win32Prompts {
         input_dialog(owner, caption, label, initial)
     }
 
+    fn settings_dialog(&self, owner: HWND, session: &mut dyn SettingsSession) {
+        crate::ui::settings_dialog::run(owner, session, None);
+    }
+
     fn choose_font(&self, owner: HWND, current: &str, points: u32) -> Option<(String, u32)> {
         let mut lf = LOGFONTW {
             // 96 DPI での高さ（負の値は文字の高さ）。ダイアログが DPI に合わせて読み替える。
@@ -468,6 +500,40 @@ fn push_item(
     push_u16(v, class);
     push_wstr(v, text);
     push_u16(v, 0); // 作成データなし
+}
+
+/// 部品を持たないダイアログのひな形（題名なし。大きさはダイアログ単位。部品と大きさは
+/// 作成後に呼び出し側が決める）。`DLGTEMPLATE` は DWORD 境界に置く必要があるので、
+/// `u32` の配列で返す。
+pub(crate) fn blank_dialog_template(cx: i16, cy: i16) -> Vec<u32> {
+    const WS_POPUP: u32 = 0x8000_0000;
+    const WS_CAPTION: u32 = 0x00C0_0000;
+    const WS_SYSMENU: u32 = 0x0008_0000;
+    const DS_MODALFRAME: u32 = 0x80;
+    const DS_SETFONT: u32 = 0x40;
+    const WS_VISIBLE: u32 = 0x1000_0000;
+    let mut v = Vec::new();
+    push_u32(
+        &mut v,
+        WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_VISIBLE | DS_MODALFRAME | DS_SETFONT,
+    );
+    push_u32(&mut v, 0);
+    push_u16(&mut v, 0); // 部品の数
+    for x in [0i16, 0, cx, cy] {
+        push_i16(&mut v, x);
+    }
+    push_u16(&mut v, 0); // メニューなし
+    push_u16(&mut v, 0); // 既定のクラス
+    push_wstr(&mut v, ""); // 題名（後で設定）
+    push_u16(&mut v, 9);
+    push_wstr(&mut v, "Yu Gothic UI");
+    align4(&mut v);
+    let mut aligned = vec![0u32; v.len().div_ceil(4)];
+    // SAFETY: aligned は v 以上の長さ。
+    unsafe {
+        std::ptr::copy_nonoverlapping(v.as_ptr(), aligned.as_mut_ptr() as *mut u8, v.len());
+    }
+    aligned
 }
 
 /// 入力ダイアログのひな形（ダイアログ単位。題名は実行時に `WM_INITDIALOG` で設定する）。

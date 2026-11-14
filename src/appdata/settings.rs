@@ -41,6 +41,8 @@
 //!   失わないため）。読み書きの処理自体はここに持たない（統合時に `file` を使って書く）。
 
 use std::collections::BTreeMap;
+use std::path::Path;
+use std::time::SystemTime;
 
 use serde_json::{Map, Value};
 
@@ -48,6 +50,12 @@ use crate::command::keys::KeyParseError;
 use crate::command::{CommandDef, KeyChord};
 use crate::core::{Error, Result};
 use crate::printing::{Margins, MARGIN_MAX};
+
+mod items;
+
+pub use items::{
+    apply_edits, edited_items, pages, Choice, Item, ItemKind, ItemValue, Page, ParseNumberError,
+};
 
 /// 現在の設定の形式の版。
 pub const SETTINGS_VERSION: u64 = 1;
@@ -459,6 +467,71 @@ impl SearchHistory {
     }
 }
 
+/// 設定ファイルの更新時刻と長さ（再読み込みが要るかを調べるための印。V4-1）。
+/// ファイルがなければ [`SettingsStamp::of`] は `None`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SettingsStamp {
+    pub modified: Option<SystemTime>,
+    pub len: u64,
+}
+
+impl SettingsStamp {
+    /// ファイルの印。ファイルがない・調べられないときは `None`。
+    pub fn of(path: &Path) -> Option<SettingsStamp> {
+        let meta = std::fs::metadata(path).ok()?;
+        Some(SettingsStamp {
+            modified: meta.modified().ok(),
+            len: meta.len(),
+        })
+    }
+}
+
+/// 前回読んだときの印 `last` と今の印 `now` を比べ、ファイルが変わっている（作られた・消えた・
+/// 更新時刻か長さが違う）なら `true`。
+pub fn stamp_changed(last: Option<SettingsStamp>, now: Option<SettingsStamp>) -> bool {
+    last != now
+}
+
+/// 2 つの設定の違い（どの項目が変わったか）。再読み込みで、変わった部分だけを反映するのに使う。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SettingsChanges {
+    pub theme: bool,
+    pub keys: bool,
+    pub view: bool,
+    pub print: bool,
+    pub restore_session: bool,
+    pub recent_files: bool,
+    pub search_history: bool,
+    pub window: bool,
+    pub mcp: bool,
+    /// 知らない項目（`version` を含む）。
+    pub other: bool,
+}
+
+impl SettingsChanges {
+    /// 何も変わっていない。
+    pub fn is_empty(&self) -> bool {
+        *self == SettingsChanges::default()
+    }
+
+    /// 利用者に見せる、変わった項目の名前（`window` と知らない項目は含めない）。
+    pub fn labels(&self) -> Vec<&'static str> {
+        [
+            (self.theme, "テーマ"),
+            (self.view, "表示"),
+            (self.keys, "キー割り当て"),
+            (self.print, "印刷"),
+            (self.restore_session, "前回のタブの復元"),
+            (self.recent_files, "最近使ったファイル"),
+            (self.search_history, "検索履歴"),
+            (self.mcp, "MCP"),
+        ]
+        .into_iter()
+        .filter_map(|(changed, label)| changed.then_some(label))
+        .collect()
+    }
+}
+
 /// 設定。
 #[derive(Debug, Clone, PartialEq)]
 pub struct Settings {
@@ -652,6 +725,22 @@ impl Settings {
             .expect("JSON の値は常に文字列にできる");
         text.push('\n');
         text
+    }
+
+    /// `other` との違い（`self` から `other` に変わったときに何が変わるか）。
+    pub fn diff(&self, other: &Settings) -> SettingsChanges {
+        SettingsChanges {
+            theme: self.theme != other.theme,
+            keys: self.keys != other.keys,
+            view: self.view != other.view,
+            print: self.print != other.print,
+            restore_session: self.restore_session != other.restore_session,
+            recent_files: self.recent_files != other.recent_files,
+            search_history: self.search_history != other.search_history,
+            window: self.window != other.window,
+            mcp: self.mcp_enabled != other.mcp_enabled,
+            other: self.extra != other.extra,
+        }
     }
 
     /// 最近使ったファイルの先頭にパスを置く（同じパスは大文字小文字を区別せず 1 つにする）。
@@ -937,5 +1026,96 @@ mod tests {
         assert_eq!(s.key_for(&save).unwrap(), None);
         s.keys.insert("file.save".into(), "Ctrl+Nope".into());
         assert!(s.key_for(&save).is_err());
+    }
+
+    // ---------------------------------------------------------------- V4-1: 差分と更新時刻
+
+    #[test]
+    fn diff_reports_what_changed() {
+        let a = Settings::default();
+        assert!(a.diff(&a.clone()).is_empty());
+        let mut b = a.clone();
+        b.theme = ThemeMode::Dark;
+        b.view.wrap = WrapMode::Word;
+        b.keys.insert("file.save".into(), "F2".into());
+        b.recent_files.push("C:\\a.txt".into());
+        b.search_history.push_find("foo");
+        b.restore_session = false;
+        b.print.landscape = true;
+        b.mcp_enabled = true;
+        b.window = Some(WindowSettings {
+            x: 1,
+            y: 2,
+            width: 300,
+            height: 300,
+            maximized: false,
+        });
+        let d = a.diff(&b);
+        assert!(d.theme && d.view && d.keys && d.recent_files && d.search_history);
+        assert!(d.restore_session && d.print && d.mcp && d.window);
+        assert!(!d.other);
+        assert_eq!(
+            d.labels(),
+            vec![
+                "テーマ",
+                "表示",
+                "キー割り当て",
+                "印刷",
+                "前回のタブの復元",
+                "最近使ったファイル",
+                "検索履歴",
+                "MCP"
+            ]
+        );
+        // 1 項目だけの違い。
+        let mut c = a.clone();
+        c.view.zoom = 3;
+        let d = a.diff(&c);
+        assert_eq!(d.labels(), vec!["表示"]);
+        assert!(!d.theme && !d.keys);
+        // 知らない項目の違い。
+        let x = Settings::from_json(r#"{"future": 1}"#).unwrap();
+        let d = a.diff(&x);
+        assert!(d.other && d.labels().is_empty() && !d.is_empty());
+    }
+
+    #[test]
+    fn diff_ignores_json_formatting() {
+        let a = Settings::from_json(r#"{"theme":"dark","view":{"wrap":"word"}}"#).unwrap();
+        let b = Settings::from_json(&a.to_json()).unwrap();
+        assert!(a.diff(&b).is_empty());
+    }
+
+    #[test]
+    fn stamp_comparison_detects_changes() {
+        let t0 = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1000);
+        let t1 = t0 + std::time::Duration::from_secs(5);
+        let s = |m: SystemTime, len| {
+            Some(SettingsStamp {
+                modified: Some(m),
+                len,
+            })
+        };
+        assert!(!stamp_changed(s(t0, 10), s(t0, 10)));
+        assert!(stamp_changed(s(t0, 10), s(t1, 10)), "更新時刻");
+        assert!(stamp_changed(s(t0, 10), s(t0, 11)), "長さ");
+        assert!(stamp_changed(None, s(t0, 10)), "作られた");
+        assert!(stamp_changed(s(t0, 10), None), "消えた");
+        assert!(!stamp_changed(None, None), "ずっとない");
+    }
+
+    #[test]
+    fn stamp_of_a_real_file_follows_its_content() {
+        let dir = std::env::temp_dir().join(format!("linote-stamp-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+        assert_eq!(SettingsStamp::of(&path), None);
+        std::fs::write(&path, "{}").unwrap();
+        let first = SettingsStamp::of(&path);
+        assert_eq!(first.map(|s| s.len), Some(2));
+        assert!(!stamp_changed(first, SettingsStamp::of(&path)));
+        std::fs::write(&path, "{ \"theme\": \"dark\" }").unwrap();
+        assert!(stamp_changed(first, SettingsStamp::of(&path)));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

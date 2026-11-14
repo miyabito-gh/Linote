@@ -27,6 +27,7 @@
 //! | [`memo_panel`] | E | メモの小窓 |
 //! | [`preview`] | H | Markdown プレビュー（右ペインと別ウィンドウ） |
 //! | [`bigview`] | L | 巨大ファイルの表示（DirectWrite） |
+//! | [`settings_dialog`] | V4 | 設定画面（ページは `appdata::settings` の表から作る） |
 
 pub mod app;
 pub mod bigview;
@@ -37,6 +38,7 @@ pub mod memo_panel;
 pub mod menu;
 pub mod preview;
 pub mod print;
+pub mod settings_dialog;
 pub mod statusbar;
 pub mod tabs;
 pub mod theme;

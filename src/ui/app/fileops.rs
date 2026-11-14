@@ -69,6 +69,11 @@ impl App {
 
     /// 最近使ったファイルの先頭に加え、設定に保存する（存在確認はしない）。
     pub(super) fn add_recent(&mut self, path: &Path) {
+        // 設定ファイル自体は載せない（載せると、開いた直後に設定ファイルを書き換えてしまい、
+        // 開いているタブが「ほかのプログラムで変更された」状態になる）。
+        if self.is_settings_file(path) {
+            return;
+        }
         let text = path.to_string_lossy().into_owned();
         if self.settings.recent_files.first() == Some(&text) {
             return;

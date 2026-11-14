@@ -283,6 +283,10 @@ static MENUS: &[MenuDef] = &[
             Item::Cmd(CommandId::new("file.close_all")),
             Item::Cmd(CommandId::new("file.reopen_closed")),
             Item::Separator,
+            Item::Cmd(CommandId::new("app.settings")),
+            Item::Cmd(CommandId::new("app.open_settings_file")),
+            Item::Cmd(CommandId::new("app.reload_settings")),
+            Item::Separator,
             Item::Cmd(CommandId::new("file.exit")),
         ],
     },
@@ -537,6 +541,22 @@ impl MenuModel {
             .iter()
             .find(|e| e.id == id)
             .map(|e| (e.command, e.args.clone()))
+    }
+
+    /// 項目の表示文字列（`\t` の後ろがキーの表示。試験用）。
+    pub fn label_of(&self, id: u16) -> Option<String> {
+        let e = self.entries.iter().find(|e| e.id == id)?;
+        let mut buf = vec![0u16; 256];
+        // SAFETY: 自分のメニューの項目。出力先は buf。
+        let n = unsafe {
+            windows::Win32::UI::WindowsAndMessaging::GetMenuStringW(
+                HMENU(e.popup as *mut _),
+                u32::from(e.id),
+                Some(&mut buf),
+                MF_BYCOMMAND,
+            )
+        };
+        (n > 0).then(|| String::from_utf16_lossy(&buf[..n as usize]))
     }
 
     /// 作った項目の一覧。

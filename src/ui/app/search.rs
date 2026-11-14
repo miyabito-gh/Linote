@@ -141,7 +141,7 @@ impl App {
     }
 
     /// 設定の履歴を検索欄のドロップダウンに反映する。
-    fn sync_find_history(&self) {
+    pub(super) fn sync_find_history(&self) {
         if let Some(p) = self.find_panel {
             let h = &self.settings.search_history;
             p.set_history(&h.find, &h.replace, &h.grep_dir);
