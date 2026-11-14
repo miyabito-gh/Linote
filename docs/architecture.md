@@ -237,23 +237,103 @@ core ← text, file ← document ← command ← appdata, mcp
 3. **版の照合**: メモの更新・名前変更・削除は前提の版を受け取り、ロックの中で現在の版と比べ、食い違えば `VersionMismatch`（現在の版つき）で拒否する。**黙って上書きしない。** 後から書いた方が勝つ方式にはしない。
 4. **所有**: 復元データは、書き出したプロセスが所有する。動作中のプロセスの所有は、そのプロセスが保持し続けるロックで示す。別のプロセスは、ロックされている復元データを復元も削除もしない。ロックされていない（持ち主が落ちた）復元データだけが、次の起動で復元の対象になる。同じ復元データを 2 つのプロセスが同時に引き取らないよう、引き取りもロックで排他する（タスク D）。
 5. **削除の時機**: 復元データは、元ファイルへの保存が成功したとき（保存した版以前の分）、または利用者が変更を明示的に破棄したときに削除する。保存中に編集が進んでいれば、その分の復元データは残す。
-6. **外部変更**: 利用者のファイルは `file::FileStamp`（長さと更新時刻）を開いたとき・保存したときに控え、ウィンドウが前面に来たとき・保存の直前・復元のときに比べる。食い違えば `DocumentState::record_external_change()`。
+6. **外部変更**: 利用者のファイルは `file::FileStamp`（長さと更新時刻）を開いたとき・保存したときに控え、ウィンドウが前面に来たとき・保存の直前・復元のときに比べる。食い違えば `DocumentState::record_external_change()`。 比較は `file::check_external_change(path, 控え)`（変化なし／変更／削除／出現を返す）。長さと更新時刻だけを見るので、同じ長さのまま更新時刻の刻みの中で書き換えられた場合は検知できない。
 
-タスク A が公開する共通部品の想定（名前と署名はタスク A が確定し、この節に追記する。D・E・I1 はそれを使う）:
+### `file` モジュールの共通部品（タスク A が確定）
+
+D・E・I1・設定の保存は、次の部品を使う。独自に一時ファイルやロックを実装しない。署名の正本は `src/file/` のドキュメントコメント。
 
 ```rust
-// file: 一時ファイル経由の置換。失敗したら一時ファイルを消し、元のファイルに触れない。
+// ---- 原子的な書き込み（メモ・復元・設定） ----
+/// 同じディレクトリの一時ファイルに書き、sync_all で確定させてから置換する。
+/// 失敗・中止・パニックでは一時ファイルを消し、元のファイルに触れない。
+/// 親ディレクトリは作らない（先に AppPaths::ensure_dir）。進捗はバイト数。
 pub fn write_atomic(path: &Path, bytes: &[u8], ctx: &TaskContext) -> Result<()>;
-// file: OS の排他ロック。取れなければ Error::Busy。Drop で解放。
+
+/// 少しずつ書く版。`write` が Err を返したら置換しない。置換後の FileStamp を返す。
+pub fn write_atomic_with(
+    path: &Path,
+    options: AtomicOptions,            // { mode: ReplaceMode }。既定は Rename
+    ctx: &TaskContext,
+    write: impl FnOnce(&mut dyn io::Write) -> Result<()>,
+) -> Result<FileStamp>;
+
+pub enum ReplaceMode { Rename, PreserveMetadata }
+
+/// この実装が作る一時ファイルの名前（`.~linote-<pid>-<時刻>-<連番>.tmp`）か。
+/// ディレクトリを列挙する側（メモ・復元）は、当てはまるファイルをデータとして
+/// 扱わない。強制終了で残った古いものは消してよい。
+pub fn is_temp_file_name(name: &OsStr) -> bool;
+
+// ---- ロック ----
+/// OS の排他ロック（std の File::try_lock。Windows: LockFileEx、Unix: flock）。
+/// 取れなければ待たずに Error::Busy。Drop で解放。プロセスが落ちれば OS が解放する。
 pub struct LockFile { /* … */ }
-impl LockFile { pub fn try_acquire(path: &Path) -> Result<LockFile>; }
+impl LockFile {
+    pub fn try_acquire(path: &Path) -> Result<LockFile>;
+    pub fn path(&self) -> &Path;
+    pub fn release(self);
+}
+
+// ---- 利用者のファイル ----
+pub fn read_text(path: &Path, options: &ReadOptions, ctx: &TaskContext) -> Result<LoadedText>;
+pub fn read_bytes(path: &Path, ctx: &TaskContext) -> Result<(Vec<u8>, FileStamp)>;
+pub fn save_text(request: &SaveRequest<'_>, ctx: &TaskContext) -> Result<SaveOutcome>;
+
+// ---- 外部変更・失敗の分類 ----
+impl FileStamp { pub fn read(path: &Path) -> Result<Option<FileStamp>>; }
+pub fn check_external_change(path: &Path, known: Option<FileStamp>) -> Result<ExternalChange>;
+pub fn classify(error: &Error) -> Option<IoFailure>;   // Error::Io の原因
 ```
+
+**置換の方法（`ReplaceMode`）と、属性・ACL の扱い**
+
+| | Windows | Unix（テスト用） | 使う場面 |
+|---|---|---|---|
+| `Rename`（既定） | `MoveFileExW(MOVEFILE_REPLACE_EXISTING \| MOVEFILE_WRITE_THROUGH)`。ファイルシステムの単位で原子的。新しいファイルの属性・ACL はディレクトリの既定になる | `rename` ＋ 親ディレクトリの `fsync` | **アプリのデータ**（メモ・復元・設定）。`write_atomic` は常にこれ |
+| `PreserveMetadata` | `ReplaceFileW`（属性、ACL、作成日時、代替データストリームを引き継ぐ）。保存先がなければ `Rename` と同じ。`ReplaceFileW` が使えないファイルシステム（FAT、一部の共有）では `Rename` の置換に切り替える | 許可ビットを写してから `rename`（所有者は引き継がない） | **利用者のファイル**（`save_text`） |
+
+- `ReplaceFileW` は内部で「保存先を別名に退避 → 一時ファイルを保存先の名前に変更 → 退避を削除」と進むので、厳密には一瞬だけ保存先の名前が存在しない。その間にプロセスが落ちても内容は一時ファイルか退避（`~RF….TMP` の類）に残るが、保存先の名前には何もない状態がありうる。利用者のファイルでは ACL と属性を失わないことを優先してこちらを選んだ。アプリのデータは `Rename` なので、この隙間はない。
+- `ReplaceFileW` を呼ぶ前に、保存先を削除アクセスで開けるか試す。他のプログラムが共有を許さずに開いている場合などは、ここで失敗させて何も動かさない。
+- 中核は `windows` crate を使わない取り決めなので、`MoveFileExW`／`ReplaceFileW` は `src/file/sys.rs` で `kernel32` の関数を直接宣言して呼ぶ（std の `fs::rename` は `MOVEFILE_WRITE_THROUGH` を付けず、属性の引き継ぎもできないため）。長いパスは `\\?\` 形式に直して渡す。
+- **読み取り専用の属性**が付いたファイルは上書きしない（`IoFailure::ReadOnly`）。属性を外して書くことはしない。
+- **シンボリックリンク**はリンク先を保存先にする（リンクを通常のファイルで置き換えない）。**ハードリンク**は切れる（新しいファイルで置き換える方式のため）。
+- 失敗は `Error::Io`（`op` が段階: 「保存先の確認」「一時ファイルの作成」「一時ファイルの書き込み」「一時ファイルの書き込みの確定」「ファイルの置換」）。原因は `file::classify` で `NotFound`／`PermissionDenied`／`ReadOnly`／`InUse`／`DiskFull`／`InvalidPath`／`IsDirectory`／`Other` に分ける。
+
+**ロックファイルの使い方**
+
+- ロックは**データとは別の専用ファイル**に掛ける（例: `memos/.lock`、`recovery/<id>.lock`）。Windows ではロックした範囲を他のハンドルから読み書きできなくなるため、データのファイルそのものには掛けない。
+- ロックファイルは消さない（存在はロック中を意味しない。消すと、同時に取りに来た相手と別々のファイルをロックする競合が起きる）。
+- 同じプロセスの中でも、同じパスを 2 回取ることはできない（2 回目は `Busy`）。
+- 復元データの所有（上の 4）は、`LockFile` を保持し続けることで示す。孤児の引き取りは `try_acquire` が成功したこと自体を「引き取った」とする。
+
+### 読み込みの流れ（通常ファイル）
+
+`file::read_text` が、読み込み・判定・変換・改行の集計をまとめて行う（ワーカーで呼ぶ）。
+
+1. `read_bytes`: 読み始める前の `FileStamp` を控えてから全体を読む。`ctx.limits.max_bytes` を超えるなら読まずに `LimitExceeded`（巨大モードへの振り分けに使える）。
+2. `text::detect`: BOM → UTF-16 らしさ（NUL を含む場合）→ UTF-8 として妥当か → CP932。根拠（`DetectReason`）と信頼度（`Confidence`）を返す。`ReadOptions::with_encoding` で文字コードを指定して開き直せる。
+3. `text::decode`: UTF-8 にする。**不正なバイトは U+FFFD に置き換え、個数と位置を `LoadedText::invalid` で返す**（エラーにしない）。`LoadedText::is_lossy()` が真なら、UI は「この文字コードでは正しく読めていない。保存すると元に戻せない」ことを知らせ、上書き保存の前に確認する。
+4. 改行は変換しない。`EolStats`（CRLF・LF・CR の数）を返し、最も多い形式を `TextFormat::eol` にする（改行がなければ `ReadOptions::default_eol`）。混在は `EolStats::is_mixed()`。
+5. `LoadedText::reencodes_exactly` は「編集せずに保存すると元のバイト列と一致するか」。偽になるのは、不正なバイトがあった場合と、CP932 の重複文字（下記）を含む場合。
+
+**CP932 の扱い**（`encoding_rs::SHIFT_JIS` を使う。詳細は `src/text/encode.rs`）
+
+- NEC 特殊文字（①、㈱ など）、IBM 拡張、NEC 選定 IBM 拡張、半角カナは Windows の CP932 と同じ対応で読み書きできる。
+- 外字（0xF040〜0xF9FC ↔ U+E000〜U+E757）は、`encoding_rs` が読めるが書けないので、自前で書いて往復させる。
+- 重複して登録された文字（NEC 選定 IBM 拡張 0xED40〜0xEEFC など、2 バイトの組み合わせのうち 398 通り）は、保存すると代表のバイト列（IBM 拡張 0xFA40〜 など）に寄る。文字は変わらないがバイト列は変わるので、`reencodes_exactly` で分かるようにしている。
+- U+00A5（¥）、U+203E（‾）、U+2212（−）は、`encoding_rs` が 0x5C、0x7E、0x817C に書くが、読み直すと別の文字（\、~、－）になる。黙って化けさせないため、**変換できない文字として報告する**。
 
 ### 保存の流れ（通常ファイル）
 
-1. UI: コマンド `file.save` が機能（`Save`）を検査し、`FileStamp` を取り直して外部変更を確かめ、本文の写しと `DocStamp` を作る。同じ文書の保存が進行中なら、新しい保存は始めない。
-2. ワーカー: 文字コードに変換する。変換できない文字があれば**書き込む前に** UI へ戻して確認する。問題なければ一時ファイルに書いて置換し、新しい `FileStamp` を返す。
-3. UI: 文書が開いていれば `record_saved(保存した版, パス, 新しい FileStamp)`。対応する復元データ（保存した版以前）を削除する。失敗したら表示し、元ファイルと編集中の内容はそのまま残す。
+1. UI: コマンド `file.save` が機能（`Save`）を検査し、`file::check_external_change` で外部変更を確かめ、本文の写しと `DocStamp` を作る。同じ文書の保存が進行中なら、新しい保存は始めない。
+2. ワーカー: `file::save_text(SaveRequest { path, text, format, doc, expect, on_unmappable })`。
+   - `expect`（`DiskExpectation::Unchanged(控え)`／`Absent`／`Any`）を確かめる。食い違えば何も書かずに `Error::ExternalChange`。
+   - 同じディレクトリの一時ファイルへ、文字コードに変換しながら書く（BOM と UTF-16 のバイト順は明示的に処理する。改行は変換しない）。
+   - 変換できない文字があれば、一時ファイルを捨てて `SaveOutcome::Unmappable { chars }`（文字・バイト位置・行・列の一覧。既定で 1000 件まで）を返す。**元ファイルには触れていない。** UI が確認し、利用者が承知したら `on_unmappable: OnUnmappable::Replace`（`?` に置換）で呼び直す。
+   - 置換の直前にもう一度 `expect` を確かめ、`ReplaceMode::PreserveMetadata` で置換する。`SaveOutcome::Saved { doc, disk, bytes_written }` を返す。
+3. UI: 文書が開いていれば `record_saved(保存した版, パス, 新しい FileStamp)`。対応する復元データ（保存した版以前）を削除する。失敗したら表示し（原因は `file::classify`）、元ファイルと編集中の内容はそのまま残す。
+4. 外部変更を知ったうえで上書きする・別名で保存する場合は、UI が利用者に確認してから `DiskExpectation::Any` を渡す。
 
 AI による保存（次の版）も同じコマンドを通る。巨大モードと、外部変更を検知した文書は `Save` の機能がないので拒否される。
 

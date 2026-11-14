@@ -18,6 +18,30 @@
 //! ここに定義済みの型（[`Encoding`]、[`Eol`]、[`TextFormat`]）は他のモジュールと
 //! 共有する取り決めなので、既存の公開項目を変える場合は報告すること。追加は自由。
 
+//!
+//! ## 提供する処理（タスク A）
+//!
+//! - [`detect`] — 文字コードの判定（根拠 [`DetectReason`] と信頼度 [`Confidence`] つき）。
+//! - [`decode`] — バイト列 → UTF-8。不正なバイトは U+FFFD に置き換えて
+//!   [`InvalidBytes`] で報告する。往復でバイト列が一致するかも返す。
+//! - [`EolStats`] — 改行の数。最も多い形式を [`TextFormat::eol`] にする。
+//! - [`encode_to`]／[`encode`] — UTF-8 → 元の文字コード・BOM。改行は変換しない。
+//! - [`find_unmappable`]／[`can_encode`] — 変換できない文字の位置（行・列）と一覧。
+//!
+//! CP932 の機種依存文字・外字・重複文字の扱いは [`encode`](mod@encode) の説明にまとめた。
+
+mod decode;
+mod detect;
+pub mod encode;
+mod eol;
+
+pub use decode::{decode, Decoded, InvalidBytes};
+pub use detect::{detect, has_bom, Confidence, DetectReason, Detection};
+pub use encode::{
+    can_encode, encode, encode_to, find_unmappable, OnUnmappable, Unmappable, REPLACEMENT_BYTE,
+};
+pub use eol::{normalize_eol, EolStats};
+
 /// 通常編集で扱う文字コード。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Encoding {
