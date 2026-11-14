@@ -10,6 +10,8 @@ fn main() {
     let sci = Path::new("third_party/scintilla");
     let lex = Path::new("third_party/lexilla");
     println!("cargo:rerun-if-changed=third_party");
+    println!("cargo:rerun-if-changed=res");
+    embed_manifest();
 
     let mut b = cc::Build::new();
     b.cpp(true)
@@ -61,4 +63,27 @@ fn main() {
     ] {
         println!("cargo:rustc-link-lib={lib}");
     }
+}
+
+/// アプリケーションマニフェスト（コモンコントロール v6、PerMonitorV2、長いパス）を EXE に埋め込む。
+fn embed_manifest() {
+    if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() != Ok("gnu") {
+        return;
+    }
+    let out = std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap()).join("linote_res.o");
+    let windres = std::env::var("WINDRES").unwrap_or_else(|_| "x86_64-w64-mingw32-windres".into());
+    let status = std::process::Command::new(windres)
+        .args([
+            "--input",
+            "res/linote.rc",
+            "--output-format=coff",
+            "--include-dir",
+            "res",
+            "--output",
+        ])
+        .arg(&out)
+        .status()
+        .expect("run windres");
+    assert!(status.success(), "windres failed");
+    println!("cargo:rustc-link-arg-bins={}", out.display());
 }

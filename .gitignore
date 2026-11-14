@@ -1,4 +1,4 @@
-/target
-/dist
 *.log
 /.claude/worktrees/
+/dist
+/target
