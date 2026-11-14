@@ -7,6 +7,13 @@ use std::ffi::{c_char, c_int, c_void};
 
 // --- メッセージ ---
 pub const SCI_GETLENGTH: u32 = 2006;
+pub const SCI_SELECTALL: u32 = 2013;
+pub const SCI_CANPASTE: u32 = 2173;
+pub const SCI_CUT: u32 = 2177;
+pub const SCI_COPY: u32 = 2178;
+pub const SCI_PASTE: u32 = 2179;
+pub const SCI_SETRECTANGULARSELECTIONMODIFIER: u32 = 2598;
+pub const SCMOD_ALT: usize = 4;
 pub const SCI_GETCHARAT: u32 = 2007;
 pub const SCI_GETCURRENTPOS: u32 = 2008;
 pub const SCI_GETANCHOR: u32 = 2009;

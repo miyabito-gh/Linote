@@ -234,6 +234,7 @@ impl Editor {
         // 矩形選択（Alt＋ドラッグ、Alt＋Shift＋矢印）と、その上での一括入力。
         self.send(SCI_SETMULTIPLESELECTION, 1, 0);
         self.send(SCI_SETADDITIONALSELECTIONTYPING, 1, 0);
+        self.send(SCI_SETRECTANGULARSELECTIONMODIFIER, SCMOD_ALT, 0);
         self.send(SCI_SETMOUSESELECTIONRECTANGULARSWITCH, 1, 0);
         self.send(SCI_SETVIRTUALSPACEOPTIONS, SCVS_RECTANGULARSELECTION, 0);
         // 余白: 0 番を行番号、1 番（記号）は使わない。
@@ -499,6 +500,26 @@ impl Editor {
 
     pub fn is_rectangular_selection(&self) -> bool {
         self.send(SCI_GETSELECTIONMODE, 0, 0) as usize == SC_SEL_RECTANGLE
+    }
+
+    pub fn select_all(&self) {
+        self.send(SCI_SELECTALL, 0, 0);
+    }
+
+    pub fn cut(&self) {
+        self.send(SCI_CUT, 0, 0);
+    }
+
+    pub fn copy(&self) {
+        self.send(SCI_COPY, 0, 0);
+    }
+
+    pub fn paste(&self) {
+        self.send(SCI_PASTE, 0, 0);
+    }
+
+    pub fn can_paste(&self) -> bool {
+        self.send(SCI_CANPASTE, 0, 0) != 0
     }
 
     pub fn scroll_caret(&self) {

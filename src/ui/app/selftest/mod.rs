@@ -7,6 +7,7 @@
 //!
 //! 戻り値: [`PASSED`]、[`FAILED`]、または画面を作れない環境で [`UNAVAILABLE`]。
 
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -20,14 +21,24 @@ use super::{
     message_loop, start, with_app, App, DocView, RunOptions, UiMessage, FILE_CLOSE, FILE_NEW,
     VIEW_ACTIVATE, VIEW_NEXT_TAB,
 };
-use crate::appdata::ThemeMode;
+use crate::appdata::{AppPaths, ThemeMode};
 use crate::command::{CommandDef, CommandId, Effect, Invocation, Registry, TargetKind, Value};
 use crate::core::{Actor, Error, TargetRef};
 use crate::document::{
     Capabilities, Capability, DocumentKind, DocumentState, EditTarget, Selection, TextRange,
     TextSource,
 };
+use crate::ui::dialogs::ScriptedPrompts;
 use crate::ui::editor::Language;
+
+mod integration;
+
+/// 統合の試験の道具立て。
+pub(crate) struct Ctx {
+    pub dir: std::path::PathBuf,
+    pub paths: AppPaths,
+    pub prompts: Rc<ScriptedPrompts>,
+}
 
 pub const PASSED: i32 = 0;
 pub const FAILED: i32 = 1;
@@ -80,22 +91,44 @@ fn text_of(app: &mut App, id: crate::core::DocumentId) -> String {
 /// 自己診断を行い、結果のコードを返す。標準エラーに経過を書く。
 pub fn run_self_test() -> i32 {
     crate::platform::system::enable_per_monitor_dpi();
+    // データ（設定・メモ・復元データ）は試験用の場所に置く。
+    let dir = std::env::temp_dir().join(format!(
+        "linote-selftest-{}-{}",
+        std::process::id(),
+        crate::core::MemoId::generate()
+    ));
+    let paths = AppPaths::with_root(dir.join("data"));
+    if std::fs::create_dir_all(&dir).is_err() {
+        eprintln!("self-test: 作業用のフォルダーを作れません");
+        return UNAVAILABLE;
+    }
     let options = RunOptions {
-        theme: ThemeMode::Dark,
+        theme: Some(ThemeMode::Dark),
+        paths: Some(paths.clone()),
         ..Default::default()
     };
     if let Err(e) = start(options) {
         eprintln!("self-test: 画面を作れません: {e}");
         return UNAVAILABLE;
     }
+    // 利用者への確認は台本どおりに答える。
+    let prompts = Rc::new(ScriptedPrompts::new());
+    with_app(|app| app.set_prompts(prompts.clone()));
+    let ctx = Ctx {
+        dir: dir.clone(),
+        paths,
+        prompts,
+    };
     let result = with_app(checks_basic)
         .unwrap_or_else(|| Err("アプリを借りられません".into()))
         .and_then(|()| check_ui_channel())
         .and_then(|()| with_app(checks_commands).unwrap_or_else(|| Err("借用".into())))
         .and_then(|()| with_app(checks_close).unwrap_or_else(|| Err("借用".into())))
-        .and_then(|()| with_app(checks_misc).unwrap_or_else(|| Err("借用".into())));
+        .and_then(|()| with_app(checks_misc).unwrap_or_else(|| Err("借用".into())))
+        .and_then(|()| integration::run(&ctx));
     with_app(|app| app.force_exit());
     let code = message_loop();
+    let _ = std::fs::remove_dir_all(&dir);
     match result {
         Ok(()) if code == 0 => {
             eprintln!("self-test: ok");
@@ -265,6 +298,7 @@ fn check_ui_channel() -> Check {
 fn checks_commands(app: &mut App) -> Check {
     let mut registry: Registry<App> = Registry::new();
     super::register(&mut registry).map_err(e2s)?;
+    super::commands::register(&mut registry).map_err(e2s)?;
     registry
         .register(TEST_APPEND, |app, call| {
             let id = call.document()?;
@@ -326,7 +360,7 @@ fn checks_commands(app: &mut App) -> Check {
 }
 
 fn checks_close(app: &mut App) -> Check {
-    // 未保存の文書は、確認のフックが断れば閉じない（既定のフックは断る）。
+    // 未保存の文書は、確認で取り消せば閉じない（台本の既定は取り消し）。
     let dirty = app.active_id().unwrap();
     check!(app.state(dirty).unwrap().is_dirty(), "未保存の文書");
     let r =
@@ -336,7 +370,6 @@ fn checks_close(app: &mut App) -> Check {
         "未保存の文書を確認なしで閉じた"
     );
     check!(app.state(dirty).is_some(), "閉じていない");
-    check!(app.status_message().is_some(), "状態表示");
 
     // 強制なら閉じ、隣のタブがアクティブになる。
     let n = app.documents().len();
@@ -364,56 +397,6 @@ fn checks_close(app: &mut App) -> Check {
 }
 
 fn checks_misc(app: &mut App) -> Check {
-    // 仮の入出力で保存し、もう一度開くと同じ文書になる。
-    let dir = std::env::temp_dir().join(format!(
-        "linote-selftest-{}-{}",
-        std::process::id(),
-        crate::core::MemoId::generate()
-    ));
-    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let path = dir.join("saved.md");
-    let id = app.active_id().unwrap();
-    app.with_text(id, |ed| ed.set_text("# 見出し\n本文\n"))
-        .map_err(e2s)?;
-    app.save_stub(id, Some(path.clone())).map_err(e2s)?;
-    let st = app.state(id).unwrap();
-    check!(!st.is_dirty(), "保存後は未変更");
-    check!(
-        *st.kind() == DocumentKind::File,
-        "保存で通常のファイルになる"
-    );
-    check!(
-        app.document(id).unwrap().language == Language::Markdown,
-        "言語"
-    );
-    check!(app.document(id).unwrap().title == "saved.md", "題名");
-    check!(
-        std::fs::read_to_string(&path).map_err(|e| e.to_string())? == "# 見出し\n本文\n",
-        "保存した内容"
-    );
-    // 保存後の編集を Undo すると、保存位置で未変更に戻る。
-    app.with_text(id, |ed| ed.replace(TextRange::at(0), "x"))
-        .map_err(e2s)?
-        .map_err(e2s)?;
-    check!(app.state(id).unwrap().is_dirty(), "保存後の編集");
-    app.with_text(id, |ed| ed.undo()).map_err(e2s)?;
-    check!(!app.state(id).unwrap().is_dirty(), "保存位置への Undo");
-    let again = app.open_path_stub(&path).map_err(e2s)?;
-    check!(again == id, "同じファイルは同じタブ");
-
-    // 別のファイルとして開き直すと、読み込んだ本文と形式が入る。
-    let other = dir.join("b.txt");
-    std::fs::write(&other, "a\nb\n").map_err(|e| e.to_string())?;
-    let b = app.open_path_stub(&other).map_err(e2s)?;
-    check!(
-        app.state(b).unwrap().format.eol == crate::text::Eol::Lf,
-        "改行形式"
-    );
-    check!(app.editor().text() == "a\nb\n", "開いた本文");
-    check!(app.status.info().eol == "LF", "ステータスバーの改行");
-    check!(app.status.info().line == 1, "ステータスバーの行");
-    let _ = std::fs::remove_dir_all(&dir);
-
     // テーマの切り替え。
     app.set_theme_mode(ThemeMode::Light);
     check!(!app.theme().dark, "ライトテーマ");

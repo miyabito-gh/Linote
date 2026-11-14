@@ -24,13 +24,19 @@
 //!
 //! 担当: タスク B（統合は I1）。
 
+mod closing;
+mod commands;
+mod fileio;
+mod memos;
+mod recover;
 pub mod selftest;
-pub mod stub_io;
 
 use std::cell::{Cell, RefCell};
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::Instant;
 
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
@@ -45,14 +51,14 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::WindowsAndMessaging::{
     DestroyWindow, DispatchMessageW, GetClientRect, GetCursorPos, GetMessageW, IsWindow, KillTimer,
     LoadCursorW, PostMessageW, PostQuitMessage, SendMessageW, SetCursor, SetTimer, SetWindowPos,
-    SetWindowTextW, ShowWindow, TranslateMessage, HTCLIENT, IDC_SIZEWE, MSG, SWP_NOACTIVATE,
+    SetWindowTextW, ShowWindow, TranslateMessage, HMENU, HTCLIENT, IDC_SIZEWE, MSG, SWP_NOACTIVATE,
     SWP_NOZORDER, SW_HIDE, SW_SHOW, SW_SHOWDEFAULT, WM_ACTIVATE, WM_CAPTURECHANGED, WM_CLOSE,
-    WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP,
-    WM_MBUTTONUP, WM_MOUSEMOVE, WM_NOTIFY, WM_PAINT, WM_SETCURSOR, WM_SETFOCUS, WM_SETTINGCHANGE,
-    WM_SIZE, WM_TIMER,
+    WM_COMMAND, WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND, WM_HOTKEY, WM_INITMENUPOPUP,
+    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONUP, WM_MOUSEMOVE, WM_NOTIFY,
+    WM_PAINT, WM_SETCURSOR, WM_SETFOCUS, WM_SETTINGCHANGE, WM_SIZE, WM_TIMER,
 };
 
-use crate::appdata::ThemeMode;
+use crate::appdata::{AppPaths, Settings, ThemeMode};
 use crate::command::{
     Call, CommandDef, CommandHost, CommandId, CommandOutput, Invocation, ParamDef, ParamType,
     Registry, TargetKind, Value,
@@ -63,8 +69,14 @@ use crate::core::{
 };
 use crate::document::{Capabilities, Capability, DocumentState};
 use crate::file::FileStamp;
+use crate::memo::MemoTab;
+use crate::platform::hotkey::GlobalHotkey;
 use crate::platform::system;
+use crate::recovery::RecoverySlot;
+use crate::ui::dialogs::{Prompts, Win32Prompts};
 use crate::ui::editor::{self, DocLoader, Editor, EditorEvent, Language, SciDoc, ViewState};
+use crate::ui::memo_panel::MemoPanel;
+use crate::ui::menu::{KeyMap, MenuModel};
 use crate::ui::statusbar::{MessageKind, StatusBar, StatusInfo, StatusSegment};
 use crate::ui::tabs::{TabBar, TabHit, TabItem};
 use crate::ui::theme::Theme;
@@ -74,6 +86,10 @@ use crate::ui::window::{self, Layout, UiFont, WM_APP_REPAINT, WM_APP_WAKE};
 const TIMER_STATUS: usize = 1;
 /// 状態表示を出しておく時間（ミリ秒）。
 const STATUS_MESSAGE_MS: u32 = 5000;
+/// 復元データ・メモの書き出しの時刻を見るタイマー（統合 I1 が使う。100 以降）。
+const TIMER_AUTOSAVE: usize = 110;
+/// 書き出しの時刻を見る間隔（ミリ秒）。
+const AUTOSAVE_TICK_MS: u32 = 500;
 
 // ------------------------------------------------------------------ メッセージ
 
@@ -113,9 +129,44 @@ pub struct OpenDoc {
     /// 対応していなければ `SCN_SAVEPOINTREACHED` を無視する（保存していない内容を
     /// 未変更と見なさないため）。
     savepoint_valid: bool,
+    /// 読み込みで不正なバイトを U+FFFD に置き換えた（上書き保存の前に確認する）。
+    lossy: bool,
+    /// 復元データの枠（初めて書くときに開く。復元した文書は引き継ぐ）。
+    slot: Option<Arc<RecoverySlot>>,
+    /// メモを開いている文書の、保存領域との対応。
+    memo: Option<MemoTab>,
+    /// 書き出していない編集（最初の編集, 最後の編集）。復元データ・メモの自動保存が使う。
+    pending: Option<(Instant, Instant)>,
+    /// 復元データ・メモの書き出しが進行中。
+    write_in_flight: bool,
+    /// 保存（ファイルへの書き出し）が進行中。
+    saving: bool,
 }
 
 impl OpenDoc {
+    fn new(
+        state: DocumentState,
+        title: String,
+        language: Language,
+        view: DocView,
+        savepoint_valid: bool,
+    ) -> OpenDoc {
+        OpenDoc {
+            state,
+            title,
+            language,
+            view,
+            view_state: ViewState::default(),
+            savepoint_valid,
+            lossy: false,
+            slot: None,
+            memo: None,
+            pending: None,
+            write_in_flight: false,
+            saving: false,
+        }
+    }
+
     pub fn id(&self) -> DocumentId {
         self.state.id()
     }
@@ -142,9 +193,9 @@ pub struct Hooks {
     /// メッセージループで `TranslateMessage` の前に呼ぶ。`true` を返すと、そのメッセージは
     /// 処理済み（ショートカットキーなど）。
     pub pre_translate: Option<fn(&mut App, &MSG) -> bool>,
-    /// 未保存の文書を閉じてよいか（確認ダイアログ）。既定は閉じない（状態表示で知らせる）。
+    /// 未保存の文書を閉じてよいか（確認ダイアログ。既定は保存／保存しない／取り消しの確認）。
     pub confirm_close: fn(&mut App, DocumentId) -> bool,
-    /// 未保存の文書があるときに終了してよいか。既定は終了しない。
+    /// 未保存の文書があるときに終了してよいか（既定は文書ごとの確認）。
     pub confirm_exit: fn(&mut App) -> bool,
     /// ステータスバーの項目がクリックされた。
     pub status_click: Option<fn(&mut App, StatusSegment)>,
@@ -160,29 +211,13 @@ pub struct Hooks {
     pub window_activated: Option<fn(&mut App, bool)>,
 }
 
-fn refuse_dirty_close(app: &mut App, _: DocumentId) -> bool {
-    app.set_status(
-        "未保存の変更があるため閉じませんでした",
-        MessageKind::Warning,
-    );
-    false
-}
-
-fn refuse_dirty_exit(app: &mut App) -> bool {
-    app.set_status(
-        "未保存の文書があるため終了しませんでした",
-        MessageKind::Warning,
-    );
-    false
-}
-
 impl Default for Hooks {
     fn default() -> Self {
         Hooks {
             message: None,
             pre_translate: None,
-            confirm_close: refuse_dirty_close,
-            confirm_exit: refuse_dirty_exit,
+            confirm_close: fileio::confirm_close,
+            confirm_exit: fileio::confirm_exit,
             status_click: None,
             theme_changed: None,
             document_changed: None,
@@ -194,22 +229,16 @@ impl Default for Hooks {
 }
 
 /// [`run`] の指定。
+#[derive(Default)]
 pub struct RunOptions {
     /// 起動時に開くファイル。空なら新しい空の文書を 1 つ開く。
     pub files: Vec<PathBuf>,
-    pub theme: ThemeMode,
+    /// 明暗の指定。`None` なら設定ファイルの値（なければ Windows に合わせる）。
+    pub theme: Option<ThemeMode>,
+    /// データ（設定・メモ・復元データ）の保存場所。`None` なら環境から決める。
+    pub paths: Option<AppPaths>,
     /// ウィンドウを作った後、表示する前に呼ぶ（コマンドの登録、フック、メニューの設定）。
     pub setup: Option<SetupFn>,
-}
-
-impl Default for RunOptions {
-    fn default() -> Self {
-        RunOptions {
-            files: Vec::new(),
-            theme: ThemeMode::System,
-            setup: None,
-        }
-    }
 }
 
 struct EditSession {
@@ -260,6 +289,23 @@ pub struct App {
     tracking_mouse: bool,
     dragging_splitter: bool,
     exit_without_confirmation: bool,
+    /// データの保存場所（決められなければ `None`。メモ・復元・設定の保存は使えない）。
+    paths: Option<AppPaths>,
+    settings: Settings,
+    settings_state: fileio::SettingsState,
+    prompts: Rc<dyn Prompts>,
+    keymap: KeyMap,
+    menu: Option<MenuModel>,
+    hotkey: Option<GlobalHotkey>,
+    memo_panel: Option<MemoPanel>,
+    /// 終了時に「保存しない」と選んだ文書（確認を繰り返さない。破棄は終了の間際）。
+    exit_discard: HashMap<DocumentId, Version>,
+    /// 読み込み中のパス（二重に開かない）。
+    opening: HashSet<PathBuf>,
+    autosave_timer: bool,
+    clipboard_counter: u32,
+    /// 起動時に分かった問題（表示する前にまとめて知らせる）。
+    startup_notes: Vec<String>,
     /// 統合側が差し込む処理。
     pub hooks: Hooks,
 }
@@ -271,6 +317,9 @@ thread_local! {
     /// このスレッドの編集欄のウィンドウ（通知の送り元の確認用）。
     static EDITORS: RefCell<Vec<isize>> = const { RefCell::new(Vec::new()) };
     static REPAINT_PENDING: Cell<bool> = const { Cell::new(false) };
+    /// アプリを借りられない間に届いた「ワーカーの結果が届いた」知らせ（借用が終わったら
+    /// もう一度投函する。モーダルなダイアログの間に取りこぼさないため）。
+    static WAKE_PENDING: Cell<bool> = const { Cell::new(false) };
 }
 
 /// アプリの状態を借りて処理する。アプリがない、または既に借りられている（再入）なら
@@ -288,6 +337,12 @@ pub fn with_app<R>(f: impl FnOnce(&mut App) -> R) -> Option<R> {
         // SAFETY: 自分のウィンドウを描き直す。
         unsafe {
             let _ = InvalidateRect(Some(hwnd), None, false);
+        }
+    }
+    if WAKE_PENDING.with(|p| p.replace(false)) {
+        // SAFETY: 自分のウィンドウへの投函。
+        unsafe {
+            let _ = PostMessageW(Some(hwnd), WM_APP_WAKE, WPARAM(0), LPARAM(0));
         }
     }
     Some(r)
@@ -345,6 +400,9 @@ pub(crate) fn dispatch(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> 
         _ => match with_app(|app| app.handle(msg, wparam, lparam)) {
             Some(result) => result,
             None => {
+                if msg == WM_APP_WAKE {
+                    WAKE_PENDING.with(|p| p.set(true));
+                }
                 if msg == WM_PAINT {
                     REPAINT_PENDING.with(|p| p.set(true));
                     // 外側の処理がアプリを返さないまま終わった場合に備えて、後で描き直す。
@@ -382,7 +440,10 @@ pub fn start(options: RunOptions) -> Result<()> {
     window::register_main_class(instance)?;
     editor::register_classes(instance)?;
     let hwnd = window::create_main_window(instance)?;
-    let app = match App::new(hwnd, instance, options.theme) {
+    let paths = options.paths.clone().or_else(|| AppPaths::from_env().ok());
+    let (settings, settings_state) = fileio::load_settings(paths.as_ref());
+    let theme_mode = options.theme.unwrap_or(settings.theme);
+    let app = match App::new(hwnd, instance, theme_mode, paths, settings, settings_state) {
         Ok(app) => app,
         Err(e) => {
             // SAFETY: 作ったばかりのウィンドウ。アプリはまだないので既定の処理になる。
@@ -396,21 +457,19 @@ pub fn start(options: RunOptions) -> Result<()> {
     let RunOptions { files, setup, .. } = options;
     with_app(|app| {
         app.relayout();
-        let mut opened = false;
-        for path in &files {
-            match app.open_path_stub(path) {
-                Ok(_) => opened = true,
-                Err(e) => app.set_status(&format!("{}: {e}", path.display()), MessageKind::Warning),
-            }
-        }
-        if !opened {
+        app.install_menu();
+        if files.is_empty() {
             if let Err(e) = app.new_untitled() {
                 app.set_status(&e.to_string(), MessageKind::Warning);
             }
         }
+        for path in &files {
+            app.open_path(path);
+        }
         if let Some(setup) = setup {
             setup(app);
         }
+        app.startup_notices();
     })
     .ok_or_else(|| Error::Internal("アプリの状態を用意できませんでした".into()))?;
     // SAFETY: 自分のウィンドウを表示する。
@@ -418,7 +477,12 @@ pub fn start(options: RunOptions) -> Result<()> {
         let _ = ShowWindow(hwnd, SW_SHOWDEFAULT);
         let _ = UpdateWindow(hwnd);
     }
-    with_app(|app| app.focus_active());
+    with_app(|app| {
+        app.focus_active();
+        // 表示した後で、ワーカーに復元データを探させ、グローバルショートカットを登録する。
+        app.init_hotkey();
+        app.start_recovery_scan();
+    });
     Ok(())
 }
 
@@ -431,9 +495,12 @@ pub fn message_loop() -> i32 {
         if r.0 == 0 || r.0 == -1 {
             break;
         }
-        let handled = with_app(|app| match app.hooks.pre_translate {
-            Some(f) => f(app, &msg),
-            None => false,
+        let handled = with_app(|app| {
+            app.translate_shortcut(&msg)
+                || match app.hooks.pre_translate {
+                    Some(f) => f(app, &msg),
+                    None => false,
+                }
         })
         .unwrap_or(false);
         if handled {
@@ -457,7 +524,14 @@ pub fn is_running() -> bool {
 }
 
 impl App {
-    fn new(hwnd: HWND, instance: HINSTANCE, theme_mode: ThemeMode) -> Result<App> {
+    fn new(
+        hwnd: HWND,
+        instance: HINSTANCE,
+        theme_mode: ThemeMode,
+        paths: Option<AppPaths>,
+        settings: Settings,
+        settings_state: fileio::SettingsState,
+    ) -> Result<App> {
         let editor = Editor::create(hwnd, instance, window::ID_EDITOR, true)?;
         register_editor_hwnd(editor.hwnd());
         let dpi = system::dpi_for_window(hwnd);
@@ -478,6 +552,7 @@ impl App {
         }));
         let mut registry = Registry::new();
         register(&mut registry)?;
+        commands::register(&mut registry)?;
         let app = App {
             hwnd,
             instance,
@@ -503,6 +578,19 @@ impl App {
             tracking_mouse: false,
             dragging_splitter: false,
             exit_without_confirmation: false,
+            paths,
+            settings,
+            settings_state,
+            prompts: Rc::new(Win32Prompts),
+            keymap: KeyMap::default(),
+            menu: None,
+            hotkey: None,
+            memo_panel: None,
+            exit_discard: HashMap::new(),
+            opening: HashSet::new(),
+            autosave_timer: false,
+            clipboard_counter: 0,
+            startup_notes: Vec::new(),
             hooks: Hooks::default(),
         };
         app.editor.apply_theme(&app.theme, Language::PlainText);
@@ -658,6 +746,9 @@ impl App {
         if status_changed {
             self.refresh_status();
         }
+        for &id in &changed_docs {
+            self.note_change(id);
+        }
         if let Some(hook) = self.hooks.document_changed {
             for id in changed_docs {
                 hook(self, id);
@@ -752,14 +843,13 @@ impl App {
         self.sync();
         let savepoint_valid = !state.is_dirty();
         let id = state.id();
-        self.docs.push(OpenDoc {
+        self.docs.push(OpenDoc::new(
             state,
             title,
             language,
-            view: DocView::Scintilla(doc),
-            view_state: ViewState::default(),
+            DocView::Scintilla(doc),
             savepoint_valid,
-        });
+        ));
         if activate || self.active.is_none() {
             self.activate(id)?;
         } else {
@@ -782,64 +872,19 @@ impl App {
             let _ = ShowWindow(hwnd, SW_HIDE);
         }
         let id = state.id();
-        self.docs.push(OpenDoc {
+        self.docs.push(OpenDoc::new(
             state,
             title,
-            language: Language::PlainText,
-            view: DocView::External(hwnd),
-            view_state: ViewState::default(),
-            savepoint_valid: false,
-        });
+            Language::PlainText,
+            DocView::External(hwnd),
+            false,
+        ));
         if activate || self.active.is_none() {
             self.activate(id)?;
         } else {
             self.refresh_tabs();
         }
         Ok(id)
-    }
-
-    /// ファイルを開く（**仮の入出力**: UTF-8 だけ。I1 で `file`／`text` に置き換える）。
-    /// 既に開いていれば、その文書をアクティブにする。
-    pub fn open_path_stub(&mut self, path: &Path) -> Result<DocumentId> {
-        let path = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
-        if let Some(d) = self
-            .docs
-            .iter()
-            .find(|d| d.state.path() == Some(path.as_path()))
-        {
-            let id = d.id();
-            self.activate(id)?;
-            return Ok(id);
-        }
-        let loaded = stub_io::read(&path)?;
-        let title = file_title(&path);
-        let language = Language::from_path(&path);
-        let state = DocumentState::open_file(path, false, loaded.format, loaded.stamp);
-        self.open_text(state, &loaded.text, title, language, true)
-    }
-
-    /// 文書を保存する（**仮の入出力**: UTF-8 だけ、UI スレッドで同期。I1 で
-    /// `file` の保存（ワーカー）に置き換える）。`path` が `None` なら現在のパスへ。
-    pub fn save_stub(&mut self, id: DocumentId, path: Option<PathBuf>) -> Result<()> {
-        let i = self.index_of(id)?;
-        let path = match path {
-            Some(p) => {
-                self.docs[i].state.require(Capability::SaveAs)?;
-                p
-            }
-            None => {
-                self.docs[i].state.require(Capability::Save)?;
-                self.docs[i]
-                    .state
-                    .path()
-                    .map(Path::to_path_buf)
-                    .ok_or_else(|| Error::unsupported("save"))?
-            }
-        };
-        let (stamp, text) = self.text_snapshot(id)?;
-        let format = self.docs[i].state.format;
-        let disk = stub_io::write(&path, &text, &format)?;
-        self.record_saved(id, stamp.version, Some(path), Some(disk))
     }
 
     /// 保存が終わったことを記録する（[`DocumentState::record_saved`]）。保存した版が
@@ -971,6 +1016,8 @@ impl App {
         self.refresh_status();
         self.update_window_title();
         self.focus_active();
+        // 表示した文書のファイルが、ほかで変更されていないか確かめる。
+        self.check_external_change_of(id);
         if let Some(hook) = self.hooks.active_changed {
             hook(self, Some(id));
         }
@@ -1015,6 +1062,11 @@ impl App {
         }
         let i = self.index_of(id)?;
         let doc = self.docs.remove(i);
+        self.exit_discard.remove(&id);
+        // 保存済み・保存しないを選んだ文書の復元データは、ここで破棄する。
+        if let Some(slot) = doc.slot {
+            recover::discard_slot(slot);
+        }
         if let Some(a) = self.active {
             if a > i {
                 self.active = Some(a - 1);
@@ -1257,6 +1309,9 @@ impl App {
             .map(|i| self.docs[i].language)
             .unwrap_or(Language::PlainText);
         self.editor.apply_theme(&self.theme, language);
+        if let Some(panel) = self.memo_panel {
+            panel.set_theme(&self.theme);
+        }
         // SAFETY: ウィンドウ全体を描き直す。
         unsafe {
             let _ = InvalidateRect(Some(self.hwnd), None, false);
@@ -1327,6 +1382,12 @@ impl App {
             }
             WM_ACTIVATE => {
                 let active = (wparam.0 & 0xFFFF) != 0;
+                if active {
+                    // 前面に戻ったとき、表示中の文書のファイルがほかで変更されていないか確かめる。
+                    if let Some(id) = self.active_id() {
+                        self.check_external_change_of(id);
+                    }
+                }
                 if let Some(hook) = self.hooks.window_activated {
                     hook(self, active);
                 }
@@ -1366,6 +1427,22 @@ impl App {
                 }
                 self.relayout();
                 self.editor.update_line_number_margin();
+                if let Some(panel) = self.memo_panel {
+                    panel.set_dpi(self.dpi);
+                }
+                Some(LRESULT(0))
+            }
+            WM_COMMAND if Self::is_menu_command(wparam, lparam) => {
+                self.on_menu_command((wparam.0 & 0xFFFF) as u16)
+                    .then_some(LRESULT(0))
+            }
+            WM_INITMENUPOPUP => {
+                self.on_init_menu_popup(HMENU(wparam.0 as *mut _));
+                Some(LRESULT(0))
+            }
+            WM_HOTKEY => self.on_hotkey(wparam),
+            WM_TIMER if wparam.0 == TIMER_AUTOSAVE => {
+                self.autosave_tick(false);
                 Some(LRESULT(0))
             }
             WM_MOUSEMOVE => {
@@ -1558,6 +1635,10 @@ impl App {
         if self.exit_without_confirmation {
             return true;
         }
+        // メモは尋ねずに保存する。保存できなければ終了しない（内容を失わないため）。
+        if !self.flush_memos_sync() {
+            return false;
+        }
         if self.docs.iter().any(|d| d.state.is_dirty()) {
             let confirm = self.hooks.confirm_exit;
             confirm(self)
@@ -1569,15 +1650,31 @@ impl App {
     /// 終了の前に文書を手放す（WM_DESTROY）。
     fn teardown(&mut self) {
         self.sync();
+        let forced = self.exit_without_confirmation;
+        let discarded = std::mem::take(&mut self.exit_discard);
         for d in std::mem::take(&mut self.docs) {
             if let DocView::Scintilla(s) = d.view {
                 self.editor.release_document(s);
             }
+            // 未保存でなくなった・「保存しない」を選んだ文書の復元データは消す。それ以外
+            // （確認なしの終了）は残し、次の起動で復元を勧める。
+            if let Some(slot) = d.slot {
+                let settled =
+                    !d.state.is_dirty() || discarded.get(&d.state.id()) == Some(&d.state.version());
+                if settled && !forced {
+                    if let Ok(slot) = Arc::try_unwrap(slot) {
+                        let _ = slot.discard();
+                    }
+                }
+            }
         }
+        self.hotkey = None;
+        self.menu = None;
         self.active = None;
         // SAFETY: 自分のタイマーを止める。
         unsafe {
             let _ = KillTimer(Some(self.hwnd), TIMER_STATUS);
+            let _ = KillTimer(Some(self.hwnd), TIMER_AUTOSAVE);
         }
     }
 
@@ -1627,7 +1724,7 @@ impl CommandHost for App {
                 .state(*id)
                 .map(|s| s.version())
                 .ok_or_else(|| Error::not_found(format!("文書 {id}"))),
-            TargetRef::Memo(_) => Err(Error::unsupported("メモの版（メモの統合は I1／E で行う）")),
+            TargetRef::Memo(id) => self.memo_version(id),
         }
     }
 
