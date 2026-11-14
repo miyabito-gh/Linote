@@ -58,6 +58,7 @@ impl App {
         let view = BigView::create(self.hwnd, self.instance, ID_BIGVIEW, false)?;
         view.set_theme(&self.theme);
         view.set_dpi(self.dpi);
+        view.set_line_numbers(self.settings.view.line_numbers);
         let sender = self.sender();
         let state = DocumentState::open_file(
             path.clone(),

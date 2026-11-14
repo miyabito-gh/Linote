@@ -34,6 +34,7 @@ use crate::ui::editor::Language;
 mod integration;
 mod integration_i2;
 mod integration_u1;
+mod integration_u2;
 
 /// 統合の試験の道具立て。
 pub(crate) struct Ctx {

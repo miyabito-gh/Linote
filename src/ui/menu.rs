@@ -19,9 +19,9 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, VK_CONTROL, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreateMenu, CreatePopupMenu, DestroyMenu, DrawMenuBar, EnableMenuItem,
-    ModifyMenuW, SetMenu, HMENU, MF_BYCOMMAND, MF_ENABLED, MF_GRAYED, MF_POPUP, MF_SEPARATOR,
-    MF_STRING,
+    AppendMenuW, CheckMenuItem, CreateMenu, CreatePopupMenu, DestroyMenu, DrawMenuBar,
+    EnableMenuItem, ModifyMenuW, SetMenu, HMENU, MF_BYCOMMAND, MF_CHECKED, MF_ENABLED, MF_GRAYED,
+    MF_POPUP, MF_SEPARATOR, MF_STRING, MF_UNCHECKED,
 };
 
 use crate::appdata::Settings;
@@ -300,6 +300,60 @@ static MENUS: &[MenuDef] = &[
             Item::Cmd(CommandId::new("view.next_tab")),
             Item::Cmd(CommandId::new("view.prev_tab")),
             Item::Separator,
+            Item::Sub(
+                "折り返し(&W)",
+                &[
+                    Item::CmdArg(CommandId::new("view.wrap"), "折り返さない", "mode", "none"),
+                    Item::CmdArg(
+                        CommandId::new("view.wrap"),
+                        "ウィンドウ幅で折り返す（単語単位）",
+                        "mode",
+                        "word",
+                    ),
+                    Item::CmdArg(
+                        CommandId::new("view.wrap"),
+                        "ウィンドウ幅で折り返す（文字単位）",
+                        "mode",
+                        "char",
+                    ),
+                    Item::CmdArg(
+                        CommandId::new("view.wrap"),
+                        "指定した桁で折り返す...",
+                        "mode",
+                        "column",
+                    ),
+                    Item::Separator,
+                    Item::Cmd(CommandId::new("view.toggle_edge_guide")),
+                ],
+            ),
+            Item::Cmd(CommandId::new("view.font")),
+            Item::CmdArg(
+                CommandId::new("view.font"),
+                "既定のフォントに戻す",
+                "font",
+                "",
+            ),
+            Item::Cmd(CommandId::new("view.zoom_in")),
+            Item::Cmd(CommandId::new("view.zoom_out")),
+            Item::Cmd(CommandId::new("view.zoom_reset")),
+            Item::Separator,
+            Item::Cmd(CommandId::new("view.toggle_whitespace")),
+            Item::Cmd(CommandId::new("view.toggle_eol")),
+            Item::Cmd(CommandId::new("view.toggle_line_numbers")),
+            Item::Cmd(CommandId::new("view.toggle_current_line")),
+            Item::Cmd(CommandId::new("view.toggle_braces")),
+            Item::Separator,
+            Item::Sub(
+                "タブ幅(&T)",
+                &[
+                    Item::CmdArg(CommandId::new("view.tab_width"), "2", "width", "2"),
+                    Item::CmdArg(CommandId::new("view.tab_width"), "4", "width", "4"),
+                    Item::CmdArg(CommandId::new("view.tab_width"), "8", "width", "8"),
+                ],
+            ),
+            Item::Cmd(CommandId::new("view.toggle_tab_spaces")),
+            Item::Cmd(CommandId::new("view.toggle_auto_indent")),
+            Item::Separator,
             Item::Cmd(CommandId::new("view.toggle_theme")),
             Item::Separator,
             Item::Cmd(CommandId::new("view.preview_pane")),
@@ -402,6 +456,19 @@ impl MenuModel {
             // SAFETY: 自分のメニューの項目。
             unsafe {
                 let _ = EnableMenuItem(popup, e.id as u32, MF_BYCOMMAND | flag);
+            }
+        }
+    }
+
+    /// 開こうとしているメニューの、印（チェック）を付ける項目の状態を直す。
+    /// `checked` は項目の状態（印を付けない項目は `None`）。
+    pub fn update_checked(&self, popup: HMENU, checked: impl Fn(&MenuEntry) -> Option<bool>) {
+        for e in self.entries.iter().filter(|e| e.popup == popup.0 as isize) {
+            let Some(on) = checked(e) else { continue };
+            let flag = if on { MF_CHECKED } else { MF_UNCHECKED };
+            // SAFETY: 自分のメニューの項目。
+            unsafe {
+                let _ = CheckMenuItem(popup, e.id as u32, (MF_BYCOMMAND | flag).0);
             }
         }
     }

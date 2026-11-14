@@ -8,6 +8,7 @@
 //!   "theme": "system",
 //!   "keys": { "clipboard.new_tab": "Ctrl+Alt+V", "file.save": "" },
 //!   "recent_files": ["C:\\work\\a.txt"],
+//!   "view": { "wrap": "word", "wrap_column": 80, "zoom": 0, "line_numbers": true },
 //!   "mcp": { "enabled": false }
 //! }
 //! ```
@@ -18,6 +19,8 @@
 //!   割り当てをエディタ内とグローバルの両方に使う。
 //! - `recent_files`: 最近使ったファイル（新しい順、最大 [`MAX_RECENT_FILES`] 件）。
 //!   存在確認は読み込みでは行わない（選んだときに確かめる）。
+//! - `view`: 表示の設定（[`ViewSettings`]）。値が不正な項目は既定値にして読む
+//!   （`view` がオブジェクトでなければ壊れているとみなす）。全タブに適用する。
 //! - 知らない項目は読み込んだまま保持し、書き戻すときに失わない
 //!   （新しい版が書いた設定を古い版が消さないため）。
 //! - ファイルがなければ既定値。ファイルは設定を変更して保存するときに初めて作る。
@@ -67,6 +70,166 @@ impl ThemeMode {
     }
 }
 
+/// 折り返しの方法。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WrapMode {
+    /// 折り返さない（既定）。
+    #[default]
+    None,
+    /// ウィンドウ幅で、単語単位に折り返す。
+    Word,
+    /// ウィンドウ幅で、文字単位に折り返す。
+    Char,
+    /// 指定した桁（[`ViewSettings::wrap_column`]）で折り返す。
+    Column,
+}
+
+impl WrapMode {
+    pub const ALL: [WrapMode; 4] = [
+        WrapMode::None,
+        WrapMode::Word,
+        WrapMode::Char,
+        WrapMode::Column,
+    ];
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            WrapMode::None => "none",
+            WrapMode::Word => "word",
+            WrapMode::Char => "char",
+            WrapMode::Column => "column",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|m| m.name() == name)
+    }
+}
+
+/// 折り返し桁の範囲と既定値。
+pub const WRAP_COLUMN_MIN: u32 = 10;
+pub const WRAP_COLUMN_MAX: u32 = 500;
+pub const WRAP_COLUMN_DEFAULT: u32 = 80;
+/// 文字サイズ（ポイント）の範囲と既定値。
+pub const FONT_SIZE_MIN: u32 = 6;
+pub const FONT_SIZE_MAX: u32 = 72;
+pub const FONT_SIZE_DEFAULT: u32 = 11;
+/// 拡大率（Scintilla の `SCI_SETZOOM` と同じ。文字サイズに足すポイント数）の範囲。
+pub const ZOOM_MIN: i32 = -10;
+pub const ZOOM_MAX: i32 = 20;
+
+/// 表示の設定（全タブに適用する）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ViewSettings {
+    pub wrap: WrapMode,
+    /// `wrap` が [`WrapMode::Column`] のときの桁数。
+    pub wrap_column: u32,
+    /// 書体の名前。空は既定（Cascadia Mono → Consolas → MS Gothic の順）。
+    pub font: String,
+    /// 文字サイズ（ポイント）。
+    pub font_size: u32,
+    /// 拡大・縮小（Ctrl+ホイールなど）。
+    pub zoom: i32,
+    pub show_whitespace: bool,
+    pub show_eol: bool,
+    pub line_numbers: bool,
+    pub highlight_current_line: bool,
+    pub highlight_braces: bool,
+    /// 折り返し桁のガイド線（`wrap` が桁指定のときだけ出す）。
+    pub edge_guide: bool,
+    /// タブ幅（2／4／8）。
+    pub tab_width: u32,
+    /// Tab キーでスペースを入力する。
+    pub use_spaces: bool,
+    pub auto_indent: bool,
+}
+
+impl Default for ViewSettings {
+    fn default() -> Self {
+        ViewSettings {
+            wrap: WrapMode::None,
+            wrap_column: WRAP_COLUMN_DEFAULT,
+            font: String::new(),
+            font_size: FONT_SIZE_DEFAULT,
+            zoom: 0,
+            show_whitespace: false,
+            show_eol: false,
+            line_numbers: true,
+            highlight_current_line: true,
+            highlight_braces: true,
+            edge_guide: true,
+            tab_width: 4,
+            use_spaces: false,
+            auto_indent: true,
+        }
+    }
+}
+
+impl ViewSettings {
+    /// 範囲外の値を範囲内に直す。
+    pub fn clamped(mut self) -> Self {
+        self.wrap_column = self.wrap_column.clamp(WRAP_COLUMN_MIN, WRAP_COLUMN_MAX);
+        self.font_size = self.font_size.clamp(FONT_SIZE_MIN, FONT_SIZE_MAX);
+        self.zoom = self.zoom.clamp(ZOOM_MIN, ZOOM_MAX);
+        if ![2, 4, 8].contains(&self.tab_width) {
+            self.tab_width = 4;
+        }
+        self
+    }
+
+    fn from_value(map: &Map<String, Value>) -> Self {
+        let d = ViewSettings::default();
+        let flag = |k: &str, default: bool| map.get(k).and_then(Value::as_bool).unwrap_or(default);
+        let num = |k: &str| map.get(k).and_then(Value::as_i64);
+        ViewSettings {
+            wrap: map
+                .get("wrap")
+                .and_then(Value::as_str)
+                .and_then(WrapMode::from_name)
+                .unwrap_or(d.wrap),
+            wrap_column: num("wrap_column").map_or(d.wrap_column, |n| n.clamp(0, 10_000) as u32),
+            font: map
+                .get("font")
+                .and_then(Value::as_str)
+                .map_or(d.font.clone(), str::to_owned),
+            font_size: num("font_size").map_or(d.font_size, |n| n.clamp(0, 10_000) as u32),
+            zoom: num("zoom").map_or(d.zoom, |n| n.clamp(-1000, 1000) as i32),
+            show_whitespace: flag("show_whitespace", d.show_whitespace),
+            show_eol: flag("show_eol", d.show_eol),
+            line_numbers: flag("line_numbers", d.line_numbers),
+            highlight_current_line: flag("highlight_current_line", d.highlight_current_line),
+            highlight_braces: flag("highlight_braces", d.highlight_braces),
+            edge_guide: flag("edge_guide", d.edge_guide),
+            tab_width: num("tab_width").map_or(d.tab_width, |n| n.clamp(0, 1000) as u32),
+            use_spaces: flag("use_spaces", d.use_spaces),
+            auto_indent: flag("auto_indent", d.auto_indent),
+        }
+        .clamped()
+    }
+
+    fn to_value(&self) -> Map<String, Value> {
+        let mut m = Map::new();
+        m.insert("wrap".into(), self.wrap.name().into());
+        m.insert("wrap_column".into(), self.wrap_column.into());
+        m.insert("font".into(), self.font.as_str().into());
+        m.insert("font_size".into(), self.font_size.into());
+        m.insert("zoom".into(), self.zoom.into());
+        m.insert("show_whitespace".into(), self.show_whitespace.into());
+        m.insert("show_eol".into(), self.show_eol.into());
+        m.insert("line_numbers".into(), self.line_numbers.into());
+        m.insert(
+            "highlight_current_line".into(),
+            self.highlight_current_line.into(),
+        );
+        m.insert("highlight_braces".into(), self.highlight_braces.into());
+        m.insert("edge_guide".into(), self.edge_guide.into());
+        m.insert("tab_width".into(), self.tab_width.into());
+        m.insert("use_spaces".into(), self.use_spaces.into());
+        m.insert("auto_indent".into(), self.auto_indent.into());
+        m
+    }
+}
+
 /// 設定。
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Settings {
@@ -77,6 +240,8 @@ pub struct Settings {
     pub mcp_enabled: bool,
     /// 最近使ったファイル（新しい順）。
     pub recent_files: Vec<String>,
+    /// 表示の設定。
+    pub view: ViewSettings,
     /// このプログラムが知らない項目。読み込んだまま書き戻す。
     extra: Map<String, Value>,
 }
@@ -140,6 +305,12 @@ impl Settings {
                 }
             }
         }
+        if let Some(view) = map.remove("view") {
+            let Value::Object(view) = view else {
+                return Err(corrupt("view がオブジェクトではありません"));
+            };
+            settings.view = ViewSettings::from_value(&view);
+        }
         if let Some(mcp) = map.remove("mcp") {
             let Value::Object(mut mcp) = mcp else {
                 return Err(corrupt("mcp がオブジェクトではありません"));
@@ -181,6 +352,7 @@ impl Settings {
                     .collect(),
             ),
         );
+        map.insert("view".into(), Value::Object(self.view.to_value()));
         let mcp = map
             .entry("mcp")
             .or_insert_with(|| Value::Object(Map::new()));
@@ -287,6 +459,7 @@ mod tests {
             r#"{"version":0}"#,
             r#"{"recent_files":"a"}"#,
             r#"{"recent_files":[1]}"#,
+            r#"{"view":[]}"#,
         ] {
             assert!(
                 matches!(Settings::from_json(bad), Err(Error::Corrupt { .. })),
@@ -309,6 +482,41 @@ mod tests {
         s.remove_recent("C:\\work\\11.txt");
         assert_eq!(s.recent_files[1], "C:\\work\\10.txt");
         assert_eq!(Settings::from_json(&s.to_json()).unwrap(), s);
+    }
+
+    #[test]
+    fn view_settings_round_trip_and_clamp() {
+        let mut s = Settings::default();
+        assert_eq!(s.view, ViewSettings::default());
+        s.view = ViewSettings {
+            wrap: WrapMode::Column,
+            wrap_column: 100,
+            font: "Consolas".into(),
+            font_size: 14,
+            zoom: -3,
+            show_whitespace: true,
+            show_eol: true,
+            line_numbers: false,
+            highlight_current_line: false,
+            highlight_braces: false,
+            edge_guide: false,
+            tab_width: 8,
+            use_spaces: true,
+            auto_indent: false,
+        };
+        assert_eq!(Settings::from_json(&s.to_json()).unwrap(), s);
+
+        // 不正な値は既定値や範囲内に直して読む（設定ファイル全体は壊れていない）。
+        let bad = r#"{"view":{"wrap":"x","wrap_column":3,"font_size":999,"zoom":99,
+            "tab_width":3,"line_numbers":"no","use_spaces":true}}"#;
+        let v = Settings::from_json(bad).unwrap().view;
+        assert_eq!(v.wrap, WrapMode::None);
+        assert_eq!(v.wrap_column, WRAP_COLUMN_MIN);
+        assert_eq!(v.font_size, FONT_SIZE_MAX);
+        assert_eq!(v.zoom, ZOOM_MAX);
+        assert_eq!(v.tab_width, 4);
+        assert!(v.line_numbers);
+        assert!(v.use_spaces);
     }
 
     #[test]

@@ -34,6 +34,7 @@ mod preview;
 mod recover;
 mod search;
 pub mod selftest;
+mod viewopts;
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
@@ -630,6 +631,7 @@ impl App {
             startup_notes: Vec::new(),
             hooks: Hooks::default(),
         };
+        app.editor.apply_view(&app.settings.view);
         app.editor.apply_theme(&app.theme, Language::PlainText);
         // ファイルのドラッグ＆ドロップ（タブバー・状態表示・本文）。本文は Scintilla の
         // ドロップ対象が親へ WM_DROPFILES として転送する（third_party/VENDORED.md を参照）。
@@ -737,6 +739,8 @@ impl App {
         let mut tabs_changed = false;
         let mut status_changed = false;
         let mut margin = false;
+        let mut brace = false;
+        let mut zoom = false;
         let mut changed_docs: Vec<DocumentId> = Vec::new();
         for (doc, event) in events {
             let Some(i) = self
@@ -774,12 +778,30 @@ impl App {
                         tabs_changed = true;
                     }
                 }
-                EditorEvent::UpdateUi { .. } => status_changed |= is_active,
+                EditorEvent::UpdateUi { selection, .. } => {
+                    status_changed |= is_active;
+                    brace |= is_active && selection;
+                }
+                EditorEvent::CharAdded { ch } => {
+                    if is_active
+                        && self.settings.view.auto_indent
+                        && self.editor.is_newline_char(ch)
+                    {
+                        self.editor.auto_indent_after_newline();
+                    }
+                }
+                EditorEvent::Zoom => zoom |= is_active,
                 EditorEvent::SavePointLeft | EditorEvent::FocusIn | EditorEvent::FocusOut => {}
             }
         }
         if margin {
             self.editor.update_line_number_margin();
+        }
+        if brace {
+            self.editor.update_brace_highlight();
+        }
+        if zoom {
+            self.on_zoom_changed();
         }
         if tabs_changed {
             self.refresh_tabs();
@@ -1307,6 +1329,8 @@ impl App {
             }
         };
         place(self.editor.hwnd(), l.editor);
+        // 桁指定の折り返しは、編集欄の幅に合わせて右余白を直す。
+        self.editor.update_wrap_margin();
         for d in &self.docs {
             if let DocView::External(h) = d.view {
                 place(h, l.editor);

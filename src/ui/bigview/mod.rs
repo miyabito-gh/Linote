@@ -170,6 +170,8 @@ struct Inner {
     hwnd: HWND,
     source: Option<Arc<BigFile>>,
     theme: Theme,
+    /// 行番号の欄を出すか（表示の設定の `line_numbers`）。
+    line_numbers: bool,
     dpi: u32,
     force_gdi: bool,
     surface: Option<Surface>,
@@ -462,6 +464,7 @@ impl Inner {
             hwnd,
             source: None,
             theme: Theme::dark(),
+            line_numbers: true,
             dpi: dpi_for_window(hwnd),
             force_gdi: std::env::var_os("LINOTE_BIGVIEW_GDI").is_some(),
             surface: None,
@@ -549,6 +552,10 @@ impl Inner {
     }
 
     fn gutter_w(&self, m: &Metrics) -> f32 {
+        if !self.line_numbers {
+            // 行番号なし: 本文の左の余白だけ。
+            return scale(PAD_X, self.dpi) as f32;
+        }
         let digits = match &self.source {
             Some(s) => gutter_digits(s.index_status().lines.max(1)),
             None => 4,
@@ -1098,6 +1105,9 @@ impl Inner {
             p.text(origin + v.col0 as f32 * m.cell_w, y, &v.text, ed.fg);
         }
         // 行番号欄は本文の左端のはみ出しを隠して描く。
+        if !self.line_numbers {
+            return self.draw_notices(p, gutter, pad);
+        }
         p.fill(0.0, 0.0, gutter, self.height as f32, ed.line_number_bg);
         for (i, rv) in self.rows.iter().enumerate() {
             let y = i as f32 * lh;
@@ -1114,6 +1124,11 @@ impl Inner {
                 ed.line_number_fg,
             );
         }
+        self.draw_notices(p, gutter, pad);
+    }
+
+    /// エラーや「ファイルがありません」の表示。
+    fn draw_notices(&self, p: &mut dyn Painter, gutter: f32, pad: f32) {
         if let Some(msg) = &self.error {
             p.text(gutter + pad, 0.0, msg, self.theme.ui.status_warn);
         } else if self.source.is_none() {
@@ -1121,7 +1136,7 @@ impl Inner {
                 gutter + pad,
                 0.0,
                 "（ファイルがありません）",
-                ed.line_number_fg,
+                self.theme.editor.line_number_fg,
             );
         }
     }
@@ -1536,6 +1551,16 @@ impl BigView {
         });
     }
 
+    /// 行番号の欄を出す・隠す（欄の幅が変わるので表示を作り直す）。
+    pub fn set_line_numbers(&self, show: bool) {
+        with_state(self.hwnd, |s| {
+            if s.line_numbers != show {
+                s.line_numbers = show;
+                s.refresh();
+            }
+        });
+    }
+
     pub fn set_theme(&self, theme: &Theme) {
         with_state(self.hwnd, |s| {
             s.theme = theme.clone();
@@ -1564,6 +1589,15 @@ impl BigView {
             s.surface_tried = false;
             s.refresh();
         });
+    }
+
+    /// 行番号の欄の幅（ピクセル。行番号を隠していれば左の余白だけ）。試験用。
+    pub fn gutter_width(&self) -> i32 {
+        with_state(self.hwnd, |s| {
+            let m = s.metrics_cached();
+            s.gutter_w(&m) as i32
+        })
+        .unwrap_or(0)
     }
 
     /// 使っている描画方式（`"Direct2D"`、`"GDI"`）。

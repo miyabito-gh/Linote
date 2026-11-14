@@ -19,7 +19,9 @@
 
 pub mod language;
 pub mod sci;
+mod viewopts;
 
+use std::cell::RefCell;
 use std::ffi::{c_char, CString};
 use std::sync::OnceLock;
 
@@ -33,6 +35,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WS_CLIPSIBLINGS, WS_HSCROLL, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
 };
 
+use crate::appdata::settings::ViewSettings;
 use crate::core::{Error, Result};
 use crate::document::{EditTarget, LineCount, Selection, TextRange, TextSource};
 use crate::text::Eol;
@@ -44,8 +47,6 @@ use sci::*;
 /// 本文の書体の候補（先に見つかったものを使う）。日本語の字形は DirectWrite の
 /// 代替書体で補われる。
 const FONT_CANDIDATES: [&str; 3] = ["Cascadia Mono", "Consolas", "MS Gothic"];
-/// 本文の文字の大きさ（ポイント×100）。
-const FONT_SIZE_CENTIPOINTS: usize = 1100;
 
 /// Scintilla のウィンドウクラスを登録する（プロセスで 1 回。2 回目以降は何もしない）。
 pub fn register_classes(instance: HINSTANCE) -> Result<()> {
@@ -109,6 +110,12 @@ pub enum EditorEvent {
     },
     FocusIn,
     FocusOut,
+    /// 文字が入力された（自動インデントに使う）。`ch` は入力された文字（改行は `\n`／`\r`）。
+    CharAdded {
+        ch: u32,
+    },
+    /// 拡大率が変わった（Ctrl+ホイールなど）。
+    Zoom,
 }
 
 /// `WM_NOTIFY` の `lParam` を読み、Scintilla の通知なら（送り元、読み替えた通知）を返す。
@@ -149,6 +156,14 @@ pub unsafe fn parse_notification(lparam: LPARAM) -> Option<(HWND, EditorEvent)> 
                 content: n.updated & SC_UPDATE_CONTENT != 0,
             }
         }
+        SCN_CHARADDED => {
+            // SAFETY: 上の説明のとおり。
+            let n = unsafe { &*(lparam.0 as *const ScNotification) };
+            EditorEvent::CharAdded {
+                ch: n.ch.max(0) as u32,
+            }
+        }
+        SCN_ZOOM => EditorEvent::Zoom,
         SCN_FOCUSIN => EditorEvent::FocusIn,
         SCN_FOCUSOUT => EditorEvent::FocusOut,
         _ => return None,
@@ -162,6 +177,8 @@ pub unsafe fn parse_notification(lparam: LPARAM) -> Option<(HWND, EditorEvent)> 
 #[derive(Debug)]
 pub struct Editor {
     hwnd: HWND,
+    /// 適用中の表示設定（書体、折り返し桁、タブ幅など）。
+    view: RefCell<ViewSettings>,
 }
 
 impl Editor {
@@ -190,7 +207,10 @@ impl Editor {
             )
         }
         .map_err(|e| Error::unavailable("編集欄", format!("作れませんでした: {e}")))?;
-        let editor = Editor { hwnd };
+        let editor = Editor {
+            hwnd,
+            view: RefCell::new(ViewSettings::default()),
+        };
         editor.configure();
         Ok(editor)
     }
@@ -311,6 +331,8 @@ impl Editor {
         self.send(SCI_SETDOCPOINTER, 0, doc.0);
         // コードページはドキュメントごとの設定。読み込み口で作った文書にも必ず設定する。
         self.send(SCI_SETCODEPAGE, SC_CP_UTF8, 0);
+        // タブ幅などはドキュメント側の設定なので、切り替えのたびに合わせる。
+        self.apply_document_options();
     }
 
     pub fn add_ref_document(&self, doc: SciDoc) {
@@ -610,14 +632,6 @@ impl Editor {
         self.send(SCI_CONVERTEOLS, mode, 0);
     }
 
-    pub fn set_wrap(&self, wrap: bool) {
-        self.send(
-            SCI_SETWRAPMODE,
-            if wrap { SC_WRAP_WORD } else { SC_WRAP_NONE },
-            0,
-        );
-    }
-
     /// 表示中のドキュメントに字句解析器を設定する（字句解析器はドキュメント側に残る）。
     /// 着色の配色は [`apply_theme`](Self::apply_theme) で別に設定する。
     pub fn set_language(&self, language: Language) {
@@ -653,12 +667,20 @@ impl Editor {
     /// 文書を切り替えたら、その文書の言語でもう一度呼ぶ。
     pub fn apply_theme(&self, theme: &Theme, language: Language) {
         let e = &theme.editor;
-        let font = cstr(editor_font());
+        let (font_name, font_size) = {
+            let v = self.view.borrow();
+            (v.font.clone(), v.font_size)
+        };
+        let font = cstr(if font_name.is_empty() {
+            editor_font()
+        } else {
+            &font_name
+        });
         self.send(SCI_STYLESETFONT, STYLE_DEFAULT, font.as_ptr() as isize);
         self.send(
             SCI_STYLESETSIZEFRACTIONAL,
             STYLE_DEFAULT,
-            FONT_SIZE_CENTIPOINTS as isize,
+            (font_size.max(1) as isize) * 100,
         );
         self.send(SCI_STYLESETFORE, STYLE_DEFAULT, e.fg.colorref() as isize);
         self.send(SCI_STYLESETBACK, STYLE_DEFAULT, e.bg.colorref() as isize);
@@ -717,8 +739,14 @@ impl Editor {
         element(SC_ELEMENT_SELECTION_INACTIVE_BACK, e.inactive_selection_bg);
         element(SC_ELEMENT_CARET, e.caret);
         element(SC_ELEMENT_CARET_ADDITIONAL, e.caret);
-        element(SC_ELEMENT_CARET_LINE_BACK, e.caret_line_bg);
+        // Scintilla 5.4 は、現在行の背景色が設定されていれば強調する。切るときは設定を外す。
+        if self.view.borrow().highlight_current_line {
+            element(SC_ELEMENT_CARET_LINE_BACK, e.caret_line_bg);
+        } else {
+            self.send(SCI_SETCARETLINEVISIBLE, 0, 0);
+        }
         element(SC_ELEMENT_WHITE_SPACE, e.whitespace);
+        self.send(SCI_SETEDGECOLOUR, e.whitespace.colorref() as usize, 0);
         self.send(SCI_SETSELECTIONLAYER, SC_LAYER_BASE, 0);
         self.send(SCI_SETFOLDMARGINCOLOUR, 1, e.bg.colorref() as isize);
         self.send(SCI_SETFOLDMARGINHICOLOUR, 1, e.bg.colorref() as isize);
@@ -727,10 +755,16 @@ impl Editor {
 
     /// 行番号の余白の幅を、行数の桁に合わせる（最低 3 桁。DPI は Scintilla が考慮する）。
     pub fn update_line_number_margin(&self) {
-        let digits = line_number_digits(self.line_count());
-        let sample = cstr(&"9".repeat(digits + 1));
-        let width = self.send(SCI_TEXTWIDTH, STYLE_LINENUMBER, sample.as_ptr() as isize);
-        self.send(SCI_SETMARGINWIDTHN, 0, width);
+        if self.view.borrow().line_numbers {
+            let digits = line_number_digits(self.line_count());
+            let sample = cstr(&"9".repeat(digits + 1));
+            let width = self.send(SCI_TEXTWIDTH, STYLE_LINENUMBER, sample.as_ptr() as isize);
+            self.send(SCI_SETMARGINWIDTHN, 0, width);
+        } else {
+            self.send(SCI_SETMARGINWIDTHN, 0, 0);
+        }
+        // 余白の幅が変わると、桁指定の折り返しの右余白も合わせ直す。
+        self.update_wrap_margin();
     }
 
     /// 編集欄にフォーカスを移す。
@@ -753,6 +787,11 @@ pub fn line_number_digits(lines: u64) -> usize {
 fn cstr(s: &str) -> CString {
     // 定数とテーマの名前だけを渡すので NUL を含まない。含んでいたら空にする。
     CString::new(s).unwrap_or_default()
+}
+
+/// 既定の本文の書体の名前（候補のうち最初にインストールされているもの）。
+pub fn default_font_name() -> &'static str {
+    editor_font()
 }
 
 /// 本文の書体（候補のうち最初にインストールされているもの）。

@@ -94,6 +94,7 @@ pub(super) fn run(ctx: &Ctx) -> Check {
     menu_keys_and_settings(ctx)?;
     super::integration_i2::run(ctx)?;
     super::integration_u1::run(ctx)?;
+    super::integration_u2::run(ctx)?;
     Ok(())
 }
 

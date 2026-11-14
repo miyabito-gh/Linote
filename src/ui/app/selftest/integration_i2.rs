@@ -312,7 +312,7 @@ fn check_active_is_not(app: &App, id: DocumentId) -> Check {
     Ok(())
 }
 
-fn write_numbered_lines(path: &std::path::Path, n: usize) -> Check {
+pub(super) fn write_numbered_lines(path: &std::path::Path, n: usize) -> Check {
     let mut text = String::new();
     for i in 1..=n {
         text.push_str(&format!("line {i} some text\n"));
@@ -320,7 +320,7 @@ fn write_numbered_lines(path: &std::path::Path, n: usize) -> Check {
     std::fs::write(path, text).map_err(|e| e.to_string())
 }
 
-fn find_big(app: &App, path: &std::path::Path) -> Option<DocumentId> {
+pub(super) fn find_big(app: &App, path: &std::path::Path) -> Option<DocumentId> {
     app.documents()
         .iter()
         .find(|d| d.state.path() == Some(path))

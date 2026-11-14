@@ -15,10 +15,12 @@ use std::path::{Path, PathBuf};
 
 use windows::core::{PCWSTR, PWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+use windows::Win32::Graphics::Gdi::{DEFAULT_CHARSET, LOGFONTW};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Controls::Dialogs::{
-    GetOpenFileNameW, GetSaveFileNameW, OFN_ALLOWMULTISELECT, OFN_EXPLORER, OFN_FILEMUSTEXIST,
-    OFN_HIDEREADONLY, OFN_OVERWRITEPROMPT, OFN_PATHMUSTEXIST, OPENFILENAMEW,
+    ChooseFontW, GetOpenFileNameW, GetSaveFileNameW, CF_FORCEFONTEXIST, CF_INITTOLOGFONTSTRUCT,
+    CF_LIMITSIZE, CF_NOVERTFONTS, CF_SCREENFONTS, CHOOSEFONTW, OFN_ALLOWMULTISELECT, OFN_EXPLORER,
+    OFN_FILEMUSTEXIST, OFN_HIDEREADONLY, OFN_OVERWRITEPROMPT, OFN_PATHMUSTEXIST, OPENFILENAMEW,
 };
 use windows::Win32::UI::Controls::EM_SETSEL;
 use windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
@@ -28,6 +30,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     MB_OK, MB_YESNO, MB_YESNOCANCEL, WM_COMMAND, WM_INITDIALOG,
 };
 
+use crate::appdata::settings::{FONT_SIZE_MAX, FONT_SIZE_MIN};
 use crate::platform::system::{from_wide, os_from_wide, to_wide};
 
 /// 未保存の文書を閉じるときの利用者の選択。
@@ -78,6 +81,9 @@ pub trait Prompts {
     fn restore_choice(&self, owner: HWND, text: &str) -> RestoreChoice;
     /// 1 行の入力（行ジャンプ、名前の変更）。取り消しは `None`。
     fn input_text(&self, owner: HWND, caption: &str, label: &str, initial: &str) -> Option<String>;
+    /// フォント選択ダイアログ。現在の書体とポイント数を初期値にし、選んだ（書体、ポイント数）を
+    /// 返す。取り消しは `None`。
+    fn choose_font(&self, owner: HWND, current: &str, points: u32) -> Option<(String, u32)>;
 }
 
 // ------------------------------------------------------------------ 台本つきの実装
@@ -93,6 +99,7 @@ pub struct ScriptedPrompts {
     pub confirm: RefCell<VecDeque<bool>>,
     pub restore: RefCell<VecDeque<RestoreChoice>>,
     pub input: RefCell<VecDeque<Option<String>>>,
+    pub font: RefCell<VecDeque<Option<(String, u32)>>>,
     /// 見せた文面（種類と本文）。
     pub shown: RefCell<Vec<String>>,
 }
@@ -145,6 +152,11 @@ impl Prompts for ScriptedPrompts {
     fn input_text(&self, _: HWND, _: &str, label: &str, _: &str) -> Option<String> {
         self.record("input", label);
         self.input.borrow_mut().pop_front().flatten()
+    }
+
+    fn choose_font(&self, _: HWND, current: &str, points: u32) -> Option<(String, u32)> {
+        self.record("font", &format!("{current} {points}"));
+        self.font.borrow_mut().pop_front().flatten()
     }
 }
 
@@ -334,6 +346,39 @@ impl Prompts for Win32Prompts {
 
     fn input_text(&self, owner: HWND, caption: &str, label: &str, initial: &str) -> Option<String> {
         input_dialog(owner, caption, label, initial)
+    }
+
+    fn choose_font(&self, owner: HWND, current: &str, points: u32) -> Option<(String, u32)> {
+        let mut lf = LOGFONTW {
+            // 96 DPI での高さ（負の値は文字の高さ）。ダイアログが DPI に合わせて読み替える。
+            lfHeight: -((points as i32 * 96 + 36) / 72),
+            lfCharSet: DEFAULT_CHARSET,
+            ..Default::default()
+        };
+        for (dst, src) in lf.lfFaceName[..31].iter_mut().zip(current.encode_utf16()) {
+            *dst = src;
+        }
+        let mut cf = CHOOSEFONTW {
+            lStructSize: std::mem::size_of::<CHOOSEFONTW>() as u32,
+            hwndOwner: owner,
+            lpLogFont: &mut lf,
+            iPointSize: points as i32 * 10,
+            Flags: CF_SCREENFONTS
+                | CF_INITTOLOGFONTSTRUCT
+                | CF_FORCEFONTEXIST
+                | CF_NOVERTFONTS
+                | CF_LIMITSIZE,
+            nSizeMin: FONT_SIZE_MIN as i32,
+            nSizeMax: FONT_SIZE_MAX as i32,
+            ..Default::default()
+        };
+        // SAFETY: 構造体と、それが指す LOGFONTW は呼び出しの間有効。
+        if !unsafe { ChooseFontW(&mut cf) }.as_bool() {
+            return None;
+        }
+        let name = from_wide(&lf.lfFaceName);
+        let points = ((cf.iPointSize + 5) / 10).max(1) as u32;
+        (!name.is_empty()).then_some((name, points))
     }
 }
 

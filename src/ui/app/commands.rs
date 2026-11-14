@@ -600,6 +600,7 @@ pub fn register(registry: &mut Registry<App>) -> Result<()> {
             Err(e) => Err(e),
         }
     })?;
+    super::viewopts::register(registry)?;
     Ok(())
 }
 
@@ -718,7 +719,23 @@ impl App {
         let Some(chord) = chord_from_input(msg.wParam.0 as u32, current_modifiers()) else {
             return false;
         };
-        let Some(command) = self.keymap.command_for(&chord) else {
+        // 英語配列の「+」は Shift を伴う（Ctrl+Shift+=）。拡大の Ctrl+Plus の割り当てを
+        // Shift 付きでも受ける。
+        let shifted_plus = chord.modifiers.ctrl
+            && chord.modifiers.shift
+            && !chord.modifiers.alt
+            && !chord.modifiers.win
+            && chord.key == crate::command::Key::Named("Plus");
+        let command = self.keymap.command_for(&chord).or_else(|| {
+            shifted_plus
+                .then(|| {
+                    let mut plain = chord;
+                    plain.modifiers.shift = false;
+                    self.keymap.command_for(&plain)
+                })
+                .flatten()
+        });
+        let Some(command) = command else {
             return false;
         };
         self.run_command(command, Value::Null);
@@ -752,6 +769,9 @@ impl App {
             registry
                 .check_available(self, &Invocation::user(entry.command))
                 .is_ok()
+        });
+        menu.update_checked(popup, |entry| {
+            self.view_menu_checked(entry.command, &entry.args)
         });
         self.menu = Some(menu);
     }
