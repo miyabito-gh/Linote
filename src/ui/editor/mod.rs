@@ -17,6 +17,7 @@
 //!
 //! 担当: タスク B。
 
+mod bookmarks;
 pub mod language;
 pub mod printing;
 pub mod sci;
@@ -239,6 +240,7 @@ impl Editor {
 
     fn configure(&self) {
         self.configure_match_indicators();
+        self.configure_bookmarks();
         // DirectWrite: DPI に沿った描画と、日本語の字形の代替書体。Wine の DirectWrite では
         // 何も描かれないので、Wine では GDI にする（試験環境のため）。
         let technology = if crate::platform::system::is_wine() {
@@ -261,9 +263,8 @@ impl Editor {
         self.send(SCI_SETRECTANGULARSELECTIONMODIFIER, SCMOD_ALT, 0);
         self.send(SCI_SETMOUSESELECTIONRECTANGULARSWITCH, 1, 0);
         self.send(SCI_SETVIRTUALSPACEOPTIONS, SCVS_RECTANGULARSELECTION, 0);
-        // 余白: 0 番を行番号、1 番（記号）は使わない。
+        // 余白: 0 番を行番号、1 番をブックマークに使う。
         self.send(SCI_SETMARGINTYPEN, 0, SC_MARGIN_NUMBER);
-        self.send(SCI_SETMARGINWIDTHN, 1, 0);
         self.send(SCI_SETMARGINLEFT, 0, 4);
         self.send(SCI_SETTABWIDTH, 4, 0);
         self.send(SCI_SETSCROLLWIDTHTRACKING, 1, 0);
@@ -778,6 +779,7 @@ impl Editor {
         self.send(SCI_SETSELECTIONLAYER, SC_LAYER_BASE, 0);
         self.send(SCI_SETFOLDMARGINCOLOUR, 1, e.bg.colorref() as isize);
         self.send(SCI_SETFOLDMARGINHICOLOUR, 1, e.bg.colorref() as isize);
+        self.apply_bookmark_theme(theme);
         self.update_line_number_margin();
     }
 

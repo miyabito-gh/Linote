@@ -228,8 +228,8 @@ fn guess_utf16(total_len: usize, sample: &[u8]) -> Option<(Encoding, Confidence)
 fn utf16_plausibility(sample: &[u8], read: fn([u8; 2]) -> u16) -> Option<u64> {
     let mut ascii = 0u64;
     let mut pending_high = false;
-    for pair in sample.chunks_exact(2) {
-        let unit = read([pair[0], pair[1]]);
+    for &pair in sample.as_chunks::<2>().0 {
+        let unit = read(pair);
         let is_low = (0xDC00..=0xDFFF).contains(&unit);
         if pending_high != is_low {
             return None; // 対にならないサロゲート

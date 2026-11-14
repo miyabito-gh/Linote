@@ -249,10 +249,16 @@ impl App {
                 }
             }
         }
+        if changes.grep {
+            self.sync_grep_settings();
+        }
+        if changes.recent_files_max {
+            self.settings.truncate_recent_files();
+        }
         if changes.search_history {
             self.sync_find_history();
         }
-        if changes.keys || changes.recent_files {
+        if changes.keys || changes.recent_files || changes.recent_files_max {
             // 文書 0 件の案内（キーの表示、最近使ったファイル）を描き直す。
             self.invalidate(self.layout.editor);
         }

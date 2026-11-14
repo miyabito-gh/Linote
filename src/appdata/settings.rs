@@ -20,7 +20,7 @@
 //!   （[`CommandDef::default_key`]）を使う。空文字列は「割り当てなし」。
 //!   グローバルショートカット（クリップボードの展開）も同じ表で、そのコマンドの
 //!   割り当てをエディタ内とグローバルの両方に使う。
-//! - `recent_files`: 最近使ったファイル（新しい順、最大 [`MAX_RECENT_FILES`] 件）。
+//! - `recent_files`: 最近使ったファイル（新しい順、`recent_files_max` 件まで。既定10、0〜30）。
 //!   存在確認は読み込みでは行わない（選んだときに確かめる）。
 //! - `view`: 表示の設定（[`ViewSettings`]）。値が不正な項目は既定値にして読む
 //!   （`view` がオブジェクトでなければ壊れているとみなす）。全タブに適用する。
@@ -63,8 +63,10 @@ pub use items::{
 /// 現在の設定の形式の版。
 pub const SETTINGS_VERSION: u64 = 1;
 
-/// 最近使ったファイルの最大件数。
+/// 最近使ったファイルの既定件数。
 pub const MAX_RECENT_FILES: usize = 10;
+/// 設定できる最近使ったファイルの件数の上限。
+pub const RECENT_FILES_LIMIT: usize = 30;
 /// 検索・置換・Grep の起点の履歴の、欄ごとの最大件数。
 pub const MAX_SEARCH_HISTORY: usize = 20;
 
@@ -451,6 +453,79 @@ impl SaveSettings {
     }
 }
 
+/// ファイルの外部変更を見つけたときの動作。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ExternalChangeMode {
+    #[default]
+    Notify,
+    ReloadIfClean,
+}
+
+impl ExternalChangeMode {
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Notify => "notify",
+            Self::ReloadIfClean => "reload_if_clean",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "notify" => Some(Self::Notify),
+            "reload_if_clean" => Some(Self::ReloadIfClean),
+            _ => None,
+        }
+    }
+}
+
+/// Grep の入力欄の設定。入力の解釈は検索モジュールが行う。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrepSettings {
+    pub extensions: String,
+    pub exclude_dirs: String,
+    pub include_hidden: bool,
+}
+
+impl Default for GrepSettings {
+    fn default() -> Self {
+        Self {
+            extensions: String::new(),
+            exclude_dirs: ".git;.hg;.svn;node_modules;target".into(),
+            include_hidden: false,
+        }
+    }
+}
+
+impl GrepSettings {
+    fn from_value(map: &Map<String, Value>) -> Self {
+        let defaults = Self::default();
+        Self {
+            extensions: map
+                .get("extensions")
+                .and_then(Value::as_str)
+                .unwrap_or(&defaults.extensions)
+                .to_owned(),
+            exclude_dirs: map
+                .get("exclude_dirs")
+                .and_then(Value::as_str)
+                .unwrap_or(&defaults.exclude_dirs)
+                .to_owned(),
+            include_hidden: map
+                .get("include_hidden")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        }
+    }
+
+    fn to_value(&self, base: Option<&Value>) -> Value {
+        let mut map = base.and_then(Value::as_object).cloned().unwrap_or_default();
+        map.insert("extensions".into(), self.extensions.clone().into());
+        map.insert("exclude_dirs".into(), self.exclude_dirs.clone().into());
+        map.insert("include_hidden".into(), self.include_hidden.into());
+        Value::Object(map)
+    }
+}
+
 /// 前回のウィンドウの位置と大きさ（画面座標。最大化していても通常状態の矩形を持つ）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WindowSettings {
@@ -627,6 +702,9 @@ pub struct SettingsChanges {
     pub new_file: bool,
     pub save: bool,
     pub recent_files: bool,
+    pub recent_files_max: bool,
+    pub external_change: bool,
+    pub grep: bool,
     pub search_history: bool,
     pub window: bool,
     pub mcp: bool,
@@ -650,7 +728,12 @@ impl SettingsChanges {
             (self.restore_session, "前回のタブの復元"),
             (self.new_file, "新規文書の既定"),
             (self.save, "保存時の整形"),
-            (self.recent_files, "最近使ったファイル"),
+            (
+                self.recent_files || self.recent_files_max,
+                "最近使ったファイル",
+            ),
+            (self.external_change, "外部変更時の動作"),
+            (self.grep, "Grep の絞り込み"),
             (self.search_history, "検索履歴"),
             (self.mcp, "MCP"),
         ]
@@ -670,6 +753,10 @@ pub struct Settings {
     pub mcp_enabled: bool,
     /// 最近使ったファイル（新しい順）。
     pub recent_files: Vec<String>,
+    /// 記録する最近使ったファイルの件数（0〜30、既定10）。
+    pub recent_files_max: usize,
+    pub external_change: ExternalChangeMode,
+    pub grep: GrepSettings,
     /// 表示の設定。
     pub view: ViewSettings,
     /// 印刷の設定。
@@ -695,6 +782,9 @@ impl Default for Settings {
             keys: BTreeMap::new(),
             mcp_enabled: false,
             recent_files: Vec::new(),
+            recent_files_max: MAX_RECENT_FILES,
+            external_change: ExternalChangeMode::default(),
+            grep: GrepSettings::default(),
             view: ViewSettings::default(),
             print: PrintSettings::default(),
             restore_session: true,
@@ -746,6 +836,27 @@ impl Settings {
                 settings.keys.insert(command, key);
             }
         }
+        if let Some(max) = map.remove("recent_files_max") {
+            settings.recent_files_max = max
+                .as_u64()
+                .filter(|&n| n <= RECENT_FILES_LIMIT as u64)
+                .map_or(MAX_RECENT_FILES, |n| n as usize);
+        }
+        if let Some(mode) = map.remove("external_change") {
+            settings.external_change = mode
+                .as_str()
+                .and_then(ExternalChangeMode::from_name)
+                .unwrap_or_default();
+        }
+        if let Some(Value::Object(mut grep)) = map.remove("grep") {
+            settings.grep = GrepSettings::from_value(&grep);
+            for key in ["extensions", "exclude_dirs", "include_hidden"] {
+                grep.remove(key);
+            }
+            if !grep.is_empty() {
+                settings.extra.insert("grep".into(), Value::Object(grep));
+            }
+        }
         if let Some(recent) = map.remove("recent_files") {
             let Value::Array(items) = recent else {
                 return Err(corrupt("recent_files が配列ではありません"));
@@ -756,7 +867,7 @@ impl Settings {
                 };
                 // 新しい順に並んでいる前提で、重複と上限だけ整える。
                 if !path.is_empty()
-                    && settings.recent_files.len() < MAX_RECENT_FILES
+                    && settings.recent_files.len() < settings.recent_files_limit()
                     && !settings
                         .recent_files
                         .iter()
@@ -843,10 +954,15 @@ impl Settings {
             Value::Array(
                 self.recent_files
                     .iter()
+                    .take(self.recent_files_limit())
                     .map(|p| Value::from(p.as_str()))
                     .collect(),
             ),
         );
+        map.insert("recent_files_max".into(), self.recent_files_limit().into());
+        map.insert("external_change".into(), self.external_change.name().into());
+        let grep = self.grep.to_value(map.get("grep"));
+        map.insert("grep".into(), grep);
         map.insert("view".into(), Value::Object(self.view.to_value()));
         map.insert("print".into(), Value::Object(self.print.to_value()));
         map.insert("restore_session".into(), self.restore_session.into());
@@ -881,11 +997,24 @@ impl Settings {
             new_file: self.new_file != other.new_file,
             save: self.save != other.save,
             recent_files: self.recent_files != other.recent_files,
+            recent_files_max: self.recent_files_max != other.recent_files_max,
+            external_change: self.external_change != other.external_change,
+            grep: self.grep != other.grep,
             search_history: self.search_history != other.search_history,
             window: self.window != other.window,
             mcp: self.mcp_enabled != other.mcp_enabled,
             other: self.extra != other.extra,
         }
+    }
+
+    /// 不正な値を直接設定した場合も、上限を超えて記録しない。
+    pub fn recent_files_limit(&self) -> usize {
+        self.recent_files_max.min(RECENT_FILES_LIMIT)
+    }
+
+    /// 件数の設定を減らしたとき、保存前に一覧にも反映する。
+    pub fn truncate_recent_files(&mut self) {
+        self.recent_files.truncate(self.recent_files_limit());
     }
 
     /// 最近使ったファイルの先頭にパスを置く（同じパスは大文字小文字を区別せず 1 つにする）。
@@ -896,7 +1025,7 @@ impl Settings {
         self.recent_files
             .retain(|p| !p.eq_ignore_ascii_case(&path) && p != &path);
         self.recent_files.insert(0, path);
-        self.recent_files.truncate(MAX_RECENT_FILES);
+        self.truncate_recent_files();
     }
 
     /// 最近使ったファイルから外す。
@@ -1100,6 +1229,58 @@ mod tests {
                 "{bad}"
             );
         }
+    }
+
+    #[test]
+    fn v7_settings_round_trip_and_preserve_unknown_grep_fields() {
+        let initial = r#"{"external_change":"reload_if_clean","recent_files_max":30,"grep":{"extensions":"*.rs;*.txt","exclude_dirs":".git;vendor","include_hidden":true,"future":{"a":1}}}"#;
+        let settings = Settings::from_json(initial).unwrap();
+        assert_eq!(settings.external_change, ExternalChangeMode::ReloadIfClean);
+        assert_eq!(settings.recent_files_max, 30);
+        assert_eq!(settings.grep.extensions, "*.rs;*.txt");
+        assert_eq!(settings.grep.exclude_dirs, ".git;vendor");
+        assert!(settings.grep.include_hidden);
+        let saved: Value = serde_json::from_str(&settings.to_json()).unwrap();
+        assert_eq!(saved["grep"]["future"]["a"], 1);
+        assert_eq!(Settings::from_json(&settings.to_json()).unwrap(), settings);
+        let changed = Settings::default().diff(&settings);
+        assert!(changed.external_change && changed.recent_files_max && changed.grep);
+    }
+
+    #[test]
+    fn v7_invalid_values_use_defaults() {
+        for invalid in [
+            r#"{"external_change":"other","recent_files_max":31,"grep":{"extensions":3,"exclude_dirs":null,"include_hidden":"true"}}"#,
+            r#"{"external_change":null,"recent_files_max":-1,"grep":true}"#,
+            r#"{"external_change":[],"recent_files_max":1.5}"#,
+            r#"{"recent_files_max":"10"}"#,
+        ] {
+            let settings = Settings::from_json(invalid).unwrap();
+            assert_eq!(settings.external_change, ExternalChangeMode::Notify);
+            assert_eq!(settings.recent_files_max, MAX_RECENT_FILES);
+            assert_eq!(settings.grep, GrepSettings::default());
+        }
+    }
+
+    #[test]
+    fn recent_limit_handles_zero_thirty_and_reduced_limit() {
+        let mut settings = Settings::from_json(r#"{"recent_files_max":30}"#).unwrap();
+        for n in 0..35 {
+            settings.push_recent(format!("file-{n}.txt"));
+        }
+        assert_eq!(settings.recent_files.len(), 30);
+        assert_eq!(settings.recent_files[0], "file-34.txt");
+        settings.recent_files_max = 2;
+        let saved = Settings::from_json(&settings.to_json()).unwrap();
+        assert_eq!(saved.recent_files, ["file-34.txt", "file-33.txt"]);
+        settings.truncate_recent_files();
+        assert_eq!(settings.recent_files.len(), 2);
+        settings.recent_files_max = 0;
+        settings.push_recent("new.txt".into());
+        assert!(settings.recent_files.is_empty());
+        let settings =
+            Settings::from_json(r#"{"recent_files_max":0,"recent_files":["a","b"]}"#).unwrap();
+        assert!(settings.recent_files.is_empty());
     }
 
     #[test]

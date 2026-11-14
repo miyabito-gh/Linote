@@ -23,7 +23,7 @@ mod grep;
 mod matcher;
 
 pub use grep::{
-    grep, grep_collect, GrepFile, GrepHit, GrepOptions, GrepSummary, DEFAULT_MAX_FILE_BYTES,
-    DEFAULT_MAX_HITS,
+    grep, grep_collect, parse_exclude_dirs, parse_extensions, GrepFile, GrepHit, GrepOptions,
+    GrepSummary, DEFAULT_MAX_FILE_BYTES, DEFAULT_MAX_HITS,
 };
 pub use matcher::{Direction, Hit, ReplaceSummary, SearchOptions, Searcher};

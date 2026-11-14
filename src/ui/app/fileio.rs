@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
-use crate::appdata::settings::SettingsStamp;
+use crate::appdata::settings::{ExternalChangeMode, SettingsStamp};
 use crate::appdata::{AppPaths, Settings};
 use crate::bigfile::{large_mode_reason, FileProfile, LargeModeReason};
 use crate::core::{DocStamp, DocumentId, Error, Limits, Result, TaskContext, WorkerPool};
@@ -131,6 +131,8 @@ struct OpenRequest {
     reopen_of: Option<DocStamp>,
     /// 「UTF-8 (BOM 付き)」で開き直した場合、保存時に BOM を付ける。
     force_bom: bool,
+    /// 外部変更による自動読み直し。同じ文書 ID・タブ位置に反映する。
+    automatic: bool,
 }
 
 /// 保存先。
@@ -183,6 +185,7 @@ impl App {
             );
             return;
         }
+        self.settings.truncate_recent_files();
         let json = self.settings.to_json();
         let sender = self.sender();
         self.settings_state = SettingsState::Loaded;
@@ -245,6 +248,7 @@ impl App {
         if !self.settings_state.writable() {
             return;
         }
+        self.settings.truncate_recent_files();
         let json = self.settings.to_json();
         self.settings_state = SettingsState::Loaded;
         let seq = SETTINGS_SEQ.fetch_add(1, Ordering::SeqCst) + 1;
@@ -297,7 +301,7 @@ impl App {
         if !self.opening.insert(path.clone()) {
             return Ok(());
         }
-        let result = self.start_read(&path, reopen);
+        let result = self.start_read(&path, reopen, false);
         if result.is_err() {
             self.opening.remove(&path);
         }
@@ -308,6 +312,7 @@ impl App {
         &mut self,
         path: &Path,
         reopen: Option<(DocStamp, Option<Encoding>, bool)>,
+        automatic: bool,
     ) -> Result<()> {
         let meta = std::fs::metadata(path).map_err(|e| Error::io("読み込み", path, e))?;
         let thresholds = self.large_thresholds;
@@ -336,6 +341,7 @@ impl App {
             path: path.to_path_buf(),
             reopen_of,
             force_bom,
+            automatic,
         };
         let reopen_of = request.reopen_of;
         let sender = self.sender();
@@ -384,6 +390,10 @@ impl App {
         result: Result<(LoadedText, DocLoader, Option<LargeModeReason>)>,
     ) {
         self.opening.remove(&request.path);
+        if request.automatic {
+            self.finish_automatic_reload(request, result);
+            return;
+        }
         let (loaded, loader, big) = match result {
             Ok(r) => r,
             Err(e) => {
@@ -463,6 +473,128 @@ impl App {
                 MessageKind::Warning,
             );
         }
+    }
+
+    /// 自動の読み直しは同じ文書を置き換える。タブ順とアクティブな文書を変えず、
+    /// 読み込み中の編集・保存・閉鎖があれば結果を破棄する。
+    fn finish_automatic_reload(
+        &mut self,
+        request: OpenRequest,
+        result: Result<(LoadedText, DocLoader, Option<LargeModeReason>)>,
+    ) {
+        self.sync();
+        let Some(stamp) = request.reopen_of else {
+            return;
+        };
+        let id = stamp.document;
+        let Some(state) = self.state(id) else { return };
+        if !self.is_current(stamp) || state.is_dirty() {
+            let _ = self.update_state(id, |s| s.record_external_change());
+            self.set_status("読み直している間に文書が変更されたため、自動の読み直しを中止しました。上書きせず、名前を付けて保存してください", MessageKind::Warning);
+            return;
+        }
+        let (loaded, loader, _) = match result {
+            Ok(value) => value,
+            Err(e) => {
+                self.report_failure(
+                    "ディスクから自動で読み直せませんでした（編集中の本文は保っています）",
+                    &e,
+                );
+                return;
+            }
+        };
+        let Ok(i) = self.index_of(id) else { return };
+        if self.docs[i].saving {
+            return;
+        }
+        let DocView::Scintilla(old_doc) = self.docs[i].view else {
+            return;
+        };
+        let view = if self.active == Some(i) {
+            self.editor.view_state()
+        } else {
+            self.docs[i].view_state
+        };
+        let positions = match self.with_text(id, |ed| {
+            [view.selection.anchor, view.selection.caret].map(|pos| {
+                let line = ed.line_from_position(pos);
+                (line, pos.saturating_sub(ed.line_start(line).unwrap_or(0)))
+            })
+        }) {
+            Ok(value) => value,
+            Err(_) => return,
+        };
+        let doc = match loader.finish() {
+            Ok(doc) => doc,
+            Err(e) => {
+                self.report_failure("編集欄に読み直せませんでした", &e);
+                return;
+            }
+        };
+        let language = self.docs[i].language;
+        let format = loaded.format;
+        let aux = match self.aux() {
+            Ok(aux) => aux,
+            Err(e) => {
+                self.editor.release_document(doc);
+                self.report_failure("編集欄に読み直せませんでした", &e);
+                return;
+            }
+        };
+        aux.set_document(doc);
+        aux.finish_loaded_document();
+        aux.set_eol(format.eol);
+        aux.set_language(language);
+        self.aux_doc = Some(doc);
+        // 新しいドキュメントが送った保存位置通知は、まだ一覧に加える前に捨てる。
+        self.sync();
+        if self.highlight_doc() == Some(id) {
+            self.clear_highlight();
+        }
+        if self.scope_doc == Some(id) {
+            self.clear_scope();
+        }
+        self.docs[i].view = DocView::Scintilla(doc);
+        self.docs[i].state.format = format;
+        let version = self.docs[i].state.record_edit(crate::core::Actor::User);
+        self.docs[i]
+            .state
+            .record_saved(version, Some(request.path), Some(loaded.stamp));
+        self.docs[i].savepoint_valid = true;
+        self.docs[i].lossy = loaded.is_lossy();
+        let mut restored = view;
+        let ed = self.aux.as_ref().expect("読み込み口を作成済み");
+        let points = positions.map(|(line, column)| {
+            let line = line.min(ed.line_count().saturating_sub(1));
+            let mut pos = (ed.line_start(line).unwrap_or(0) + column).min(ed.line_end(line));
+            while pos > 0 && !ed.is_char_boundary(pos) {
+                pos -= 1;
+            }
+            pos
+        });
+        restored.selection.anchor = points[0];
+        restored.selection.caret = points[1];
+        restored.first_visible_line = restored
+            .first_visible_line
+            .min(ed.line_count().saturating_sub(1));
+        self.docs[i].view_state = restored;
+        if self.active == Some(i) {
+            self.editor.set_document(doc);
+            self.editor.set_eol(format.eol);
+            self.editor.apply_theme(&self.theme, language);
+            self.editor.restore_view_state(&restored);
+        }
+        self.editor.release_document(old_doc);
+        self.recovery_saved(id, version);
+        self.refresh_tabs();
+        self.refresh_status();
+        self.update_window_title();
+        self.update_find_context();
+        self.preview_note_change(id);
+        self.set_status(
+            &format!("「{}」をディスクから読み直しました", self.docs[i].title),
+            MessageKind::Info,
+        );
     }
 
     /// 文字コードを指定して開き直す。未保存の変更があれば確認する（破棄される）。
@@ -561,7 +693,24 @@ impl App {
         let title = d.title.clone();
         match check_external_change(&path, known) {
             Ok(change) if change.is_changed() => {
+                let automatic = self.settings.external_change == ExternalChangeMode::ReloadIfClean
+                    && !d.state.is_dirty()
+                    && !d.saving
+                    && !matches!(change, ExternalChange::Removed);
+                let stamp = d.state.stamp();
+                let encoding = d.state.format.encoding;
+                let bom = d.state.format.bom;
                 let _ = self.update_state(id, |s| s.record_external_change());
+                if automatic && self.opening.insert(path.clone()) {
+                    match self.start_read(&path, Some((stamp, Some(encoding), bom)), true) {
+                        Ok(()) => return true,
+                        Err(e) => {
+                            self.opening.remove(&path);
+                            self.report_failure("ディスクから自動で読み直せませんでした", &e);
+                            return true;
+                        }
+                    }
+                }
                 let what = match change {
                     ExternalChange::Removed => "削除または移動されました",
                     _ => "ほかのプログラムで変更されました",

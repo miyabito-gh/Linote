@@ -66,7 +66,10 @@ fn menu_and_keys() -> Check {
             .iter()
             .filter(|e| e.command == CommandId::new("file.open_recent"))
             .count();
-        check!(recent == 10, "最近使ったファイルの枠 {recent}");
+        check!(
+            recent == crate::appdata::settings::RECENT_FILES_LIMIT,
+            "最近使ったファイルの枠 {recent}"
+        );
         Ok(())
     })?
 }

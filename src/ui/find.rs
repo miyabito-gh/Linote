@@ -54,6 +54,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WS_SYSMENU, WS_TABSTOP, WS_THICKFRAME, WS_VISIBLE, WS_VSCROLL,
 };
 
+use crate::appdata::settings::GrepSettings;
 use crate::core::{
     ui_channel, CancelToken, Completion, Error, Result, TaskContext, UiReceiver, UiSender, UiWaker,
     WorkerPool,
@@ -83,6 +84,9 @@ const ID_STOP: usize = 212;
 const ID_STATUS: usize = 213;
 const ID_LIST: usize = 214;
 const ID_INSEL: usize = 215;
+const ID_EXTENSIONS: usize = 216;
+const ID_EXCLUDE_DIRS: usize = 217;
+const ID_INCLUDE_HIDDEN: usize = 218;
 
 /// コンボボックスのメッセージと通知（`CBS_DROPDOWN`: 入力もできる一覧）。
 const CBS_DROPDOWN: u32 = 0x0002;
@@ -124,6 +128,8 @@ pub enum FindEvent {
         replace: Option<String>,
         grep_dir: Option<String>,
     },
+    /// Grep を実行したときの絞り込み（設定へ保存する）。
+    GrepSettings(GrepSettings),
     /// 検索欄の条件が変わった（入力・オプションの切り替え）。強調表示の更新に使う。
     /// 空や無効なパターンでも届く。
     Changed(SearchOptions),
@@ -183,8 +189,12 @@ struct State {
     word: HWND,
     regex: HWND,
     in_selection: HWND,
-    /// 3 つのコンボボックスの中の入力欄（キー操作を受ける）。
-    edits: [HWND; 3],
+    extensions: HWND,
+    exclude_dirs: HWND,
+    include_hidden: HWND,
+    filter_labels: [HWND; 2],
+    /// コンボボックスと Grep 条件の入力欄（キー操作を受ける）。
+    edits: [HWND; 5],
     /// 履歴の差し替え中は入力の通知を無視する。
     quiet: bool,
     buttons: [HWND; 6],
@@ -204,7 +214,7 @@ struct State {
     tx: UiSender<Msg>,
     rx: UiReceiver<Msg>,
     on_event: Rc<dyn Fn(FindEvent)>,
-    edit_proc: WNDPROC,
+    edit_procs: [WNDPROC; 5],
     list_proc: WNDPROC,
 }
 
@@ -261,7 +271,7 @@ impl FindPanel {
                 0,
                 0,
                 scale(560, dpi),
-                scale(520, dpi),
+                scale(610, dpi),
                 Some(owner),
                 None,
                 Some(instance.into()),
@@ -413,6 +423,23 @@ impl FindPanel {
             s.quiet = false;
             s.validate();
             s.emit(FindEvent::Changed(s.options()));
+        });
+    }
+
+    /// 保存済みの Grep の絞り込みを反映する（履歴の更新では入力中の条件を変えない）。
+    pub fn set_grep_settings(&self, settings: &GrepSettings) {
+        with_state(self.hwnd, |s| {
+            set_text(s.extensions, &settings.extensions);
+            set_text(s.exclude_dirs, &settings.exclude_dirs);
+            // SAFETY: 自分のチェックボックス。
+            unsafe {
+                SendMessageW(
+                    s.include_hidden,
+                    BM_SETCHECK,
+                    Some(WPARAM(settings.include_hidden as usize)),
+                    None,
+                );
+            }
         });
     }
 
@@ -583,10 +610,14 @@ impl State {
             self.word,
             self.regex,
             self.in_selection,
+            self.extensions,
+            self.exclude_dirs,
+            self.include_hidden,
             self.status,
             self.list,
         ];
         v.extend(self.buttons);
+        v.extend(self.filter_labels);
         v
     }
 
@@ -642,6 +673,18 @@ impl State {
         }
         y += row + gap;
         mv(self.in_selection, m, y, inner, row);
+        y += row + gap;
+        let label_width = scale(116, d);
+        for (label, input) in self
+            .filter_labels
+            .into_iter()
+            .zip([self.extensions, self.exclude_dirs])
+        {
+            mv(label, m, y + scale(3, d), label_width, row);
+            mv(input, m + label_width, y, inner - label_width, row);
+            y += row + gap;
+        }
+        mv(self.include_hidden, m, y, inner, row);
         y += row + gap;
         let bw = (inner - 5 * gap) / 6;
         for (i, b) in self.buttons.into_iter().enumerate() {
@@ -749,11 +792,6 @@ impl State {
             self.show_status("フォルダーが見つかりません", true);
             return;
         }
-        self.emit(FindEvent::Ran {
-            find: self.options().query,
-            replace: None,
-            grep_dir: Some(root.to_string_lossy().into_owned()),
-        });
         self.generation += 1;
         let generation = self.generation;
         let cancel = CancelToken::new();
@@ -765,7 +803,21 @@ impl State {
             SendMessageW(self.list, LB_RESETCONTENT, None, None);
         }
         self.show_status("検索しています…", false);
-        let options = GrepOptions::new(root, self.options());
+        let settings = GrepSettings {
+            extensions: text_of(self.extensions),
+            exclude_dirs: text_of(self.exclude_dirs),
+            include_hidden: is_checked(self.include_hidden),
+        };
+        let mut options = GrepOptions::new(root.clone(), self.options());
+        options.extensions = crate::search::parse_extensions(&settings.extensions);
+        options.exclude_dirs = crate::search::parse_exclude_dirs(&settings.exclude_dirs);
+        options.include_hidden = settings.include_hidden;
+        self.emit(FindEvent::GrepSettings(settings));
+        self.emit(FindEvent::Ran {
+            find: self.options().query,
+            replace: None,
+            grep_dir: Some(root.to_string_lossy().into_owned()),
+        });
         let tx = self.tx.clone();
         WorkerPool::global().spawn(move || {
             let ctx = TaskContext {
@@ -907,6 +959,27 @@ extern "system" fn panel_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPAR
                 check(w!("正規表現"), ID_REGEX),
             );
             let in_selection = check(w!("選択範囲内（検索・置換を選択範囲に限る）"), ID_INSEL);
+            let extensions = child(
+                hwnd,
+                w!("EDIT"),
+                w!(""),
+                WS_TABSTOP.0 | ES_AUTOHSCROLL as u32,
+                WS_EX_CLIENTEDGE.0,
+                ID_EXTENSIONS,
+            );
+            let exclude_dirs = child(
+                hwnd,
+                w!("EDIT"),
+                w!(""),
+                WS_TABSTOP.0 | ES_AUTOHSCROLL as u32,
+                WS_EX_CLIENTEDGE.0,
+                ID_EXCLUDE_DIRS,
+            );
+            let include_hidden = check(w!("隠しファイルも対象"), ID_INCLUDE_HIDDEN);
+            let filter_labels = [
+                child(hwnd, w!("STATIC"), w!("対象（拡張子）"), 0, 0, 0),
+                child(hwnd, w!("STATIC"), w!("除外フォルダー"), 0, 0, 0),
+            ];
             let buttons = [
                 button(w!("次へ"), ID_NEXT),
                 button(w!("前へ"), ID_PREV),
@@ -934,7 +1007,11 @@ extern "system" fn panel_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPAR
                 word,
                 regex,
                 in_selection,
-                edits: [HWND::default(); 3],
+                extensions,
+                exclude_dirs,
+                include_hidden,
+                filter_labels,
+                edits: [HWND::default(); 5],
                 quiet: false,
                 buttons,
                 status,
@@ -953,20 +1030,23 @@ extern "system" fn panel_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPAR
                 tx,
                 rx,
                 on_event,
-                edit_proc: None,
+                edit_procs: [None; 5],
                 list_proc: None,
             });
             state.rebuild_brushes();
             state.apply_font();
             // SAFETY: 元の処理を控えて、キー操作を受ける処理に差し替える。
             unsafe {
-                for (i, combo) in [query, replace, folder].into_iter().enumerate() {
+                for (i, combo) in [query, replace, folder, extensions, exclude_dirs]
+                    .into_iter()
+                    .enumerate()
+                {
                     // コンボボックスの中の入力欄がキー操作を受ける。
                     let h = FindWindowExW(Some(combo), None, w!("EDIT"), None).unwrap_or(combo);
                     state.edits[i] = h;
                     let old =
                         SetWindowLongPtrW(h, GWLP_WNDPROC, key_proc as *const () as usize as isize);
-                    state.edit_proc = std::mem::transmute::<isize, WNDPROC>(old);
+                    state.edit_procs[i] = std::mem::transmute::<isize, WNDPROC>(old);
                 }
                 let old =
                     SetWindowLongPtrW(list, GWLP_WNDPROC, key_proc as *const () as usize as isize);
@@ -1128,7 +1208,7 @@ extern "system" fn key_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                     s.find(!shift);
                 } else if hwnd == s.edits[1] {
                     s.replace(false);
-                } else if hwnd == s.edits[2] {
+                } else if s.edits[2..].contains(&hwnd) {
                     s.start_grep();
                 } else {
                     s.open_selected();
@@ -1147,7 +1227,10 @@ extern "system" fn key_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
         if hwnd == s.list {
             s.list_proc
         } else {
-            s.edit_proc
+            s.edits
+                .iter()
+                .position(|&h| h == hwnd)
+                .and_then(|i| s.edit_procs[i])
         }
     })
     .flatten();

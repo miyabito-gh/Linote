@@ -51,6 +51,41 @@ impl GrepOptions {
     }
 }
 
+/// Grep の対象欄を解釈する（`*.rs;*.txt`、`.rs txt`、`rs txt`）。
+/// 拡張子はドットなし・小文字にそろえて重複を除く。空欄と `*` / `*.*` は全対象。
+pub fn parse_extensions(input: &str) -> Vec<String> {
+    let mut result = Vec::new();
+    for token in input
+        .split(|c: char| c == ';' || c.is_whitespace())
+        .filter(|s| !s.is_empty())
+    {
+        if matches!(token, "*" | "*.*") {
+            return Vec::new();
+        }
+        let ext = token
+            .strip_prefix("*.")
+            .unwrap_or(token)
+            .trim_start_matches('.')
+            .to_lowercase();
+        if !ext.is_empty() && !result.contains(&ext) {
+            result.push(ext);
+        }
+    }
+    result
+}
+
+/// 除外フォルダー欄を解釈する。名前の中の空白は保ち、比較用の小文字にそろえる。
+pub fn parse_exclude_dirs(input: &str) -> Vec<String> {
+    let mut result = Vec::new();
+    for token in input.split(';').map(str::trim).filter(|s| !s.is_empty()) {
+        let name = token.to_lowercase();
+        if !result.contains(&name) {
+            result.push(name);
+        }
+    }
+    result
+}
+
 /// 1 件の一致行。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GrepHit {
@@ -298,4 +333,69 @@ pub fn grep_collect(
     let mut files = Vec::new();
     let out = grep(options, ctx, &mut |f| files.push(f))?;
     Ok(Outcome::new((out.value, files), out.completion))
+}
+
+#[cfg(test)]
+mod filter_tests {
+    use super::*;
+
+    #[test]
+    fn extensions_accept_patterns_dots_and_whitespace() {
+        assert_eq!(parse_extensions("*.rs;*.txt"), ["rs", "txt"]);
+        assert_eq!(parse_extensions(" rs TXT .rs; *.Md "), ["rs", "txt", "md"]);
+        assert_eq!(parse_extensions(" ; "), Vec::<String>::new());
+        assert!(parse_extensions("rs *.*").is_empty());
+        assert!(parse_extensions("*").is_empty());
+        assert!(parse_extensions(".").is_empty());
+    }
+
+    #[test]
+    fn exclude_dirs_preserve_spaces_but_ignore_empty_and_duplicate_names() {
+        assert_eq!(
+            parse_exclude_dirs(" .git ; target;;TARGET; build output ; "),
+            [".git", "target", "build output"]
+        );
+        assert!(parse_exclude_dirs(" ; ").is_empty());
+    }
+
+    #[test]
+    fn filters_reach_the_filesystem_search() {
+        let dir =
+            std::env::temp_dir().join(format!("linote-filter-{}", crate::core::MemoId::generate()));
+        std::fs::create_dir_all(dir.join("skip")).unwrap();
+        for name in ["a.rs", "b.txt", ".hidden.rs", "skip/c.rs"] {
+            std::fs::write(dir.join(name), "needle").unwrap();
+        }
+        let mut options = GrepOptions::new(
+            &dir,
+            SearchOptions {
+                query: "needle".into(),
+                ..Default::default()
+            },
+        );
+        options.extensions = parse_extensions("*.RS");
+        options.exclude_dirs = parse_exclude_dirs("skip");
+        let out = grep_collect(&options, &TaskContext::detached()).unwrap();
+        assert_eq!(out.value.0.hits, 1);
+        assert!(out.value.1[0].path.ends_with("a.rs"));
+        options.include_hidden = true;
+        assert_eq!(
+            grep_collect(&options, &TaskContext::detached())
+                .unwrap()
+                .value
+                .0
+                .hits,
+            2
+        );
+        options.exclude_dirs.clear();
+        assert_eq!(
+            grep_collect(&options, &TaskContext::detached())
+                .unwrap()
+                .value
+                .0
+                .hits,
+            3
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }

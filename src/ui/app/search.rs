@@ -125,6 +125,7 @@ impl App {
             let panel = FindPanel::create(self.hwnd, &self.theme, self.dpi, on_event)?;
             self.find_panel = Some(panel);
             self.sync_find_history();
+            self.sync_grep_settings();
         }
         let Some(panel) = self.find_panel else {
             return Ok(());
@@ -138,6 +139,13 @@ impl App {
         self.update_find_context();
         panel.show(prefill.as_deref());
         Ok(())
+    }
+
+    /// 設定の再読み込み時だけ Grep 条件も差し替える。
+    pub(super) fn sync_grep_settings(&self) {
+        if let Some(panel) = self.find_panel {
+            panel.set_grep_settings(&self.settings.grep);
+        }
     }
 
     /// 設定の履歴を検索欄のドロップダウンに反映する。
@@ -426,6 +434,16 @@ impl App {
                 replace,
                 grep_dir,
             } => self.record_history(&find, replace.as_deref(), grep_dir.as_deref()),
+            FindEvent::GrepSettings(settings) => {
+                self.reload_settings(super::settingsops::ReloadReason::BeforeApply);
+                if self.settings.grep != settings {
+                    self.settings.grep = settings;
+                    self.sync_grep_settings();
+                    if self.settings_state.writable() {
+                        self.persist_settings();
+                    }
+                }
+            }
             FindEvent::Changed(options) => self.on_query_changed(options),
             FindEvent::OpenHit { path, line, column } => self.open_hit(path, line, column),
             FindEvent::Closed => self.focus_active(),

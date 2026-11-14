@@ -10,8 +10,8 @@
 use crate::text::Eol;
 
 use super::{
-    new_file_encoding_name, parse_new_file_encoding, Settings, ThemeMode, WrapMode, FONT_SIZE_MAX,
-    FONT_SIZE_MIN, WRAP_COLUMN_MAX, WRAP_COLUMN_MIN,
+    new_file_encoding_name, parse_new_file_encoding, ExternalChangeMode, Settings, ThemeMode,
+    WrapMode, FONT_SIZE_MAX, FONT_SIZE_MIN, WRAP_COLUMN_MAX, WRAP_COLUMN_MIN,
 };
 
 /// 選択肢 1 つ（設定ファイルでの値と、画面の表示）。
@@ -147,6 +147,17 @@ const THEME_CHOICES: &[Choice] = &[
     },
 ];
 
+const EXTERNAL_CHANGE_CHOICES: &[Choice] = &[
+    Choice {
+        value: "notify",
+        label: "変更を通知する",
+    },
+    Choice {
+        value: "reload_if_clean",
+        label: "未保存の変更がなければ自動で読み直す",
+    },
+];
+
 const WRAP_CHOICES: &[Choice] = &[
     Choice {
         value: "none",
@@ -206,6 +217,30 @@ macro_rules! check_item {
 }
 
 static GENERAL_ITEMS: &[Item] = &[
+    Item {
+        id: "external_change",
+        label: "ファイルが外部で変更されたとき",
+        kind: ItemKind::Choice(EXTERNAL_CHANGE_CHOICES),
+        get: |s| ItemValue::Text(s.external_change.name().into()),
+        set: |s, v| {
+            if let Some(mode) = text(v).and_then(ExternalChangeMode::from_name) {
+                s.external_change = mode;
+            }
+        },
+    },
+    Item {
+        id: "recent_files_max",
+        label: "最近使ったファイルの件数（0 は記録しない）",
+        kind: ItemKind::Number { min: 0, max: 30 },
+        get: |s| ItemValue::Number(s.recent_files_max as i64),
+        set: |s, v| {
+            if let ItemValue::Number(n) = v {
+                if (0..=30).contains(n) {
+                    s.recent_files_max = *n as usize;
+                }
+            }
+        },
+    },
     Item {
         id: "theme",
         label: "テーマ",
@@ -573,6 +608,24 @@ mod tests {
         let size = item("view.font_size");
         assert_eq!(size.parse_number("72"), Ok(72));
         assert!(size.parse_number("5").is_err());
+    }
+
+    #[test]
+    fn external_change_and_recent_limit_are_editable() {
+        let baseline = Settings::default();
+        let mut edited = baseline.clone();
+        item("external_change").set(&mut edited, &ItemValue::Text("reload_if_clean".into()));
+        item("recent_files_max").set(&mut edited, &ItemValue::Number(30));
+        assert_eq!(edited.external_change, ExternalChangeMode::ReloadIfClean);
+        assert_eq!(edited.recent_files_max, 30);
+        assert!(item("recent_files_max").parse_number("31").is_err());
+        assert_eq!(item("recent_files_max").parse_number("0"), Ok(0));
+        let mut latest = baseline.clone();
+        latest.grep.extensions = "*.rs".into();
+        apply_edits(&baseline, &edited, &mut latest);
+        assert_eq!(latest.external_change, ExternalChangeMode::ReloadIfClean);
+        assert_eq!(latest.recent_files_max, 30);
+        assert_eq!(latest.grep.extensions, "*.rs");
     }
 
     #[test]

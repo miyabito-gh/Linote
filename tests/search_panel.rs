@@ -17,6 +17,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WS_OVERLAPPED,
 };
 
+use linote::appdata::settings::GrepSettings;
 use linote::ui::find::{FindEvent, FindPanel};
 use linote::ui::theme::Theme;
 
@@ -58,6 +59,8 @@ fn panel_greps_opens_hits_and_disables_replace() {
     std::fs::create_dir_all(&root).unwrap();
     std::fs::write(root.join("a.txt"), "x\nneedle here\n").unwrap();
     std::fs::write(root.join("b.txt"), "needle again\n").unwrap();
+
+    std::fs::write(root.join("c.rs"), "needle excluded\n").unwrap();
 
     // SAFETY: 試験用の最上位ウィンドウ（所有者にする）。
     let owner: HWND = unsafe {
@@ -110,6 +113,10 @@ fn panel_greps_opens_hits_and_disables_replace() {
                     replace.unwrap_or_default(),
                     grep_dir.is_some()
                 ),
+                FindEvent::GrepSettings(s) => format!(
+                    "grep {}|{}|{}",
+                    s.extensions, s.exclude_dirs, s.include_hidden
+                ),
                 FindEvent::Changed(o) => format!("changed {}", o.query),
                 FindEvent::OpenHit { path, line, column } => format!(
                     "open {} {line}:{column}",
@@ -135,8 +142,16 @@ fn panel_greps_opens_hits_and_disables_replace() {
     assert_eq!(events.borrow().last().unwrap(), "next needle");
 
     // Grep。
+    panel.set_grep_settings(&GrepSettings {
+        extensions: "*.txt".into(),
+        ..Default::default()
+    });
     panel.set_grep_folder(&root);
     command(hwnd, 211, 0);
+    assert!(
+        events.borrow().iter().any(|s| s.starts_with("grep *.txt|")),
+        "実行条件を保存する通知"
+    );
     let count = || unsafe { SendMessageW(list, LB_GETCOUNT, None, None).0 };
     assert!(
         pump(|| count() == 2),

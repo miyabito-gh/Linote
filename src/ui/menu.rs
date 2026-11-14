@@ -20,8 +20,8 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CheckMenuItem, CreateMenu, CreatePopupMenu, DestroyMenu, DrawMenuBar,
-    EnableMenuItem, ModifyMenuW, SetMenu, HMENU, MF_BYCOMMAND, MF_CHECKED, MF_ENABLED, MF_GRAYED,
-    MF_POPUP, MF_SEPARATOR, MF_STRING, MF_UNCHECKED,
+    EnableMenuItem, InsertMenuW, RemoveMenu, SetMenu, HMENU, MF_BYCOMMAND, MF_BYPOSITION,
+    MF_CHECKED, MF_ENABLED, MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, MF_UNCHECKED,
 };
 
 use crate::appdata::Settings;
@@ -168,6 +168,28 @@ static MENUS: &[MenuDef] = &[
                     Item::Recent(8),
                     Item::Recent(9),
                     Item::Recent(10),
+                    Item::Recent(11),
+                    Item::Recent(12),
+                    Item::Recent(13),
+                    Item::Recent(14),
+                    Item::Recent(15),
+                    Item::Recent(16),
+                    Item::Recent(17),
+                    Item::Recent(18),
+                    Item::Recent(19),
+                    Item::Recent(20),
+                    Item::Recent(21),
+                    Item::Recent(22),
+                    Item::Recent(23),
+                    Item::Recent(24),
+                    Item::Recent(25),
+                    Item::Recent(26),
+                    Item::Recent(27),
+                    Item::Recent(28),
+                    Item::Recent(29),
+                    Item::Recent(30),
+                    Item::Separator,
+                    Item::Cmd(CommandId::new("file.clear_recent")),
                 ],
             ),
             Item::Separator,
@@ -309,6 +331,10 @@ static MENUS: &[MenuDef] = &[
                     Item::Cmd(CommandId::new("edit.delete_line")),
                     Item::Cmd(CommandId::new("edit.move_line_up")),
                     Item::Cmd(CommandId::new("edit.move_line_down")),
+                    Item::Separator,
+                    Item::Cmd(CommandId::new("edit.sort_lines_asc")),
+                    Item::Cmd(CommandId::new("edit.sort_lines_desc")),
+                    Item::Cmd(CommandId::new("edit.remove_duplicate_lines")),
                 ],
             ),
             Item::Sub(
@@ -337,6 +363,11 @@ static MENUS: &[MenuDef] = &[
             Item::Separator,
             Item::Cmd(CommandId::new("edit.goto_line")),
             Item::Cmd(CommandId::new("edit.goto_matching_brace")),
+            Item::Separator,
+            Item::Cmd(CommandId::new("search.toggle_bookmark")),
+            Item::Cmd(CommandId::new("search.next_bookmark")),
+            Item::Cmd(CommandId::new("search.prev_bookmark")),
+            Item::Cmd(CommandId::new("search.clear_bookmarks")),
         ],
     },
     MenuDef {
@@ -589,27 +620,39 @@ impl MenuModel {
         }
     }
 
-    /// 開こうとしているメニューのうち、最近使ったファイルの枠の表示名を付け直す。
-    /// `label` は番号（1 始まり）に対する表示名で、なければ「(なし)」にする。
+    /// 最近使ったファイルの実際の件数だけを表示する。ID は固定し、末尾の消去項目を保つ。
     pub fn relabel_recent(&self, popup: HMENU, label: impl Fn(usize) -> Option<String>) {
-        for e in self
+        let entries: Vec<_> = self
             .entries
             .iter()
             .filter(|e| e.popup == popup.0 as isize && e.command == ID_FILE_OPEN_RECENT)
-        {
-            let n = e.args["index"].as_u64().unwrap_or(0) as usize;
-            let text = label(n).unwrap_or_else(|| "(なし)".to_owned());
-            let wide = to_wide(&text);
-            // SAFETY: 自分のメニューの項目。
+            .collect();
+        // SAFETY: 自分が作成したメニューから既存の履歴項目だけを取り外す。
+        for e in &entries {
             unsafe {
-                let _ = ModifyMenuW(
+                let _ = RemoveMenu(popup, e.id as u32, MF_BYCOMMAND);
+            }
+        }
+        let mut position = 0;
+        for e in entries {
+            let n = e.args["index"].as_u64().unwrap_or(0) as usize;
+            let text = match label(n) {
+                Some(text) => text,
+                None if n == 1 => "(なし)".to_owned(),
+                None => continue,
+            };
+            let wide = to_wide(&text);
+            // SAFETY: 自分のメニューの先頭から履歴を順に戻す。コマンドIDは変えない。
+            unsafe {
+                let _ = InsertMenuW(
                     popup,
-                    e.id as u32,
-                    MF_BYCOMMAND | MF_STRING,
+                    position,
+                    MF_BYPOSITION | MF_STRING,
                     e.id as usize,
                     PCWSTR(wide.as_ptr()),
                 );
             }
+            position += 1;
         }
     }
 

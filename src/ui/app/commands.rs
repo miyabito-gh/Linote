@@ -89,8 +89,14 @@ pub const FILE_OPEN_RECENT: CommandDef = CommandDef::new(
 .params(&[ParamDef::required(
     "index",
     ParamType::Integer,
-    "一覧の番号（1 始まり、最大 10）",
+    "一覧の番号（1 始まり、最大 30）",
 )]);
+
+pub const FILE_CLEAR_RECENT: CommandDef = CommandDef::new(
+    CommandId::new("file.clear_recent"),
+    "一覧を消去",
+    "最近使ったファイルの一覧を消去する（確認なし）。",
+);
 
 pub const FILE_RELOAD: CommandDef = CommandDef::new(
     CommandId::new("file.reload"),
@@ -391,6 +397,10 @@ pub fn register(registry: &mut Registry<App>) -> Result<()> {
             other => return Err(Error::invalid_argument("encoding", other.to_owned())),
         };
         app.reopen_with_encoding(call.document()?, encoding, bom)?;
+        Ok(Value::Null)
+    })?;
+    registry.register(FILE_CLEAR_RECENT, |app, _| {
+        app.clear_recent();
         Ok(Value::Null)
     })?;
     registry.register(FILE_OPEN_RECENT, |app, call| {
@@ -875,6 +885,9 @@ impl App {
                 .map(|p| super::fileops::recent_menu_label(n, p))
         });
         menu.update_enabled(popup, |entry| {
+            if entry.command == FILE_CLEAR_RECENT.id {
+                return !recent.is_empty();
+            }
             if entry.command == crate::ui::menu::ID_FILE_OPEN_RECENT {
                 let n = entry.args["index"].as_u64().unwrap_or(0) as usize;
                 return n >= 1 && n <= recent.len();

@@ -24,7 +24,7 @@ pub(super) fn recent_menu_label(number: usize, path: &str) -> String {
     if number <= 9 {
         format!("&{number} {shown}")
     } else {
-        format!("{number} {shown}")
+        shown
     }
 }
 
@@ -83,6 +83,14 @@ impl App {
         if self.settings_state.writable() {
             self.persist_settings();
         }
+    }
+
+    /// 一覧の消去は確認なし。ほかのウィンドウの新しい設定を取り込んでから書く。
+    pub(super) fn clear_recent(&mut self) {
+        self.reload_settings(super::settingsops::ReloadReason::BeforeApply);
+        self.settings.recent_files.clear();
+        self.persist_settings();
+        self.invalidate(self.layout.editor);
     }
 
     /// 最近使ったファイルの `index` 番目（1 始まり）を開く。なければ案内して一覧から外す。
@@ -316,7 +324,7 @@ mod tests {
     fn recent_labels_have_mnemonics_and_escape_ampersands() {
         assert_eq!(recent_menu_label(1, "C:\\a\\b.txt"), "&1 C:\\a\\b.txt");
         assert_eq!(recent_menu_label(9, "C:\\a&b.txt"), "&9 C:\\a&&b.txt");
-        assert_eq!(recent_menu_label(10, "C:\\x.txt"), "10 C:\\x.txt");
+        assert_eq!(recent_menu_label(10, "C:\\x.txt"), "C:\\x.txt");
     }
 
     #[test]

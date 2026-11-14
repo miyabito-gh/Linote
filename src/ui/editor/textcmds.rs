@@ -208,6 +208,38 @@ impl Editor {
         edits.len()
     }
 
+    /// 全選択の外側にある行までをまとめて整理する（選択がなければ全文）。
+    pub fn organize_lines(&self, operation: crate::text::lines::LineOperation) -> bool {
+        if self.is_read_only() {
+            return false;
+        }
+        let selections = self.line_selections();
+        let text = self.text();
+        let Some(edit) = crate::text::lines::organize_lines(&text, &selections, operation) else {
+            return false;
+        };
+        self.apply_line_organization(edit);
+        true
+    }
+
+    /// 行整理の計算へ渡す選択（矩形・複数選択を含む）。
+    pub fn line_selections(&self) -> Vec<std::ops::Range<usize>> {
+        (0..self.send(SCI_GETSELECTIONS, 0, 0).max(1) as usize)
+            .map(|i| {
+                let start = self.send(SCI_GETSELECTIONNSTART, i, 0).max(0) as usize;
+                let end = self.send(SCI_GETSELECTIONNEND, i, 0).max(0) as usize;
+                start..end
+            })
+            .collect()
+    }
+
+    /// 版を照合した行整理を 1 回の Undo として適用する。
+    pub fn apply_line_organization(&self, edit: Edit) {
+        let top = self.send(SCI_GETFIRSTVISIBLELINE, 0, 0);
+        self.apply_edits(0, &[edit]);
+        self.send(SCI_SETFIRSTVISIBLELINE, top.max(0) as usize, 0);
+    }
+
     /// 行末の空白を削除する（選択があればその行だけ）。削除した行の数を返す。
     pub fn trim_trailing_whitespace(&self) -> usize {
         self.transform_region(transform::trailing_whitespace_edits)

@@ -331,3 +331,19 @@ pub struct RangeToFormatFull {
     pub cp_min: isize,
     pub cp_max: isize,
 }
+
+// --- ブックマークと行の整理（Scintilla.h と照合済み） ---
+pub const SCI_MARKERDEFINE: u32 = 2040;
+pub const SCI_MARKERSETFORE: u32 = 2041;
+pub const SCI_MARKERSETBACK: u32 = 2042;
+pub const SCI_MARKERADD: u32 = 2043;
+pub const SCI_MARKERDELETE: u32 = 2044;
+pub const SCI_MARKERDELETEALL: u32 = 2045;
+pub const SCI_MARKERGET: u32 = 2046;
+pub const SCI_MARKERNEXT: u32 = 2047;
+pub const SCI_MARKERPREVIOUS: u32 = 2048;
+pub const SCI_SETMARGINMASKN: u32 = 2244;
+pub const SCI_GETSELECTIONNSTART: u32 = 2585;
+pub const SCI_GETSELECTIONNEND: u32 = 2587;
+pub const SC_MARK_CIRCLE: isize = 0;
+pub const SC_MARGIN_SYMBOL: isize = 0;
