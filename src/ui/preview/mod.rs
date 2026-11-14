@@ -6,3 +6,16 @@
 //! 対象は [`crate::document::Capability::Preview`] を持つ文書。
 //!
 //! 担当: タスク H。
+
+mod host;
+mod pane;
+mod policy;
+mod window;
+
+pub use host::PreviewHost;
+pub use pane::{PaneStatus, PreviewPane};
+pub use policy::{
+    decide_navigation, fits_navigate_to_string, guidance_text, oversize_notice_html, NavDecision,
+    MAX_NAVIGATE_BYTES,
+};
+pub use window::PreviewWindow;
