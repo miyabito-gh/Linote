@@ -387,6 +387,9 @@ thread_local! {
     /// このスレッドの編集欄のウィンドウ（通知の送り元の確認用）。
     static EDITORS: RefCell<Vec<isize>> = const { RefCell::new(Vec::new()) };
     static REPAINT_PENDING: Cell<bool> = const { Cell::new(false) };
+    /// アプリを借りている間に届いた WM_SIZE（前回のウィンドウ位置の復元など）。借用の
+    /// 終わりに配置し直す（取りこぼすと、ステータスバーの下に余白が残る）。
+    static RELAYOUT_PENDING: Cell<bool> = const { Cell::new(false) };
     /// アプリを借りられない間に届いた「ワーカーの結果が届いた」知らせ（借用が終わったら
     /// もう一度投函する。モーダルなダイアログの間に取りこぼさないため）。
     static WAKE_PENDING: Cell<bool> = const { Cell::new(false) };
@@ -399,6 +402,9 @@ pub fn with_app<R>(f: impl FnOnce(&mut App) -> R) -> Option<R> {
         let mut guard = cell.try_borrow_mut().ok()?;
         let app = guard.as_mut()?;
         let r = f(app);
+        if RELAYOUT_PENDING.with(|p| p.replace(false)) {
+            app.relayout();
+        }
         app.sync();
         Some((r, app.hwnd))
     });
@@ -494,6 +500,10 @@ pub(crate) fn dispatch(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> 
             None => {
                 if msg == WM_APP_WAKE {
                     WAKE_PENDING.with(|p| p.set(true));
+                }
+                if msg == WM_SIZE {
+                    RELAYOUT_PENDING.with(|p| p.set(true));
+                    REPAINT_PENDING.with(|p| p.set(true));
                 }
                 if msg == WM_PAINT {
                     REPAINT_PENDING.with(|p| p.set(true));

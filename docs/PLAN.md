@@ -207,3 +207,7 @@ W5 配布・性能 ── N → 🪟性能計測 → O 最終レビュー
 - 見送り: Grep 結果の列表示（ListView 化）、ステータスバーのタブ幅表示。
 
 - 最後の品質関門: fmt、Clippy 全ターゲット（Windows・Linux）、Wine＋Xvfb の Windows テスト 441 件（7 件 ignored）、Linux lib 294 件、release ビルド、DLL 依存検査を通過。Windows 実機での見た目は未報告（`docs/verification/V.md` の 0.1.4）。
+
+### 2026-11-14 0.1.5 起動時のステータスバー下の余白
+
+- 前回のウィンドウ位置の復元（`SetWindowPlacement`）がアプリを借りている最中に WM_SIZE を出し、配置し直しを取りこぼしていた。借用中に届いた WM_SIZE を覚え、借用の終わりに配置し直すよう修正（モーダルなダイアログ中のサイズ変更も同様）。GUI 自己診断・Clippy 通過。

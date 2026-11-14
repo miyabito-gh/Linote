@@ -1,6 +1,6 @@
 [package]
 name = "linote"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2021"
 description = "Lightweight text editor for Windows"
 publish = false
