@@ -120,7 +120,7 @@ mod tests {
     fn terminators_are_found_from_both_ends_at_every_alignment() {
         for len in 0..40 {
             for at in 0..len {
-                for t in [b'\n', b'\r'] {
+                for t in *b"\n\r" {
                     let mut buf = vec![b'x'; len];
                     buf[at] = t;
                     assert_eq!(find_terminator(&buf), Some(at));

@@ -78,6 +78,7 @@ impl BlockCache {
         self.bytes
     }
 
+    #[cfg(test)]
     pub(crate) fn blocks(&self) -> usize {
         self.map.len()
     }

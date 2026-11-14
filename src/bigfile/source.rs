@@ -243,12 +243,6 @@ impl BigFile {
         Ok(want)
     }
 
-    /// 位置 `offset` のバイト。末尾以降なら `None`。
-    pub(crate) fn byte_at(&self, offset: u64) -> Result<Option<u8>> {
-        let mut b = [0u8; 1];
-        Ok((self.read_cached(offset, &mut b)? == 1).then_some(b[0]))
-    }
-
     /// `offset` を、UTF-8 の文字の途中でない位置まで前へ寄せる（高々 3 バイト）。
     /// 選択範囲や読み取り範囲の端を文字の境界に合わせるために使う。
     pub fn snap_to_char_boundary(&self, offset: u64) -> Result<u64> {

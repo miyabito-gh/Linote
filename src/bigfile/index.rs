@@ -82,6 +82,7 @@ impl LineIndex {
         self.scan_bound
     }
 
+    #[cfg(test)]
     pub(crate) fn stride(&self) -> u64 {
         self.stride
     }
@@ -90,6 +91,7 @@ impl LineIndex {
         self.entries.capacity() as u64 * CHECKPOINT_BYTES
     }
 
+    #[cfg(test)]
     pub(crate) fn checkpoints(&self) -> usize {
         self.entries.len()
     }

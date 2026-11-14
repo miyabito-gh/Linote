@@ -155,13 +155,13 @@ impl BigFileConfig {
 
     /// キャッシュが保持するブロック数の上限。
     pub fn max_cached_blocks(&self) -> usize {
-        ((self.cache_budget_bytes / self.block_bytes.max(1) as u64).max(1)).min(1 << 24) as usize
+        (self.cache_budget_bytes / self.block_bytes.max(1) as u64).clamp(1, 1 << 24) as usize
     }
 
     /// 行索引の控えの数の上限。領域を伸ばすときに一時的に古い領域と新しい領域が
     /// 並ぶので、予算の半分までを控えに使う。
     pub fn max_index_entries(&self) -> usize {
-        ((self.index_budget_bytes / (2 * index::CHECKPOINT_BYTES)).max(2)).min(1 << 28) as usize
+        (self.index_budget_bytes / (2 * index::CHECKPOINT_BYTES)).clamp(2, 1 << 28) as usize
     }
 }
 
