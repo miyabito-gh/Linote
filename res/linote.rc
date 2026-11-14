@@ -1,2 +1,4 @@
 #include <winuser.h>
 CREATEPROCESS_MANIFEST_RESOURCE_ID RT_MANIFEST "linote.manifest"
+// アプリのアイコン（ID 1 が EXE の表示アイコンになる）。res/icon/*.svg から scripts/make-icon.js で作る。
+1 ICON "linote.ico"
