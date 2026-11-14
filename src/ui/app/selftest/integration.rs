@@ -28,12 +28,12 @@ macro_rules! check {
     };
 }
 
-fn step<R>(f: impl FnOnce(&mut App) -> R) -> std::result::Result<R, String> {
+pub(super) fn step<R>(f: impl FnOnce(&mut App) -> R) -> std::result::Result<R, String> {
     with_app(f).ok_or_else(|| "アプリを借りられません".to_owned())
 }
 
 /// 条件が成り立つまで（アプリを借りずに）メッセージを回して待つ。
-fn wait(what: &str, mut cond: impl FnMut(&mut App) -> bool) -> Check {
+pub(super) fn wait(what: &str, mut cond: impl FnMut(&mut App) -> bool) -> Check {
     if pump_until(|| with_app(&mut cond).unwrap_or(false)) {
         Ok(())
     } else {
@@ -44,7 +44,7 @@ fn wait(what: &str, mut cond: impl FnMut(&mut App) -> bool) -> Check {
     }
 }
 
-fn cmd(id: &'static str, args: Value) -> Result<(), String> {
+pub(super) fn cmd(id: &'static str, args: Value) -> Result<(), String> {
     step(|app| app.run_command(CommandId::new(id), args))
 }
 
@@ -57,7 +57,7 @@ fn encode(text: &str, encoding: Encoding, bom: bool, on: OnUnmappable) -> Vec<u8
     text::encode(text, format, on, &TaskContext::detached()).expect("変換できる")
 }
 
-fn open_and_wait(path: &Path) -> Result<DocumentId, String> {
+pub(super) fn open_and_wait(path: &Path) -> Result<DocumentId, String> {
     let p = path.to_path_buf();
     cmd("file.open", json!({ "path": path.to_string_lossy() }))?;
     wait("ファイルが開く", |app| {
@@ -82,6 +82,7 @@ fn save_and_wait(id: DocumentId) -> Check {
 }
 
 pub(super) fn run(ctx: &Ctx) -> Check {
+    super::integration_i2::startup_is_light()?;
     file_round_trips(ctx)?;
     unmappable_and_external_change(ctx)?;
     closing(ctx)?;
@@ -91,6 +92,7 @@ pub(super) fn run(ctx: &Ctx) -> Check {
     editing_commands(ctx)?;
     clipboard_tab()?;
     menu_keys_and_settings(ctx)?;
+    super::integration_i2::run(ctx)?;
     Ok(())
 }
 

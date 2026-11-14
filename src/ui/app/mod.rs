@@ -24,11 +24,14 @@
 //!
 //! 担当: タスク B（統合は I1）。
 
+mod bigdoc;
 mod closing;
 mod commands;
 mod fileio;
 mod memos;
+mod preview;
 mod recover;
+mod search;
 pub mod selftest;
 
 use std::cell::{Cell, RefCell};
@@ -59,13 +62,14 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::appdata::{AppPaths, Settings, ThemeMode};
+use crate::bigfile::LargeModeThresholds;
 use crate::command::{
     Call, CommandDef, CommandHost, CommandId, CommandOutput, Invocation, ParamDef, ParamType,
     Registry, TargetKind, Value,
 };
 use crate::core::{
-    ui_channel, Actor, DocStamp, DocumentId, Error, Result, TargetRef, UiReceiver, UiSender,
-    Version,
+    ui_channel, Actor, CancelToken, DocStamp, DocumentId, Error, Result, TargetRef, UiReceiver,
+    UiSender, Version,
 };
 use crate::document::{Capabilities, Capability, DocumentState};
 use crate::file::FileStamp;
@@ -73,8 +77,10 @@ use crate::memo::MemoTab;
 use crate::platform::hotkey::GlobalHotkey;
 use crate::platform::system;
 use crate::recovery::RecoverySlot;
+use crate::search::SearchOptions;
 use crate::ui::dialogs::{Prompts, Win32Prompts};
 use crate::ui::editor::{self, DocLoader, Editor, EditorEvent, Language, SciDoc, ViewState};
+use crate::ui::find::FindPanel;
 use crate::ui::memo_panel::MemoPanel;
 use crate::ui::menu::{KeyMap, MenuModel};
 use crate::ui::statusbar::{MessageKind, StatusBar, StatusInfo, StatusSegment};
@@ -298,6 +304,23 @@ pub struct App {
     menu: Option<MenuModel>,
     hotkey: Option<GlobalHotkey>,
     memo_panel: Option<MemoPanel>,
+    /// 検索・置換・Grep の小窓（初めて使うときに作る）。
+    find_panel: Option<FindPanel>,
+    /// 最後に使った検索条件（F3 用）。
+    last_search: Option<SearchOptions>,
+    /// 実行中の検索（ワーカー）の中止。
+    search_cancel: Option<CancelToken>,
+    /// これ以上の大きさの文書は、検索・置換をワーカーで行う。
+    worker_search_bytes: usize,
+    /// Grep の結果を開いたあとの移動先（開き終えるまで待たせる）。
+    pending_jumps: HashMap<PathBuf, (u64, u64)>,
+    /// 巨大ファイルのタブの部品。
+    bigviews: HashMap<DocumentId, bigdoc::BigDoc>,
+    /// 巨大モードにする条件。
+    large_thresholds: LargeModeThresholds,
+    big_timer: bool,
+    /// Markdown プレビュー（初めて開くときに作る）。
+    preview: Option<preview::PreviewState>,
     /// 終了時に「保存しない」と選んだ文書（確認を繰り返さない。破棄は終了の間際）。
     exit_discard: HashMap<DocumentId, Version>,
     /// 読み込み中のパス（二重に開かない）。
@@ -354,6 +377,10 @@ fn is_our_editor(hwnd: HWND) -> bool {
 
 fn register_editor_hwnd(hwnd: HWND) {
     EDITORS.with(|e| e.borrow_mut().push(hwnd.0 as isize));
+}
+
+fn unregister_editor_hwnd(hwnd: HWND) {
+    EDITORS.with(|e| e.borrow_mut().retain(|h| *h != hwnd.0 as isize));
 }
 
 /// メインウィンドウのメッセージの入口（`window.rs` のウィンドウプロシージャから呼ぶ）。
@@ -586,6 +613,15 @@ impl App {
             menu: None,
             hotkey: None,
             memo_panel: None,
+            find_panel: None,
+            last_search: None,
+            search_cancel: None,
+            worker_search_bytes: search::WORKER_SEARCH_BYTES,
+            pending_jumps: HashMap::new(),
+            bigviews: HashMap::new(),
+            large_thresholds: LargeModeThresholds::DEFAULT,
+            big_timer: false,
+            preview: None,
             exit_discard: HashMap::new(),
             opening: HashSet::new(),
             autosave_timer: false,
@@ -748,6 +784,7 @@ impl App {
         }
         for &id in &changed_docs {
             self.note_change(id);
+            self.preview_note_change(id);
         }
         if let Some(hook) = self.hooks.document_changed {
             for id in changed_docs {
@@ -971,10 +1008,14 @@ impl App {
         if let Some(cur) = self.active {
             match self.docs[cur].view {
                 DocView::Scintilla(_) => self.docs[cur].view_state = self.editor.view_state(),
-                // SAFETY: 外部の表示部品を隠すだけ。
-                DocView::External(h) => unsafe {
-                    let _ = ShowWindow(h, SW_HIDE);
-                },
+                DocView::External(h) => {
+                    let leaving = self.docs[cur].id();
+                    self.big_leave(leaving);
+                    // SAFETY: 外部の表示部品を隠すだけ。
+                    unsafe {
+                        let _ = ShowWindow(h, SW_HIDE);
+                    }
+                }
             }
         }
         let d = &self.docs[i];
@@ -1007,6 +1048,7 @@ impl App {
                     );
                     let _ = ShowWindow(h, SW_SHOW);
                 }
+                self.big_enter(id);
             }
         }
         self.active = Some(i);
@@ -1018,6 +1060,8 @@ impl App {
         self.focus_active();
         // 表示した文書のファイルが、ほかで変更されていないか確かめる。
         self.check_external_change_of(id);
+        self.update_find_context();
+        self.preview_active_changed(id);
         if let Some(hook) = self.hooks.active_changed {
             hook(self, Some(id));
         }
@@ -1073,6 +1117,10 @@ impl App {
             }
         }
         self.edits.retain(|s| s.doc != id);
+        self.close_big(id);
+        self.preview_document_closed(id);
+        self.pending_jumps
+            .retain(|p, _| doc.state.path() != Some(p.as_path()));
         if let DocView::Scintilla(sci) = doc.view {
             if let Some(aux) = &self.aux {
                 if self.aux_doc == Some(sci) || aux.document() == sci {
@@ -1164,6 +1212,7 @@ impl App {
         let info = match self.active.map(|i| &self.docs[i]) {
             None => StatusInfo::default(),
             Some(d) => {
+                let big = self.big_status_text(d.id());
                 let (line, column, selected_chars) = match d.view {
                     DocView::Scintilla(_) => {
                         let sel = self.editor.selection();
@@ -1183,7 +1232,11 @@ impl App {
                     line,
                     column,
                     selected_chars,
-                    language: d.language.label().to_owned(),
+                    position_text: big.as_ref().map(|b| b.0.clone()),
+                    language: match &big {
+                        Some(b) => b.1.clone(),
+                        None => d.language.label().to_owned(),
+                    },
                     read_only: !d.state.capabilities().contains(Capability::Edit),
                     external_change: d.state.has_external_change(),
                     ai_edits: d.state.has_ai_edits(),
@@ -1312,6 +1365,13 @@ impl App {
         if let Some(panel) = self.memo_panel {
             panel.set_theme(&self.theme);
         }
+        if let Some(panel) = self.find_panel {
+            panel.set_theme(&self.theme);
+        }
+        for b in self.bigviews.values() {
+            b.view.set_theme(&self.theme);
+        }
+        self.preview_theme_changed();
         // SAFETY: ウィンドウ全体を描き直す。
         unsafe {
             let _ = InvalidateRect(Some(self.hwnd), None, false);
@@ -1430,6 +1490,12 @@ impl App {
                 if let Some(panel) = self.memo_panel {
                     panel.set_dpi(self.dpi);
                 }
+                if let Some(panel) = self.find_panel {
+                    panel.set_dpi(self.dpi);
+                }
+                for b in self.bigviews.values() {
+                    b.view.set_dpi(self.dpi);
+                }
                 Some(LRESULT(0))
             }
             WM_COMMAND if Self::is_menu_command(wparam, lparam) => {
@@ -1443,6 +1509,14 @@ impl App {
             WM_HOTKEY => self.on_hotkey(wparam),
             WM_TIMER if wparam.0 == TIMER_AUTOSAVE => {
                 self.autosave_tick(false);
+                Some(LRESULT(0))
+            }
+            WM_TIMER if wparam.0 == bigdoc::TIMER_BIG => {
+                self.big_tick();
+                Some(LRESULT(0))
+            }
+            WM_TIMER if wparam.0 == preview::TIMER_PREVIEW => {
+                self.preview_tick();
                 Some(LRESULT(0))
             }
             WM_MOUSEMOVE => {
@@ -1668,6 +1742,12 @@ impl App {
                 }
             }
         }
+        self.preview_teardown();
+        let big_ids: Vec<DocumentId> = self.bigviews.keys().copied().collect();
+        for id in big_ids {
+            self.close_big(id);
+        }
+        self.cancel_search();
         self.hotkey = None;
         self.menu = None;
         self.active = None;

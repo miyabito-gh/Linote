@@ -13,6 +13,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::appdata::{AppPaths, Settings};
+use crate::bigfile::{large_mode_reason, FileProfile, LargeModeReason};
 use crate::core::{DocStamp, DocumentId, Error, Limits, Result, TaskContext, WorkerPool};
 use crate::document::{Capability, DocumentKind, DocumentState};
 use crate::file::{
@@ -23,7 +24,7 @@ use crate::ui::editor::{DocLoader, Language};
 use crate::ui::statusbar::MessageKind;
 
 use super::closing::{self, ChoiceAction, ClosePlan};
-use super::{file_title, App, UiMessage};
+use super::{file_title, App, DocView, UiMessage};
 
 // ------------------------------------------------------------------ 設定ファイル
 
@@ -157,11 +158,6 @@ impl SaveOpts {
     }
 }
 
-/// 通常編集で開ける大きさの上限（これを超えると巨大ファイルのビューの担当。統合 I2）。
-fn normal_max_bytes() -> u64 {
-    crate::bigfile::LargeModeThresholds::DEFAULT.max_bytes
-}
-
 impl App {
     // ---------------------------------------------------------------- 設定の保存
 
@@ -239,15 +235,22 @@ impl App {
         reopen: Option<(DocStamp, Option<Encoding>, bool)>,
     ) -> Result<()> {
         let meta = std::fs::metadata(path).map_err(|e| Error::io("読み込み", path, e))?;
-        let max = normal_max_bytes();
-        if meta.len() > max {
-            return Err(Error::LimitExceeded {
-                what: format!(
-                    "通常編集で開けるファイルの大きさ（{} MiB。巨大ファイルの表示は未統合）",
-                    max / (1024 * 1024)
-                ),
-                limit: max,
-            });
+        let thresholds = self.large_thresholds;
+        let max = thresholds.max_bytes;
+        let too_large = large_mode_reason(&FileProfile::of_size(meta.len()), &thresholds).is_some();
+        if too_large {
+            if reopen.is_some() {
+                return Err(Error::LimitExceeded {
+                    what: format!(
+                        "文字コードを指定して開き直せるファイルの大きさ（{} MiB）",
+                        max / (1024 * 1024)
+                    ),
+                    limit: max,
+                });
+            }
+            // 巨大モード: 読み取り専用のビューで開く（本文は読み込まない）。
+            self.opening.remove(path);
+            return self.open_big(path).map(|_| ());
         }
         let loader = self.create_loader(meta.len())?;
         let (reopen_of, encoding, force_bom) = match reopen {
@@ -259,6 +262,7 @@ impl App {
             reopen_of,
             force_bom,
         };
+        let reopen_of = request.reopen_of;
         let sender = self.sender();
         let read_path = path.to_path_buf();
         WorkerPool::global().spawn(move || {
@@ -271,13 +275,27 @@ impl App {
                 ..ReadOptions::default()
             };
             let mut loader: DocLoader = loader;
+            let allow_big = reopen_of.is_none();
             let result = file::read_text(&read_path, &options, &ctx).and_then(|mut loaded| {
-                // 本文は読み込み口に流し込み、ここでは持たない。
-                let text = std::mem::take(&mut loaded.text);
-                loader.add(text.as_bytes())?;
-                Ok(loaded)
+                // 容量は小さくても、行数が多い・1 行が極端に長いファイルは巨大モードにする
+                // （UTF-8 のときだけ。巨大ファイルのビューは UTF-8 を前提とする）。
+                let gate = thresholds.max_lines.min(thresholds.max_line_bytes);
+                let reason = if allow_big
+                    && loaded.format.encoding == Encoding::Utf8
+                    && loaded.text.len() as u64 > gate
+                {
+                    large_mode_reason(&FileProfile::of_text(loaded.text.as_bytes()), &thresholds)
+                } else {
+                    None
+                };
+                if reason.is_none() {
+                    // 本文は読み込み口に流し込み、ここでは持たない。
+                    let text = std::mem::take(&mut loaded.text);
+                    loader.add(text.as_bytes())?;
+                }
+                Ok((loaded, reason))
             });
-            let result = result.map(|loaded| (loaded, loader));
+            let result = result.map(|(loaded, reason)| (loaded, loader, reason));
             sender.send(UiMessage::Run(Box::new(move |app| {
                 app.finish_open(request, result)
             })));
@@ -285,9 +303,13 @@ impl App {
         Ok(())
     }
 
-    fn finish_open(&mut self, request: OpenRequest, result: Result<(LoadedText, DocLoader)>) {
+    fn finish_open(
+        &mut self,
+        request: OpenRequest,
+        result: Result<(LoadedText, DocLoader, Option<LargeModeReason>)>,
+    ) {
         self.opening.remove(&request.path);
-        let (loaded, loader) = match result {
+        let (loaded, loader, big) = match result {
             Ok(r) => r,
             Err(e) => {
                 self.report_failure(
@@ -306,6 +328,18 @@ impl App {
                 );
                 return;
             }
+        }
+        if big.is_some() {
+            // 行数が多い・長大な行がある: 読み込んだ分は捨て、読み取り専用のビューで開く。
+            drop(loader);
+            if let Err(e) = self.open_big(&request.path) {
+                self.report_failure(
+                    &format!("{} を開けませんでした", request.path.display()),
+                    &e,
+                );
+                self.ensure_a_document();
+            }
+            return;
         }
         let doc = match loader.finish() {
             Ok(d) => d,
@@ -335,6 +369,7 @@ impl App {
         if let Ok(i) = self.index_of(id) {
             self.docs[i].lossy = lossy;
         }
+        self.apply_pending_jump(id);
         if lossy {
             self.set_status(
                 &format!(
@@ -469,6 +504,11 @@ impl App {
         let result = (|| {
             let i = self.index_of(id)?;
             let d = &self.docs[i];
+            if matches!(d.view, DocView::External(_)) {
+                return Err(Error::unsupported(
+                    "巨大ファイルは読み取り専用のため保存できません",
+                ));
+            }
             if matches!(d.state.kind(), DocumentKind::Memo(_)) {
                 return if self.save_memo_now(id) {
                     Ok(())

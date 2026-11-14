@@ -44,6 +44,8 @@ pub struct StatusInfo {
     pub column: u64,
     /// 選択している文字数（選択がなければ 0）。
     pub selected_chars: u64,
+    /// 位置の表示を、行・列の代わりにこの文字列にする（巨大ファイルのビュー）。
+    pub position_text: Option<String>,
     pub language: String,
     /// 文字コード（[`TextFormat::label`]）。
     pub encoding: String,
@@ -73,8 +75,11 @@ impl StatusInfo {
         if self.ai_edits {
             out.push((StatusSegment::AiEdits, "AI の変更あり".to_owned()));
         }
-        let mut pos = format!("行 {}, 列 {}", self.line, self.column);
-        if self.selected_chars > 0 {
+        let mut pos = match &self.position_text {
+            Some(text) => text.clone(),
+            None => format!("行 {}, 列 {}", self.line, self.column),
+        };
+        if self.position_text.is_none() && self.selected_chars > 0 {
             pos.push_str(&format!(" ({} 文字選択)", self.selected_chars));
         }
         out.push((StatusSegment::Position, pos));

@@ -207,7 +207,15 @@ static MENUS: &[MenuDef] = &[
     },
     MenuDef {
         title: "検索(&S)",
-        items: &[Item::Cmd(CommandId::new("edit.goto_line"))],
+        items: &[
+            Item::Cmd(CommandId::new("search.find")),
+            Item::Cmd(CommandId::new("search.replace")),
+            Item::Cmd(CommandId::new("search.find_next")),
+            Item::Cmd(CommandId::new("search.find_prev")),
+            Item::Cmd(CommandId::new("search.grep")),
+            Item::Separator,
+            Item::Cmd(CommandId::new("edit.goto_line")),
+        ],
     },
     MenuDef {
         title: "表示(&V)",
@@ -216,6 +224,9 @@ static MENUS: &[MenuDef] = &[
             Item::Cmd(CommandId::new("view.prev_tab")),
             Item::Separator,
             Item::Cmd(CommandId::new("view.toggle_theme")),
+            Item::Separator,
+            Item::Cmd(CommandId::new("view.preview_pane")),
+            Item::Cmd(CommandId::new("view.preview_window")),
         ],
     },
     MenuDef {

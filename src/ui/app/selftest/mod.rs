@@ -32,6 +32,7 @@ use crate::ui::dialogs::ScriptedPrompts;
 use crate::ui::editor::Language;
 
 mod integration;
+mod integration_i2;
 
 /// 統合の試験の道具立て。
 pub(crate) struct Ctx {

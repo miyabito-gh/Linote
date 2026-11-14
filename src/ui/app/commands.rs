@@ -19,6 +19,7 @@ use crate::platform::clipboard;
 use crate::platform::hotkey::{
     bring_to_front, HotkeyStatus, CLIPBOARD_HOTKEY_ID, DEFAULT_CLIPBOARD_CHORD,
 };
+use crate::search::Direction;
 use crate::text::{Encoding, EolStats};
 use crate::ui::dialogs::NoticeKind;
 use crate::ui::editor::Language;
@@ -160,6 +161,54 @@ pub const VIEW_TOGGLE_THEME: CommandDef = CommandDef::new(
 )
 .result("{\"theme\": \"system\" | \"light\" | \"dark\"}");
 
+pub const SEARCH_FIND: CommandDef = CommandDef::new(
+    CommandId::new("search.find"),
+    "検索...",
+    "検索・置換・Grep の小窓を開く（選択文字列があれば検索欄に入れる）。",
+)
+.default_key("Ctrl+F");
+
+pub const SEARCH_REPLACE: CommandDef = CommandDef::new(
+    CommandId::new("search.replace"),
+    "置換...",
+    "検索・置換・Grep の小窓を開く（置換欄を使う）。巨大ファイルでは置換は使えない。",
+)
+.default_key("Ctrl+H");
+
+pub const SEARCH_FIND_NEXT: CommandDef = CommandDef::new(
+    CommandId::new("search.find_next"),
+    "次を検索",
+    "直前の検索条件で次の一致を探す（端で折り返す）。条件がなければ検索の小窓を開く。",
+)
+.default_key("F3");
+
+pub const SEARCH_FIND_PREV: CommandDef = CommandDef::new(
+    CommandId::new("search.find_prev"),
+    "前を検索",
+    "直前の検索条件で前の一致を探す（端で折り返す）。条件がなければ検索の小窓を開く。",
+)
+.default_key("Shift+F3");
+
+pub const SEARCH_GREP: CommandDef = CommandDef::new(
+    CommandId::new("search.grep"),
+    "フォルダー内を検索（Grep）...",
+    "検索・置換・Grep の小窓を開き、Grep の起点をアクティブな文書のフォルダーにする。",
+)
+.default_key("Ctrl+Shift+F");
+
+pub const VIEW_PREVIEW_PANE: CommandDef = CommandDef::new(
+    CommandId::new("view.preview_pane"),
+    "Markdown プレビュー（右ペイン）",
+    "Markdown 文書（.md／.markdown）のプレビューを右ペインに開く（開いていれば閉じる）。初めて使うときに WebView2 を初期化する。",
+)
+.default_key("Ctrl+Shift+P");
+
+pub const VIEW_PREVIEW_WINDOW: CommandDef = CommandDef::new(
+    CommandId::new("view.preview_window"),
+    "Markdown プレビュー（別ウィンドウ）",
+    "Markdown 文書（.md／.markdown）のプレビューを別ウィンドウに開く（開いていれば閉じる）。",
+);
+
 pub const MEMO_OPEN_PANEL: CommandDef = CommandDef::new(
     CommandId::new("memo.open_panel"),
     "メモの一覧...",
@@ -252,7 +301,16 @@ pub fn register(registry: &mut Registry<App>) -> Result<()> {
         Ok(Value::Null)
     })?;
     registry.register(EDIT_COPY, |app, call| {
-        app.with_text(call.document()?, |ed| ed.copy())?;
+        let id = call.document()?;
+        if let Some(b) = app.bigviews.get(&id) {
+            match b.view.copy_selection() {
+                Ok(0) => {}
+                Ok(n) => app.set_status(&format!("{n} バイトをコピーしました"), MessageKind::Info),
+                Err(e) => return Err(e),
+            }
+            return Ok(Value::Null);
+        }
+        app.with_text(id, |ed| ed.copy())?;
         Ok(Value::Null)
     })?;
     registry.register(EDIT_PASTE, |app, call| {
@@ -260,11 +318,19 @@ pub fn register(registry: &mut Registry<App>) -> Result<()> {
         Ok(Value::Null)
     })?;
     registry.register(EDIT_SELECT_ALL, |app, call| {
-        app.with_text(call.document()?, |ed| ed.select_all())?;
+        let id = call.document()?;
+        if let Some(b) = app.bigviews.get(&id) {
+            b.view.select_all();
+            return Ok(Value::Null);
+        }
+        app.with_text(id, |ed| ed.select_all())?;
         Ok(Value::Null)
     })?;
     registry.register(EDIT_GOTO_LINE, |app, call| {
         let id = call.document()?;
+        if app.bigviews.contains_key(&id) {
+            return app.big_goto(id, call.opt_u64("line"));
+        }
         let (total, current) = app.with_text(id, |ed| {
             let caret = ed.selection().caret;
             (ed.line_count(), ed.line_from_position(caret) + 1)
@@ -311,6 +377,41 @@ pub fn register(registry: &mut Registry<App>) -> Result<()> {
         app.persist_settings();
         app.set_status(&format!("テーマ: {}", theme_label(next)), MessageKind::Info);
         Ok(serde_json::json!({ "theme": next.name() }))
+    })?;
+
+    registry.register(SEARCH_FIND, |app, _| {
+        app.show_find(false)?;
+        Ok(Value::Null)
+    })?;
+    registry.register(SEARCH_REPLACE, |app, _| {
+        app.show_find(false)?;
+        Ok(Value::Null)
+    })?;
+    registry.register(SEARCH_FIND_NEXT, |app, _| {
+        match app.current_search_options() {
+            Some(options) => app.search_step(options, Direction::Forward),
+            None => app.show_find(false)?,
+        }
+        Ok(Value::Null)
+    })?;
+    registry.register(SEARCH_FIND_PREV, |app, _| {
+        match app.current_search_options() {
+            Some(options) => app.search_step(options, Direction::Backward),
+            None => app.show_find(false)?,
+        }
+        Ok(Value::Null)
+    })?;
+    registry.register(SEARCH_GREP, |app, _| {
+        app.show_find(true)?;
+        Ok(Value::Null)
+    })?;
+    registry.register(VIEW_PREVIEW_PANE, |app, _| {
+        app.toggle_preview_pane()?;
+        Ok(serde_json::json!({ "open": app.preview_pane_open() }))
+    })?;
+    registry.register(VIEW_PREVIEW_WINDOW, |app, _| {
+        app.toggle_preview_window()?;
+        Ok(serde_json::json!({ "open": app.preview_window_open() }))
     })?;
 
     registry.register(MEMO_OPEN_PANEL, |app, _| {
