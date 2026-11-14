@@ -307,6 +307,27 @@ pub fn classify(error: &Error) -> Option<IoFailure>;   // Error::Io の原因
 - 同じプロセスの中でも、同じパスを 2 回取ることはできない（2 回目は `Busy`）。
 - 復元データの所有（上の 4）は、`LockFile` を保持し続けることで示す。孤児の引き取りは `try_acquire` が成功したこと自体を「引き取った」とする。
 
+### 復元データの形式（タスク D が確定）
+
+`recovery/` の中（実装は `src/recovery/`）:
+
+```text
+recovery\
+  <id>.rec          復元データ 1 件。<id> = <プロセス ID>-<時刻ms>-<連番>（16 進、英小文字・数字・`-`）
+  <id>.lock         所有のロックファイル。所有プロセスが文書を閉じるまで排他ロックを保持
+  quarantine\       壊れた・未知の版の隔離先（<id>.corrupt.rec / <id>.unknown-version.rec）。削除しない
+```
+
+- **`.rec` の中身**: 1 行目がコンパクトな JSON のヘッダー、改行、続けて本文（UTF-8 の生バイト）。ヘッダーは `format`（`linote-recovery`）、`version`（形式の版。現在 1）、`id`、`kind`（`file`／`untitled`／`clipboard`／`ai`）、`source_path`（なければ null。UTF-8 に変換できないパスは置換文字になる）、`encoding`／`bom`／`eol`（`TextFormat`）、`file_stamp`（`{len, modified_ns}` または null。復元時に `file::check_external_change` へ渡す）、`title`、`doc_version`、`created_ms`／`updated_ms`、`owner_pid`（参考情報）、`body_len`、`body_fnv`（本文の FNV-1a 64 ビット）。1 ファイルなので原子的な置換だけで整合する。長さと検査値が合わないものは壊れているとみなす。
+- **所有**: `RecoveryStore::open_slot()` が新しい `<id>` を作り、`.lock` を `file::LockFile` で取る（文書ごとに 1 つ、閉じるまで保持）。各プロセスは自分の `<id>` にしか書かないので、同じ文書を複数ウィンドウで開いても上書きし合わない。プロセスが落ちれば OS がロックを解放する。
+- **孤児の引き取り**: `RecoveryStore::scan()` は `.rec` ごとに `.lock` を `try_acquire` し、取れたもの（持ち主が落ちた）を `Candidate` として返す。`Candidate` はロックを保持するので他のプロセスは引き取れない。取れない（`Busy`）ものは `live` に載せるだけで触らない。`Candidate::read_text()` で本文、`meta`（`file_stamp` を含む）で付随情報を得る。復元しても元ファイルには書かない。`into_slot()` で復元した文書が `<id>` を引き継ぎ、`discard()` で削除する。
+- **隔離**: 引き取れたもののうち、壊れている・未知の版のものは `quarantine/` へ移して `ScanReport::quarantined` で報告する（削除しない）。生きているプロセスのものは、読めなくても触らない。
+- **書き出し**（`RecoverySlot::write`、ワーカーで呼ぶ）: `file::write_atomic` で `.rec` を置換する。UI が `Snapshot`（本文の写し・版）を渡し、完了の通知は呼び出し側が `DocStamp` で行う。書き出した版より古い版、保存済みの版以下は `Stale` で捨てる。Windows では他のプロセスが走査で読んでいる最中の置換が拒否されうるので、拒否・使用中なら数回やり直す。
+- **削除**: `RecoverySlot::saved(版)` は保存した版以前の分だけを削除する（保存中に進んだ分は残す）。`discard()` は `.rec` と `.lock` を削除して所有を手放す。`.lock` は `<id>` が一意なので、`discard`／隔離のときに限り削除してよい。
+- **掃除**: 走査は、1 時間以上前の一時ファイル（`is_temp_file_name`）と、データのない 1 時間以上前のロックファイルを削除する。作られた直後のロックファイルは、作成とロック取得の間に消すと持ち主が消えたファイルをロックしてしまうので触らない。
+- **書き出しの間隔**: `RecoveryPolicy` の既定は、最後の編集から 2 秒（入力が落ち着いたとき）、ただし未書き出しの編集が 30 秒を超えて溜まらないようにする。設定項目にするかは統括の判断。
+- 別プロセス（将来の MCP）も同じ `scan()` を呼んでよい。候補を捨てれば（Drop）ロックは解放され、孤児のまま残る。
+
 ### 読み込みの流れ（通常ファイル）
 
 `file::read_text` が、読み込み・判定・変換・改行の集計をまとめて行う（ワーカーで呼ぶ）。

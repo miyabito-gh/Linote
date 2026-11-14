@@ -19,3 +19,21 @@
 //!   プロセスが所有する復元データを、別のプロセスが復元・削除しないこと。
 //! - 元ファイルへの保存の成功、または利用者による明示的な破棄で削除する。
 //!   復元した内容を元ファイルへ書くのは、利用者が保存したときだけ。
+//!
+//! 構成:
+//! - [`format`]: 1 件の復元データのファイル形式（版つきヘッダー + 本文、検査つき）。
+//! - [`store`]: 保存先ディレクトリの操作（[`RecoveryStore`]、[`RecoverySlot`]、起動時の [`ScanReport`]）。
+//! - `RecoveryPolicy`: 書き出しの間隔の方針（設定可能、既定値つき）。
+//!
+//! 保存先のディレクトリ構成と形式は `docs/architecture.md` §7 の「復元データの形式」。
+
+pub mod format;
+mod policy;
+mod store;
+
+pub use format::{Meta, RecoveryId, RecoveryKind, Snapshot, FORMAT_VERSION};
+pub use policy::RecoveryPolicy;
+pub use store::{
+    Candidate, LiveEntry, QuarantineReason, Quarantined, RecoverySlot, RecoveryStore, ScanReport,
+    WriteOutcome,
+};
