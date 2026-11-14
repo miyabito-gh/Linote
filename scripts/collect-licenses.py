@@ -6,6 +6,7 @@ crate に同梱されたライセンスファイルを連結し、Scintilla と 
 使い方: python3 scripts/collect-licenses.py OUTPUT_FILE
 """
 import json
+import os
 import pathlib
 import subprocess
 import sys
@@ -37,7 +38,8 @@ def main() -> int:
     # （libgcc、libstdc++。GCC Runtime Library Exception 付き）。ビルド環境の Debian/Ubuntu の著作権情報を写す。
     for name, path in [("MinGW-w64 runtime (CRT, winpthreads)", "/usr/share/doc/mingw-w64-common/copyright"),
                        ("GCC runtime (libgcc, libstdc++)", "/usr/share/doc/gcc-mingw-w64-base/copyright")]:
-        f = pathlib.Path(path)
+        # Relocated toolchains can supply the root containing usr/share/doc.
+        f = pathlib.Path(os.environ.get("LINOTE_TOOLCHAIN_ROOT", "/")) / path.lstrip("/")
         if f.exists():
             parts.append(f"\n## {name}\n\n" + f.read_text(encoding="utf-8", errors="replace"))
         else:

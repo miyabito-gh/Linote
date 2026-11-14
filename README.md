@@ -39,6 +39,20 @@ cargo build --release
 scripts/package.sh
 ```
 
+Windows 用インストーラー（NSIS 3.11 以降が必要）:
+
+```bash
+scripts/package-installer.sh
+```
+
+`dist/linote-<版>-win-x64-setup.exe` を作成します。管理者権限なしで
+`%LOCALAPPDATA%\Programs\Linote` に導入し、スタートメニューへ登録します。
+Windows の「インストールされているアプリ」から削除できます。
+アンインストール後も `%LOCALAPPDATA%\Linote` の設定・メモ・復元データは保持します。
+インストーラーはコード署名していません。
+ツールチェーンを別のルートへ展開した環境では、ライセンス収集用に
+`LINOTE_TOOLCHAIN_ROOT` へそのルートを指定します（通常は不要）。
+
 ## 第三者ソフトウェア
 
 Scintilla 5.4.1 と Lexilla 5.3.0 を同梱しています（[third_party/VENDORED.md](third_party/VENDORED.md)）。配布物には `THIRD_PARTY_LICENSES.txt` を含めます。
