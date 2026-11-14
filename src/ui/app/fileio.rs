@@ -30,6 +30,8 @@ use super::{file_title, App, DocView, UiMessage};
 
 // ------------------------------------------------------------------ 設定ファイル
 
+/// 設定の書き出しをやり直す最大回数（間隔 20 ms）。
+const SETTINGS_WRITE_ATTEMPTS: u32 = 100;
 /// 設定の保存の依頼の通し番号と、書き出し済みの最後の番号。
 static SETTINGS_SEQ: AtomicU64 = AtomicU64::new(0);
 static SETTINGS_WRITTEN: Mutex<u64> = Mutex::new(0);
@@ -191,13 +193,24 @@ impl App {
                 return;
             }
             *last = seq;
-            let result = paths.ensure_dir(paths.root()).and_then(|()| {
-                file::write_atomic(
-                    &paths.settings_file(),
-                    json.as_bytes(),
-                    &TaskContext::detached(),
-                )
-            });
+            // 置換は、他のプロセスや読み手（ウイルス対策、検索の索引、Wine での読み取りなど）が
+            // 設定ファイルを開いている間、一時的に拒否されることがある。書き込みを落とさない
+            // よう、短い間隔で数回やり直す。
+            let mut attempt = 0;
+            let result = loop {
+                let result = paths.ensure_dir(paths.root()).and_then(|()| {
+                    file::write_atomic(
+                        &paths.settings_file(),
+                        json.as_bytes(),
+                        &TaskContext::detached(),
+                    )
+                });
+                attempt += 1;
+                if result.is_ok() || attempt >= SETTINGS_WRITE_ATTEMPTS {
+                    break result;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            };
             drop(last);
             if let Err(e) = result {
                 sender.send(UiMessage::Status(format!(
