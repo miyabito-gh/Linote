@@ -114,6 +114,26 @@ pub const FILE_CLOSE_OTHERS: CommandDef = CommandDef::new(
 .target(TargetKind::Document)
 .result("{\"closed\": 閉じた数}");
 
+pub const FILE_CLOSE_RIGHT: CommandDef = CommandDef::new(
+    CommandId::new("file.close_right"),
+    "右側のタブを閉じる",
+    "指定した（なければアクティブな）文書より右のタブをすべて閉じる。未保存の文書は 1 つずつ確認する。",
+)
+.target(TargetKind::Document)
+.result("{\"closed\": 閉じた数}");
+
+pub const FILE_MOVE_TO_NEW_WINDOW: CommandDef = CommandDef::new(
+    CommandId::new("file.move_to_new_window"),
+    "新しいウィンドウに移動",
+    "タブを新しいプロセスのウィンドウへ移す。新しい側が文書を取り込んだと確認できてから元のタブを閉じる（失敗したら残す）。",
+)
+.target(TargetKind::Document)
+.params(&[ParamDef::optional(
+    "position",
+    ParamType::String,
+    "新しいウィンドウの左上の目安（画面座標 \"x,y\"。省略すると既定の位置）",
+)]);
+
 pub const FILE_NEW_WINDOW: CommandDef = CommandDef::new(
     CommandId::new("file.new_window"),
     "新しいウィンドウ",
@@ -388,6 +408,20 @@ pub fn register(registry: &mut Registry<App>) -> Result<()> {
     registry.register(FILE_CLOSE_OTHERS, |app, call| {
         let closed = app.close_other_documents(call.document()?);
         Ok(serde_json::json!({ "closed": closed }))
+    })?;
+    registry.register(FILE_CLOSE_RIGHT, |app, call| {
+        let closed = app.close_documents_right_of(call.document()?);
+        Ok(serde_json::json!({ "closed": closed }))
+    })?;
+    registry.register(FILE_MOVE_TO_NEW_WINDOW, |app, call| {
+        let position = match call.opt_str("position") {
+            None => None,
+            Some(s) => Some(crate::appdata::handoff::parse_position(s).ok_or_else(|| {
+                Error::invalid_argument("position", "\"x,y\" の形ではありません")
+            })?),
+        };
+        app.move_to_new_window(call.document()?, position)?;
+        Ok(Value::Null)
     })?;
     registry.register(FILE_NEW_WINDOW, |app, _| {
         app.spawn_new_window()?;

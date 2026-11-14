@@ -130,7 +130,7 @@ impl App {
         n
     }
 
-    fn close_each(&mut self, ids: Vec<DocumentId>) -> usize {
+    pub(super) fn close_each(&mut self, ids: Vec<DocumentId>) -> usize {
         let mut closed = 0;
         for id in ids {
             match self.close_document(id, false) {
@@ -220,7 +220,7 @@ impl App {
 
     // ---------------------------------------------------------------- パス
 
-    fn path_of(&self, id: DocumentId) -> Result<PathBuf> {
+    pub(super) fn path_of(&self, id: DocumentId) -> Result<PathBuf> {
         let i = self.index_of(id)?;
         self.docs[i]
             .state

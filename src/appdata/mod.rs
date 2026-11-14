@@ -17,6 +17,7 @@
 //! - テストでは [`AppPaths::with_root`] で一時ディレクトリを指す。実行ファイル全体を
 //!   別の場所に向けたいとき（結合テスト、検証）は環境変数 [`DATA_DIR_ENV`] を使う。
 
+pub mod handoff;
 pub mod settings;
 
 pub use settings::{Settings, ThemeMode};
@@ -92,6 +93,11 @@ impl AppPaths {
     /// 復元データのディレクトリ（タスク D）。
     pub fn recovery_dir(&self) -> PathBuf {
         self.root.join("recovery")
+    }
+
+    /// 別ウィンドウ（別プロセス）への文書の受け渡しファイル置き場（U4、`handoff` モジュール）。
+    pub fn handoff_dir(&self) -> PathBuf {
+        self.root.join("handoff")
     }
 
     /// MCP 関連のディレクトリ（次の版）。

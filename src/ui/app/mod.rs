@@ -36,6 +36,7 @@ mod preview;
 mod recover;
 mod search;
 pub mod selftest;
+mod tabops;
 mod viewopts;
 
 use std::cell::{Cell, RefCell};
@@ -62,7 +63,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SWP_NOZORDER, SW_HIDE, SW_SHOW, SW_SHOWDEFAULT, WM_ACTIVATE, WM_CAPTURECHANGED, WM_CLOSE,
     WM_COMMAND, WM_DESTROY, WM_DPICHANGED, WM_DROPFILES, WM_ERASEBKGND, WM_HOTKEY,
     WM_INITMENUPOPUP, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONUP, WM_MOUSEMOVE,
-    WM_NOTIFY, WM_PAINT, WM_SETCURSOR, WM_SETFOCUS, WM_SETTINGCHANGE, WM_SIZE, WM_TIMER,
+    WM_NOTIFY, WM_PAINT, WM_RBUTTONUP, WM_SETCURSOR, WM_SETFOCUS, WM_SETTINGCHANGE, WM_SIZE,
+    WM_TIMER,
 };
 
 use crate::appdata::{AppPaths, Settings, ThemeMode};
@@ -88,7 +90,7 @@ use crate::ui::find::FindPanel;
 use crate::ui::memo_panel::MemoPanel;
 use crate::ui::menu::{KeyMap, MenuModel};
 use crate::ui::statusbar::{MessageKind, StatusBar, StatusInfo, StatusSegment};
-use crate::ui::tabs::{TabBar, TabHit, TabItem};
+use crate::ui::tabs::{drag_end, DragEnd, TabBar, TabDrag, TabHit, TabItem, DRAG_THRESHOLD_DIP};
 use crate::ui::theme::Theme;
 use crate::ui::window::{self, Layout, UiFont, WM_APP_REPAINT, WM_APP_WAKE};
 
@@ -249,6 +251,10 @@ pub struct RunOptions {
     pub paths: Option<AppPaths>,
     /// ウィンドウを作った後、表示する前に呼ぶ（コマンドの登録、フック、メニューの設定）。
     pub setup: Option<SetupFn>,
+    /// 別のウィンドウから移された文書の受け渡しファイル（`--adopt`、U4）。
+    pub adopt: Option<PathBuf>,
+    /// ウィンドウの置き場所の目安（画面座標。`--pos`、U4）。
+    pub window_pos: Option<(i32, i32)>,
 }
 
 struct EditSession {
@@ -335,6 +341,14 @@ pub struct App {
     clipboard_counter: u32,
     /// 起動時に分かった問題（表示する前にまとめて知らせる）。
     startup_notes: Vec<String>,
+    /// 押しているタブのドラッグ（U4）。
+    tab_drag: Option<TabDrag>,
+    /// 別ウィンドウへの移動で、受け取りを待っているもの（U4）。
+    handoffs: Vec<tabops::PendingHandoff>,
+    handoff_timer: bool,
+    handoff_seq: u32,
+    /// 別ウィンドウへの移動で新しいプロセスを起動するか（自己診断では `false`）。
+    pub(crate) handoff_spawn: bool,
     /// 統合側が差し込む処理。
     pub hooks: Hooks,
 }
@@ -487,11 +501,28 @@ pub fn start(options: RunOptions) -> Result<()> {
         }
     };
     APP.with(|cell| *cell.borrow_mut() = Some(app));
-    let RunOptions { files, setup, .. } = options;
+    let RunOptions {
+        files,
+        setup,
+        adopt,
+        window_pos,
+        ..
+    } = options;
     with_app(|app| {
         app.relayout();
         app.install_menu();
-        if files.is_empty() {
+        if let Some(pos) = window_pos {
+            app.place_at(pos);
+        }
+        // 別のウィンドウから移された文書。失敗しても、何もないままにはしない。
+        if let Some(file) = &adopt {
+            if let Err(e) = app.adopt_handoff(file) {
+                app.startup_notes.push(format!(
+                    "別のウィンドウから移された文書を開けませんでした: {e}"
+                ));
+            }
+        }
+        if files.is_empty() && app.docs.is_empty() {
             if let Err(e) = app.new_untitled() {
                 app.set_status(&e.to_string(), MessageKind::Warning);
             }
@@ -634,6 +665,11 @@ impl App {
             autosave_timer: false,
             clipboard_counter: 0,
             startup_notes: Vec::new(),
+            tab_drag: None,
+            handoffs: Vec::new(),
+            handoff_timer: false,
+            handoff_seq: 0,
+            handoff_spawn: true,
             hooks: Hooks::default(),
         };
         app.editor.apply_view(&app.settings.view);
@@ -1557,6 +1593,10 @@ impl App {
                 self.autosave_tick(false);
                 Some(LRESULT(0))
             }
+            WM_TIMER if wparam.0 == tabops::TIMER_HANDOFF => {
+                self.handoff_tick();
+                Some(LRESULT(0))
+            }
             WM_TIMER if wparam.0 == bigdoc::TIMER_BIG => {
                 self.big_tick();
                 Some(LRESULT(0))
@@ -1586,8 +1626,15 @@ impl App {
             }
             WM_CAPTURECHANGED => {
                 self.dragging_splitter = false;
+                self.tab_drag = None;
                 self.tabs.press_close(None);
                 None
+            }
+            WM_RBUTTONUP => {
+                if let Some(TabHit::Tab(i) | TabHit::Close(i)) = self.tabs.hit_test(x, y) {
+                    self.show_tab_menu(i);
+                }
+                Some(LRESULT(0))
             }
             WM_MBUTTONUP => {
                 if let Some(TabHit::Tab(i) | TabHit::Close(i)) = self.tabs.hit_test(x, y) {
@@ -1641,6 +1688,17 @@ impl App {
             self.set_right_pane_ratio(window::ratio_from_splitter_x(client, x));
             return;
         }
+        if let Some(mut drag) = self.tab_drag {
+            let threshold = system::scale(DRAG_THRESHOLD_DIP, self.dpi);
+            if drag.update((x, y), threshold) {
+                if let Ok(from) = self.index_of(drag.id) {
+                    let to = self.tabs.reorder_target(from, x);
+                    self.move_tab(drag.id, to);
+                }
+            }
+            self.tab_drag = Some(drag);
+            return;
+        }
         if !self.tracking_mouse {
             let mut tme = TRACKMOUSEEVENT {
                 cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
@@ -1673,6 +1731,12 @@ impl App {
             Some(TabHit::Tab(i)) => {
                 let id = self.docs[i].id();
                 self.execute_on(VIEW_ACTIVATE.id, Some(id));
+                // ドラッグ（並べ替え・外へ出して新しいウィンドウ）の準備。
+                self.tab_drag = Some(TabDrag::new(id, (x, y)));
+                // SAFETY: 自分のウィンドウでマウスを捕まえる。
+                unsafe {
+                    SetCapture(self.hwnd);
+                }
             }
             Some(TabHit::Close(i)) => {
                 self.tabs.press_close(Some(i));
@@ -1694,12 +1758,19 @@ impl App {
     fn on_left_up(&mut self, x: i32, y: i32) {
         let pressed = self.tabs.pressed_close();
         let dragging = self.dragging_splitter;
+        let tab_drag = self.tab_drag.take();
         self.dragging_splitter = false;
         self.tabs.press_close(None);
-        if dragging || pressed.is_some() {
+        if dragging || pressed.is_some() || tab_drag.is_some() {
             // SAFETY: 捕まえたマウスを放す。
             unsafe {
                 let _ = ReleaseCapture();
+            }
+        }
+        if let Some(drag) = tab_drag.filter(|d| d.started) {
+            let (cursor, window) = self.cursor_and_window_rect();
+            if drag_end(cursor, &window) == DragEnd::Detach {
+                self.detach_tab(drag.id, cursor);
             }
         }
         if let Some(i) = pressed {

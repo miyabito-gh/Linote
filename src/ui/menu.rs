@@ -265,6 +265,8 @@ static MENUS: &[MenuDef] = &[
             Item::Cmd(CommandId::new("file.new_window")),
             Item::Cmd(CommandId::new("file.close")),
             Item::Cmd(CommandId::new("file.close_others")),
+            Item::Cmd(CommandId::new("file.close_right")),
+            Item::Cmd(CommandId::new("file.move_to_new_window")),
             Item::Cmd(CommandId::new("file.close_all")),
             Item::Separator,
             Item::Cmd(CommandId::new("file.exit")),

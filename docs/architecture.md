@@ -219,6 +219,7 @@ core ← text, file ← document ← command ← appdata, mcp
   settings.json            設定（§8）
   memos\                   一時メモ: `<id>.memo`（UTF-8 の JSON 1 個。原子的に置換）と、変更時だけ取る排他ロック `.lock`。詳細は `src/memo/store.rs` の冒頭
   recovery\                復元データ（中の形式はタスク D が決めてここに追記する）
+  handoff\                 別ウィンドウ（別プロセス）へ移すタブの受け渡しファイル（下の「受け渡しフォルダー」）
   mcp\authorization.json   MCP の認可（次の版）
   mcp\operations.jsonl     AI の操作記録（次の版。1 行 1 件の JSON）
 ```
@@ -327,6 +328,28 @@ recovery\
 - **掃除**: 走査は、1 時間以上前の一時ファイル（`is_temp_file_name`）と、データのない 1 時間以上前のロックファイルを削除する。作られた直後のロックファイルは、作成とロック取得の間に消すと持ち主が消えたファイルをロックしてしまうので触らない。
 - **書き出しの間隔**: `RecoveryPolicy` の既定は、最後の編集から 2 秒（入力が落ち着いたとき）、ただし未書き出しの編集が 30 秒を超えて溜まらないようにする。設定項目にするかは統括の判断。
 - 別プロセス（将来の MCP）も同じ `scan()` を呼んでよい。候補を捨てれば（Drop）ロックは解放され、孤児のまま残る。
+
+### 受け渡しフォルダー（U4、`appdata::handoff`）
+
+タブを別ウィンドウ（別プロセス）へ移すための一時ファイル。実装と試験は `src/appdata/handoff.rs`（GUI 非依存）、画面側のつなぎは `src/ui/app/tabops.rs`。
+
+```text
+handoff\
+  handoff-<送り側 pid>-<作成時刻 ms>-<連番>.json    受け渡し 1 件（原子的に書く）
+  （一時ファイル `.~linote-*.tmp`、取り込み・取り消しの瞬間だけ `.json.adopted` / `.json.cancelled`）
+```
+
+- **形式**: UTF-8 の JSON 1 個。`version`（現在 1。未知の版は `Unsupported` で拒否）、`created_ms`（Unix ミリ秒）、`kind`。`kind` ごとの項目:
+  - `file`: `path`（保存済みの通常・巨大ファイル。受け側がパスから開く）
+  - `memo`: `memo_id`（`MemoId::parse` で検証。送り側が保存領域へ書き終えてから渡し、受け側は `MemoStore::load` で開く）
+  - `text`: `doc_kind`（`untitled`／`clipboard`／`file`）、`path`（`file` では必須）、`title`、`encoding`／`bom`／`eol`（`TextFormat`）、`dirty`、`disk`（`{len, modified_ns}` か null。受け側が `check_external_change` に渡す）、`text`（編集欄の本文そのまま）
+- **新しさ**: `created_ms` から 10 分を超えたものは受け取らない（`Handoff::check_fresh`。時計が戻った場合は拒否しない）。`sweep` が 24 時間を超えた `handoff-*` と一時ファイルを消す（移動を始めるときに呼ぶ。起動経路では呼ばない）。
+- **確認の手順**（受け取りの確認はファイルの有無）:
+  1. 送り側が `write`（`write_atomic`）→ `linote.exe --adopt <ファイル> [--pos x,y]` を起動。
+  2. 受け側が `read`（壊れている・古い・未対応は何もせず、ファイルにも触れず失敗）→ 文書を開く → `claim`（`.json` を `.adopted` へ改名して消す。改名は原子的で成功は 1 回だけ）。`claim` に負けたら開いた文書を捨てる。
+  3. 送り側は 0.1 秒ごとに `is_pending`（ファイルがあるか）を見る。消えたら元のタブを閉じる（版が変わっていれば閉じない）。最長 15 秒、または受け側のプロセスが先に終了したら `cancel`（`.json` を `.cancelled` へ改名して消す）を試み、勝てば元のタブを残して失敗を知らせる。負けたら受け取り済み。
+- **受け側の保証**: 未保存の文書は未保存（`DocumentState::mark_unsaved`）で開き、claim の後ですぐ復元データを書く。元のタブを閉じるときに送り側の復元データは破棄される（その前に受け側の復元データがある）。取り込みの宣言から復元データの書き出しの完了までの間（ワーカーの書き出し）にだけ、両方のプロセスが落ちると内容を失いうる（既存の復元データの間隔の問題と同質）。
+- 送り側のプロセスが先に終了しても、受け側は読めればそのまま取り込む（claim は成功し、元のタブは既にない）。受け側が起動しなかった場合のファイルは、次の `sweep` までフォルダーに残る。
 
 ### 読み込みの流れ（通常ファイル）
 

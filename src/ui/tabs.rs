@@ -264,6 +264,11 @@ impl TabBar {
         self.bar
     }
 
+    /// タブ `from` をクライアント座標の x に合わせて動かすときの新しい番号。
+    pub fn reorder_target(&self, from: usize, x: i32) -> usize {
+        reorder_target(&self.positions, from, x - self.bar.left)
+    }
+
     /// バー全体を描く。
     pub fn paint(&self, target: windows::Win32::Graphics::Gdi::HDC, theme: &Theme, font: &UiFont) {
         let Some(buf) = BufferedPaint::new(target, self.bar) else {
@@ -371,6 +376,152 @@ impl TabBar {
     }
 }
 
+// ------------------------------------------------------------------ ドラッグ（U4）
+
+/// ドラッグを始める移動量（96 DPI の値）。これ未満の動きはクリックとして扱う。
+pub const DRAG_THRESHOLD_DIP: i32 = 5;
+
+/// 押したタブのドラッグの状態。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TabDrag {
+    pub id: DocumentId,
+    /// 押した位置（クライアント座標）。
+    pub start: (i32, i32),
+    /// しきい値を超えて、ドラッグが始まった。
+    pub started: bool,
+}
+
+impl TabDrag {
+    pub fn new(id: DocumentId, start: (i32, i32)) -> TabDrag {
+        TabDrag {
+            id,
+            start,
+            started: false,
+        }
+    }
+
+    /// マウスが動いた。しきい値（ピクセル）を超えたらドラッグ開始とし、始まっていれば `true`。
+    pub fn update(&mut self, at: (i32, i32), threshold: i32) -> bool {
+        if !self.started {
+            let (dx, dy) = (at.0 - self.start.0, at.1 - self.start.1);
+            self.started = dx.abs() > threshold || dy.abs() > threshold;
+        }
+        self.started
+    }
+}
+
+/// 離した位置の扱い。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DragEnd {
+    /// ウィンドウの中: 並べ替えは動かしている間に済んでいるので、そのまま。
+    Stay,
+    /// ウィンドウの外: 新しいウィンドウで開く。
+    Detach,
+}
+
+/// 離したカーソル位置（画面座標）が、ウィンドウ全体の矩形（画面座標）の外か。
+pub fn drag_end(cursor: (i32, i32), window: &RECT) -> DragEnd {
+    let inside = cursor.0 >= window.left
+        && cursor.0 < window.right
+        && cursor.1 >= window.top
+        && cursor.1 < window.bottom;
+    if inside {
+        DragEnd::Stay
+    } else {
+        DragEnd::Detach
+    }
+}
+
+/// タブ `from` をカーソルの x（バーの左端からの距離）に合わせて動かしたときの新しい番号。
+///
+/// すべてのタブが見えているときは、`from` 以外の各タブの中心と比べて決める
+/// （幅の違うタブでも行き来が起きない）。あふれて見えないタブがあるときは、
+/// カーソルの下にあるタブの番号（左右の外では見えている端のタブ）にする。
+pub fn reorder_target(positions: &[Option<(i32, i32)>], from: usize, x: i32) -> usize {
+    let n = positions.len();
+    if from >= n {
+        return from;
+    }
+    if positions.iter().all(Option::is_some) {
+        // 現在の並びでの、`from` 以外のタブの中心を越えた数。動かした後も同じカーソル位置
+        // なら同じ結果になり（行き来しない）、戻るには反対側の中心を越える必要がある。
+        return positions
+            .iter()
+            .enumerate()
+            .filter(|&(i, _)| i != from)
+            .filter(|(_, p)| p.is_some_and(|(px, w)| px + w / 2 < x))
+            .count();
+    }
+    let visible: Vec<(usize, (i32, i32))> = positions
+        .iter()
+        .enumerate()
+        .filter_map(|(i, p)| p.map(|p| (i, p)))
+        .collect();
+    let (Some(first), Some(last)) = (visible.first(), visible.last()) else {
+        return from;
+    };
+    if x < first.1 .0 {
+        return first.0;
+    }
+    if x >= last.1 .0 + last.1 .1 {
+        return last.0;
+    }
+    visible
+        .iter()
+        .find(|(_, (px, w))| x >= *px && x < *px + *w)
+        .map_or(from, |(i, _)| *i)
+}
+
+/// `v` の `from` 番目を `to` 番目へ動かす（範囲外は何もしない）。動かしたら `true`。
+pub fn move_item<T>(v: &mut Vec<T>, from: usize, to: usize) -> bool {
+    if from >= v.len() || to >= v.len() || from == to {
+        return false;
+    }
+    let item = v.remove(from);
+    v.insert(to, item);
+    true
+}
+
+/// 並べ替えの後の、選択中のタブの番号。
+pub fn active_after_move(active: Option<usize>, from: usize, to: usize) -> Option<usize> {
+    active.map(|a| {
+        if a == from {
+            to
+        } else if from < to && a > from && a <= to {
+            a - 1
+        } else if to < from && a >= to && a < from {
+            a + 1
+        } else {
+            a
+        }
+    })
+}
+
+// ------------------------------------------------------------------ 右クリックメニュー（U4）
+
+/// タブの右クリックメニューの項目（`None` は区切り線）。
+pub const TAB_MENU: &[Option<(&str, &str)>] = &[
+    Some(("file.close", "閉じる")),
+    Some(("file.close_others", "ほかのタブを閉じる")),
+    Some(("file.close_right", "右側のタブを閉じる")),
+    None,
+    Some(("file.move_to_new_window", "新しいウィンドウに移動")),
+    None,
+    Some(("file.copy_path", "フルパスをコピー")),
+    Some(("file.reveal_in_explorer", "エクスプローラーで表示")),
+];
+
+/// 右クリックしたタブ（`index`／全 `count` 個、ファイルのパスの有無 `has_path`）で、
+/// コマンドが使えるか。
+pub fn tab_menu_enabled(command: &str, index: usize, count: usize, has_path: bool) -> bool {
+    match command {
+        "file.close_others" | "file.move_to_new_window" => count > 1,
+        "file.close_right" => index + 1 < count,
+        "file.copy_path" | "file.reveal_in_explorer" => has_path,
+        _ => true,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -473,5 +624,122 @@ mod tests {
         assert!(bar.set_items(vec![item(1, "a")], Some(0)));
         assert_eq!(bar.pressed_close(), None);
         assert!(!bar.set_items(vec![item(1, "a")], Some(0)));
+    }
+
+    #[test]
+    fn drag_starts_only_past_the_threshold() {
+        let mut d = TabDrag::new(DocumentId::from_raw(1), (100, 10));
+        assert!(!d.update((104, 12), 5));
+        assert!(!d.update((95, 10), 5));
+        assert!(d.update((106, 10), 5));
+        // いったん始まれば、戻っても続く。
+        assert!(d.update((100, 10), 5));
+        let mut v = TabDrag::new(DocumentId::from_raw(1), (0, 0));
+        assert!(v.update((0, -6), 5));
+    }
+
+    #[test]
+    fn drag_end_is_detach_only_outside_the_window() {
+        let w = RECT {
+            left: 100,
+            top: 50,
+            right: 900,
+            bottom: 650,
+        };
+        assert_eq!(drag_end((100, 50), &w), DragEnd::Stay);
+        assert_eq!(drag_end((899, 649), &w), DragEnd::Stay);
+        assert_eq!(drag_end((900, 300), &w), DragEnd::Detach);
+        assert_eq!(drag_end((99, 300), &w), DragEnd::Detach);
+        assert_eq!(drag_end((500, 49), &w), DragEnd::Detach);
+        assert_eq!(drag_end((500, 650), &w), DragEnd::Detach);
+        // 別のモニターにあたる負の座標。
+        assert_eq!(drag_end((-1500, 200), &w), DragEnd::Detach);
+    }
+
+    #[test]
+    fn reorder_target_uses_centers_of_the_other_tabs() {
+        // 幅 100 のタブが 4 つ。タブ 0 をドラッグ。
+        let pos: Vec<_> = (0..4).map(|i| Some((i * 100, 100))).collect();
+        assert_eq!(reorder_target(&pos, 0, 10), 0);
+        assert_eq!(reorder_target(&pos, 0, 149), 0);
+        // 他のタブの中心（150、250、350）を超えた分だけ進む（戻るときは動かした後の並びの中心）。
+        assert_eq!(reorder_target(&pos, 0, 151), 1);
+        assert_eq!(reorder_target(&pos, 0, 251), 2);
+        assert_eq!(reorder_target(&pos, 0, 351), 3);
+        assert_eq!(reorder_target(&pos, 0, 9999), 3);
+        assert_eq!(reorder_target(&pos, 0, -50), 0);
+        // 末尾のタブを左へ。
+        assert_eq!(reorder_target(&pos, 3, 0), 0);
+        assert_eq!(reorder_target(&pos, 3, 120), 1);
+        assert_eq!(reorder_target(&pos, 3, 49), 0);
+        assert_eq!(reorder_target(&pos, 3, 51), 1);
+        // 幅が違っても、動かした後の同じ位置で結果が変わらない（行き来しない）。
+        let widths = [200, 80, 120];
+        let layout_of = |order: &[usize]| {
+            let mut x = 0;
+            order
+                .iter()
+                .map(|&i| {
+                    let p = Some((x, widths[i]));
+                    x += widths[i];
+                    p
+                })
+                .collect::<Vec<_>>()
+        };
+        let cursor = 230;
+        let before = layout_of(&[0, 1, 2]);
+        let to = reorder_target(&before, 0, cursor);
+        let mut order = vec![0, 1, 2];
+        move_item(&mut order, 0, to);
+        let after = layout_of(&order);
+        assert_eq!(reorder_target(&after, to, cursor), to);
+    }
+
+    #[test]
+    fn reorder_target_with_overflow_uses_the_tab_under_the_cursor() {
+        let pos = vec![None, Some((0, 75)), Some((75, 75)), None];
+        assert_eq!(reorder_target(&pos, 1, 100), 2);
+        assert_eq!(reorder_target(&pos, 2, 10), 1);
+        assert_eq!(reorder_target(&pos, 1, -30), 1);
+        assert_eq!(reorder_target(&pos, 1, 500), 2);
+        assert_eq!(reorder_target(&[None, None], 1, 5), 1);
+        assert_eq!(reorder_target(&[], 0, 5), 0);
+        assert_eq!(reorder_target(&pos, 9, 5), 9);
+    }
+
+    #[test]
+    fn moving_items_keeps_the_active_tab() {
+        let mut v = vec!['a', 'b', 'c', 'd'];
+        assert!(move_item(&mut v, 0, 2));
+        assert_eq!(v, ['b', 'c', 'a', 'd']);
+        assert!(!move_item(&mut v, 1, 1));
+        assert!(!move_item(&mut v, 4, 0));
+        assert!(!move_item(&mut v, 0, 4));
+        // どの選択位置でも、同じ文書が選択されたまま。
+        for from in 0..4 {
+            for to in 0..4 {
+                for active in 0..4 {
+                    let mut v: Vec<usize> = (0..4).collect();
+                    move_item(&mut v, from, to);
+                    let a = active_after_move(Some(active), from, to).unwrap();
+                    assert_eq!(v[a], active, "from {from} to {to} active {active}");
+                }
+            }
+        }
+        assert_eq!(active_after_move(None, 0, 1), None);
+    }
+
+    #[test]
+    fn tab_menu_enablement() {
+        assert!(tab_menu_enabled("file.close", 0, 1, false));
+        assert!(!tab_menu_enabled("file.close_others", 0, 1, true));
+        assert!(tab_menu_enabled("file.close_others", 0, 2, true));
+        assert!(!tab_menu_enabled("file.close_right", 2, 3, true));
+        assert!(tab_menu_enabled("file.close_right", 1, 3, true));
+        assert!(!tab_menu_enabled("file.move_to_new_window", 0, 1, true));
+        assert!(tab_menu_enabled("file.move_to_new_window", 0, 2, false));
+        assert!(!tab_menu_enabled("file.copy_path", 0, 2, false));
+        assert!(tab_menu_enabled("file.reveal_in_explorer", 0, 2, true));
+        assert_eq!(TAB_MENU.iter().flatten().count(), 6);
     }
 }
