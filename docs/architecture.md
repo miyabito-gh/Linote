@@ -483,3 +483,12 @@ AI による保存（次の版）も同じコマンドを通る。巨大モー�
 
 - 判断: メモは `Recover` を持たず、`AutoSave` を持つ。
 - 理由: メモは入力が落ち着いた時点で保存領域に自動保存されるので、それ自体が強制終了への備えになる。復元データと二重に持つと、どちらが新しいかの照合が要る。
+
+### ADR-13: 利用者のファイルの上書きは `ReplaceFileW`、中核での kernel32 直接宣言を `file/sys.rs` に限り認める
+
+- 利用者のファイル（`save_text`）は ACL・属性・作成日時・代替データストリームを失わないことを優先し、`ReplaceFileW`（`AtomicOptions::PreserveMetadata`）で置換する。置換の途中で一瞬保存先の名前がなくなる可能性はあるが、失敗時は元ファイルが残る。メモ・復元・設定は `MoveFileExW(REPLACE_EXISTING | WRITE_THROUGH)`（`Rename`）。
+- `std` では `WRITE_THROUGH` と属性の引き継ぎができないため、GUI 非依存の中核のうち `src/file/sys.rs` に限り、`windows` crate を使わずに kernel32 の関数を `extern "system"` で直接宣言してよい。
+
+### ADR-14: `FileStamp` はファイル ID を持たない（既知の制限）
+
+外部変更の検知は長さと更新時刻で行う。同じ長さのまま更新時刻の刻みの中で書き換えられた場合は検知できない。必要になったら `FileStamp` に `id: Option<…>` を追加する（既存の構造体リテラルの修正を伴う）。R1 で再検討する。
