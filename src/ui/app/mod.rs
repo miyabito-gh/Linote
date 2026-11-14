@@ -1420,6 +1420,10 @@ impl App {
             None => StatusInfo::default(),
             Some(d) => {
                 let big = self.big_status_text(d.id());
+                let total_chars = match d.view {
+                    DocView::Scintilla(_) => self.editor.total_characters(COUNT_TOTAL_MAX_BYTES),
+                    DocView::External(_) => None,
+                };
                 let (line, column, selected_chars) = match d.view {
                     DocView::Scintilla(_) => {
                         let sel = self.editor.selection();
@@ -1439,6 +1443,7 @@ impl App {
                     line,
                     column,
                     selected_chars,
+                    total_chars,
                     position_text: big.as_ref().map(|b| b.0.clone()),
                     language: match &big {
                         Some(b) => b.1.clone(),
@@ -2108,6 +2113,10 @@ fn file_title(path: &Path) -> String {
 /// 選択の文字数を数える上限（バイト）。カーソルが動くたびに数えるので、これより大きい
 /// 選択では数えない（ステータスバーに文字数を出さない）。
 const COUNT_SELECTION_MAX_BYTES: u64 = 8 * 1024 * 1024;
+
+/// 文書全体の文字数を出す上限（バイト）。文字の索引は行ごとに位置を持つので、
+/// 大きな文書ではメモリを食う。これより大きい文書では文字数を出さない。
+const COUNT_TOTAL_MAX_BYTES: u64 = 64 * 1024 * 1024;
 
 /// 範囲の文字数。大きすぎる範囲は 0（数えない）。
 fn count_chars(editor: &Editor, start: u64, end: u64) -> u64 {

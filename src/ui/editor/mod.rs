@@ -473,6 +473,33 @@ impl Editor {
         self.send(SCI_GETLINEENDPOSITION, line as usize, 0).max(0) as u64
     }
 
+    /// 文書全体の文字数（コードポイント。改行の CR・LF は 1 文字ずつ）。`max_bytes` を
+    /// 超える文書は数えない（`None`）。初回に文字の索引（行ごとの文字位置）を作り、以後は
+    /// Scintilla が編集に合わせて保つので、毎回は数え直さない。
+    pub fn total_characters(&self, max_bytes: u64) -> Option<u64> {
+        let len = self.send(SCI_GETLENGTH, 0, 0).max(0) as u64;
+        if len > max_bytes {
+            return None;
+        }
+        if self.send(SCI_GETLINECHARACTERINDEX, 0, 0) & SC_LINECHARACTERINDEX_UTF32 as isize == 0 {
+            self.send(
+                SCI_ALLOCATELINECHARACTERINDEX,
+                SC_LINECHARACTERINDEX_UTF32,
+                0,
+            );
+        }
+        let last = self.send(SCI_GETLINECOUNT, 0, 0).max(1) as usize - 1;
+        let before = self
+            .send(
+                SCI_INDEXPOSITIONFROMLINE,
+                last,
+                SC_LINECHARACTERINDEX_UTF32 as isize,
+            )
+            .max(0) as u64;
+        let start = self.send(SCI_POSITIONFROMLINE, last, 0).max(0) as u64;
+        Some(before + self.count_characters(start, len))
+    }
+
     /// 範囲の文字数（写しを作らずに数える）。
     pub fn count_characters(&self, start: u64, end: u64) -> u64 {
         self.send(SCI_COUNTCHARACTERS, start as usize, end as isize)

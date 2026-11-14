@@ -29,6 +29,8 @@ pub enum StatusSegment {
     ExternalChange,
     AiEdits,
     Position,
+    /// 文字数（選択があれば「選択 / 全体」）。
+    Chars,
     Language,
     Encoding,
     Eol,
@@ -44,6 +46,8 @@ pub struct StatusInfo {
     pub column: u64,
     /// 選択している文字数（選択がなければ 0）。
     pub selected_chars: u64,
+    /// 文書全体の文字数。数えない（大きすぎる文書・巨大ファイルのビュー）なら `None`。
+    pub total_chars: Option<u64>,
     /// 位置の表示を、行・列の代わりにこの文字列にする（巨大ファイルのビュー）。
     pub position_text: Option<String>,
     pub language: String,
@@ -75,14 +79,23 @@ impl StatusInfo {
         if self.ai_edits {
             out.push((StatusSegment::AiEdits, "AI の変更あり".to_owned()));
         }
-        let mut pos = match &self.position_text {
+        let pos = match &self.position_text {
             Some(text) => text.clone(),
             None => format!("行 {}, 列 {}", self.line, self.column),
         };
-        if self.position_text.is_none() && self.selected_chars > 0 {
-            pos.push_str(&format!(" ({} 文字選択)", self.selected_chars));
-        }
         out.push((StatusSegment::Position, pos));
+        if self.position_text.is_none() {
+            let sel = self.selected_chars;
+            let chars = match (self.total_chars, sel) {
+                (Some(total), 0) => Some(format!("{} 文字", grouped(total))),
+                (Some(total), _) => Some(format!("{} / {} 文字", grouped(sel), grouped(total))),
+                (None, 0) => None,
+                (None, _) => Some(format!("{} 文字選択", grouped(sel))),
+            };
+            if let Some(chars) = chars {
+                out.push((StatusSegment::Chars, chars));
+            }
+        }
         if !self.language.is_empty() {
             out.push((StatusSegment::Language, self.language.clone()));
         }
@@ -94,6 +107,19 @@ impl StatusInfo {
         }
         out
     }
+}
+
+/// 3 桁ごとにカンマを入れる（1234567 → 1,234,567）。
+pub fn grouped(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// 右から詰めて並べる。`widths` は各項目の文字の幅。戻り値は各項目の (左端, 幅)。
@@ -267,6 +293,7 @@ mod tests {
             line: 12,
             column: 5,
             selected_chars: 3,
+            total_chars: Some(12_345),
             language: "Rust".into(),
             ..Default::default()
         }
@@ -279,8 +306,26 @@ mod tests {
         let names: Vec<_> = segs.iter().map(|(_, s)| s.as_str()).collect();
         assert_eq!(
             names,
-            ["行 12, 列 5 (3 文字選択)", "Rust", "UTF-8 (BOM)", "LF"]
+            [
+                "行 12, 列 5",
+                "3 / 12,345 文字",
+                "Rust",
+                "UTF-8 (BOM)",
+                "LF"
+            ]
         );
+        let plain = StatusInfo {
+            total_chars: Some(0),
+            ..Default::default()
+        };
+        assert_eq!(plain.segments()[1].1, "0 文字");
+        let uncounted = StatusInfo {
+            selected_chars: 1_000,
+            ..Default::default()
+        };
+        assert_eq!(uncounted.segments()[1].1, "1,000 文字選択");
+        assert_eq!(grouped(1_234_567), "1,234,567");
+        assert_eq!(grouped(999), "999");
 
         let ro = StatusInfo {
             line: 1,

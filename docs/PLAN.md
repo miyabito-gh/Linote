@@ -217,3 +217,8 @@ W5 配布・性能 ── N → 🪟性能計測 → O 最終レビュー
 
 - 付箋の形に青のグラデーション、白い行と黄色のカーソル。48 px 以上は `res/icon/linote-large.svg`、32 px 以下は行を太くした `res/icon/linote-small.svg`。
 - `scripts/make-icon.js`（Playwright）で `res/linote.ico`（16〜256 px、PNG 形式）を作り、`res/linote.rc` の ID 1 として EXE に埋め込む。メインウィンドウとプレビューの別ウィンドウのクラスに設定。インストーラー（`MUI_ICON`／`MUI_UNICON`）にも使い、スタートメニューのショートカットは EXE のアイコンを使う。
+
+### 2026-11-14 0.1.6 文字数の表示
+
+- メモ帳との比較を受け、ステータスバーに文書全体の文字数（選択中は「選択 / 全体」）を追加。Scintilla の文字の索引（UTF-32）を使い、編集のたびに全文を数えない。64 MiB を超える文書では出さない。
+
