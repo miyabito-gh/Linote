@@ -116,6 +116,23 @@ impl App {
         }
     }
 
+    /// 開く対象: アクティブな Markdown 文書。アクティブが Markdown でなくても、もう一方の
+    /// 表示（右ペイン／別ウィンドウ）が文書を表示中なら、それを引き継ぐ（切り替えのため）。
+    fn preview_open_target(&mut self) -> Option<DocumentId> {
+        let active_md = self
+            .active
+            .map(|i| &self.docs[i])
+            .filter(|d| is_markdown(d))
+            .map(|d| d.id());
+        let showing = self
+            .preview
+            .as_ref()
+            .filter(|p| p.pane.is_some() || p.window.is_some())
+            .and_then(|p| p.target)
+            .filter(|&id| self.document(id).is_some());
+        active_md.or(showing).or_else(|| self.markdown_target())
+    }
+
     pub fn preview_pane_open(&self) -> bool {
         self.preview.as_ref().is_some_and(|p| p.pane.is_some())
     }
@@ -132,7 +149,7 @@ impl App {
             self.close_preview_pane();
             return Ok(());
         }
-        let Some(id) = self.markdown_target() else {
+        let Some(id) = self.preview_open_target() else {
             return Ok(());
         };
         let palette = palette_for(&self.theme);
@@ -155,7 +172,11 @@ impl App {
         };
         self.preview_state().pane = Some(pane);
         self.set_right_pane(Some(pane_hwnd));
-        self.preview_retarget(id);
+        self.preview_open_surface(id, Surface::Pane);
+        // 右ペインと別ウィンドウはどちらか一方（開いてから閉じるので、本文はそのまま引き継ぐ）。
+        if self.preview_window_open() {
+            self.close_preview_window();
+        }
         if let Some(reason) = unavailable {
             self.on_preview_unavailable(&reason);
         }
@@ -181,7 +202,7 @@ impl App {
             self.close_preview_window();
             return Ok(());
         }
-        let Some(id) = self.markdown_target() else {
+        let Some(id) = self.preview_open_target() else {
             return Ok(());
         };
         let palette = palette_for(&self.theme);
@@ -215,7 +236,11 @@ impl App {
         };
         window.show();
         self.preview_state().window = Some(window);
-        self.preview_retarget(id);
+        self.preview_open_surface(id, Surface::Window);
+        // 右ペインと別ウィンドウはどちらか一方（開いてから閉じるので、本文はそのまま引き継ぐ）。
+        if self.preview_pane_open() {
+            self.close_preview_pane();
+        }
         if let Some(reason) = unavailable {
             self.on_preview_unavailable(&reason);
         }
@@ -270,6 +295,44 @@ impl App {
     }
 
     // ---------------------------------------------------------------- 変換
+
+    /// 右ペインか別ウィンドウを新しく開いた。もう一方が同じ文書を表示済みなら、その本文を
+    /// 新しい方にも渡す（同じ版は変換し直さないので、渡さないと空のままになる）。
+    /// それ以外は `id` を対象にして変換を始める。
+    fn preview_open_surface(&mut self, id: DocumentId, surface: Surface) {
+        let title = self
+            .document(id)
+            .map(|d| d.title.clone())
+            .unwrap_or_default();
+        let shown = self.preview.as_ref().and_then(|p| {
+            let body = p.body.as_ref().filter(|_| p.target == Some(id))?;
+            Some(Arc::<str>::from(compose_document(
+                body,
+                &p.stylesheet,
+                &title,
+            )))
+        });
+        match shown {
+            Some(html) => {
+                let Some(p) = self.preview.as_ref() else {
+                    return;
+                };
+                match surface {
+                    Surface::Pane => {
+                        if let Some(pane) = &p.pane {
+                            pane.set_document(id, html);
+                        }
+                    }
+                    Surface::Window => {
+                        if let Some(w) = &p.window {
+                            w.set_document(id, html);
+                        }
+                    }
+                }
+            }
+            None => self.preview_retarget(id),
+        }
+    }
 
     /// プレビューの対象を `id` にして、すぐに変換を始める。
     fn preview_retarget(&mut self, id: DocumentId) {
@@ -490,4 +553,11 @@ impl App {
             }
         }
     }
+}
+
+/// プレビューを出す場所。
+#[derive(Debug, Clone, Copy)]
+enum Surface {
+    Pane,
+    Window,
 }
