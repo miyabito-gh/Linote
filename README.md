@@ -3,6 +3,7 @@
 Windows 11 x64 向けの軽量テキストエディタ（Rust）。日本語の編集、検索・Grep、巨大ファイルの閲覧、一時メモ、Markdown プレビューを備え、EXE 1 つで動きます。
 
 - 要件: [docs/requirements.md](docs/requirements.md)
+- 仕様（実装どおりの動作）: [docs/spec.md](docs/spec.md)
 - 設計: [docs/architecture.md](docs/architecture.md)
 - 計画と進捗: [docs/PLAN.md](docs/PLAN.md)
 - Windows 実機での確認項目: [docs/verification/](docs/verification/)
