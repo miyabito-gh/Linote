@@ -8,7 +8,7 @@
 - push しない。作業ブランチにコミットする。コミットメッセージの末尾:
   ```
   Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
-  Claude-Session: https://claude.ai/code/session_01FKh1LYTmSLTjt6QEACFaoA
+  Claude-Session: https://claude.ai/code/session_01FKh1LX8mAYfb2LZjCfYnE1
   ```
 - `docs/PLAN.md` の自分の行の状態を「👀 レビュー中」にする（他の行は触らない）。
 - 報告（日本語・簡潔）: ブランチ名、コミット、変更ファイル、設計判断、未解決点・統括への依頼（共有ファイルの変更、取り決めの変更提案）、品質関門の結果。
