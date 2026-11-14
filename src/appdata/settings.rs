@@ -50,6 +50,7 @@ use crate::command::keys::KeyParseError;
 use crate::command::{CommandDef, KeyChord};
 use crate::core::{Error, Result};
 use crate::printing::{Margins, MARGIN_MAX};
+use crate::text::{Encoding, Eol, TextFormat};
 
 mod items;
 pub mod keybind;
@@ -329,6 +330,127 @@ impl PrintSettings {
     }
 }
 
+/// 新規文書（無題・クリップボード由来）の既定の形式（`settings.json` の `new_file`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NewFileSettings {
+    pub format: TextFormat,
+}
+
+impl Default for NewFileSettings {
+    fn default() -> Self {
+        NewFileSettings {
+            format: TextFormat::DEFAULT,
+        }
+    }
+}
+
+/// 設定ファイルの文字コード名（BOM の有無を含む）から（文字コード, BOM）。
+/// `cp932` と `shift-jis` も受け付ける。
+pub fn parse_new_file_encoding(name: &str) -> Option<(Encoding, bool)> {
+    Some(match name.trim().to_ascii_lowercase().as_str() {
+        "utf-8" | "utf8" => (Encoding::Utf8, false),
+        "utf-8-bom" => (Encoding::Utf8, true),
+        // UTF-16 は Windows の慣例どおり BOM を付ける。
+        "utf-16le" => (Encoding::Utf16Le, true),
+        "utf-16be" => (Encoding::Utf16Be, true),
+        "shift_jis" | "shift-jis" | "sjis" | "cp932" => (Encoding::Cp932, false),
+        _ => return None,
+    })
+}
+
+/// [`parse_new_file_encoding`] の逆（設定ファイルに書く名前）。
+pub fn new_file_encoding_name(format: &TextFormat) -> &'static str {
+    match (format.encoding, format.bom) {
+        (Encoding::Utf8, false) => "utf-8",
+        (Encoding::Utf8, true) => "utf-8-bom",
+        (Encoding::Utf16Le, _) => "utf-16le",
+        (Encoding::Utf16Be, _) => "utf-16be",
+        (Encoding::Cp932, _) => "shift_jis",
+    }
+}
+
+fn eol_name(eol: Eol) -> &'static str {
+    match eol {
+        Eol::CrLf => "crlf",
+        Eol::Lf => "lf",
+        Eol::Cr => "cr",
+    }
+}
+
+fn parse_eol_name(name: &str) -> Option<Eol> {
+    match name.trim().to_ascii_lowercase().as_str() {
+        "crlf" => Some(Eol::CrLf),
+        "lf" => Some(Eol::Lf),
+        "cr" => Some(Eol::Cr),
+        _ => None,
+    }
+}
+
+impl NewFileSettings {
+    /// 不正な値は既定として読む。
+    fn from_value(map: &Map<String, Value>) -> Self {
+        let mut format = TextFormat::DEFAULT;
+        if let Some((encoding, bom)) = map
+            .get("encoding")
+            .and_then(Value::as_str)
+            .and_then(parse_new_file_encoding)
+        {
+            format.encoding = encoding;
+            format.bom = bom;
+        }
+        if let Some(eol) = map
+            .get("eol")
+            .and_then(Value::as_str)
+            .and_then(parse_eol_name)
+        {
+            format.eol = eol;
+        }
+        NewFileSettings { format }
+    }
+
+    fn to_value(self) -> Map<String, Value> {
+        let mut m = Map::new();
+        m.insert(
+            "encoding".into(),
+            new_file_encoding_name(&self.format).into(),
+        );
+        m.insert("eol".into(), eol_name(self.format.eol).into());
+        m
+    }
+}
+
+/// 保存時の整形（`settings.json` の `save`）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SaveSettings {
+    /// 行末の空白を除く（Markdown の文書は除く）。
+    pub trim_trailing_whitespace: bool,
+    /// 最終行に改行を補う。
+    pub ensure_final_newline: bool,
+}
+
+impl SaveSettings {
+    fn from_value(map: &Map<String, Value>) -> Self {
+        let flag = |k: &str| map.get(k).and_then(Value::as_bool).unwrap_or(false);
+        SaveSettings {
+            trim_trailing_whitespace: flag("trim_trailing_whitespace"),
+            ensure_final_newline: flag("ensure_final_newline"),
+        }
+    }
+
+    fn to_value(self) -> Map<String, Value> {
+        let mut m = Map::new();
+        m.insert(
+            "trim_trailing_whitespace".into(),
+            self.trim_trailing_whitespace.into(),
+        );
+        m.insert(
+            "ensure_final_newline".into(),
+            self.ensure_final_newline.into(),
+        );
+        m
+    }
+}
+
 /// 前回のウィンドウの位置と大きさ（画面座標。最大化していても通常状態の矩形を持つ）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WindowSettings {
@@ -502,6 +624,8 @@ pub struct SettingsChanges {
     pub view: bool,
     pub print: bool,
     pub restore_session: bool,
+    pub new_file: bool,
+    pub save: bool,
     pub recent_files: bool,
     pub search_history: bool,
     pub window: bool,
@@ -524,6 +648,8 @@ impl SettingsChanges {
             (self.keys, "キー割り当て"),
             (self.print, "印刷"),
             (self.restore_session, "前回のタブの復元"),
+            (self.new_file, "新規文書の既定"),
+            (self.save, "保存時の整形"),
             (self.recent_files, "最近使ったファイル"),
             (self.search_history, "検索履歴"),
             (self.mcp, "MCP"),
@@ -550,6 +676,10 @@ pub struct Settings {
     pub print: PrintSettings,
     /// 起動時に前回のタブを開き直す。
     pub restore_session: bool,
+    /// 新規文書の既定の形式。
+    pub new_file: NewFileSettings,
+    /// 保存時の整形。
+    pub save: SaveSettings,
     /// 前回のウィンドウの位置と大きさ。
     pub window: Option<WindowSettings>,
     /// 検索・置換・Grep の履歴。
@@ -568,6 +698,8 @@ impl Default for Settings {
             view: ViewSettings::default(),
             print: PrintSettings::default(),
             restore_session: true,
+            new_file: NewFileSettings::default(),
+            save: SaveSettings::default(),
             window: None,
             search_history: SearchHistory::default(),
             extra: Map::new(),
@@ -646,6 +778,13 @@ impl Settings {
             };
             settings.print = PrintSettings::from_value(&print);
         }
+        // オブジェクトでなければ既定のまま。
+        if let Some(Value::Object(nf)) = map.remove("new_file") {
+            settings.new_file = NewFileSettings::from_value(&nf);
+        }
+        if let Some(Value::Object(sv)) = map.remove("save") {
+            settings.save = SaveSettings::from_value(&sv);
+        }
         if let Some(v) = map.remove("restore_session") {
             // 真偽値でなければ既定（有効）のまま。
             settings.restore_session = v.as_bool().unwrap_or(true);
@@ -711,6 +850,8 @@ impl Settings {
         map.insert("view".into(), Value::Object(self.view.to_value()));
         map.insert("print".into(), Value::Object(self.print.to_value()));
         map.insert("restore_session".into(), self.restore_session.into());
+        map.insert("new_file".into(), Value::Object(self.new_file.to_value()));
+        map.insert("save".into(), Value::Object(self.save.to_value()));
         match self.window {
             Some(w) => map.insert("window".into(), Value::Object(w.to_value())),
             None => map.remove("window"),
@@ -737,6 +878,8 @@ impl Settings {
             view: self.view != other.view,
             print: self.print != other.print,
             restore_session: self.restore_session != other.restore_session,
+            new_file: self.new_file != other.new_file,
+            save: self.save != other.save,
             recent_files: self.recent_files != other.recent_files,
             search_history: self.search_history != other.search_history,
             window: self.window != other.window,
@@ -885,6 +1028,37 @@ mod tests {
         assert!(bad.print.color);
         assert_eq!(bad.print.paper_size, 0);
         assert!(Settings::from_json(r#"{"print":[]}"#).is_err());
+    }
+
+    #[test]
+    fn new_file_and_save_round_trip_with_defaults_for_bad_values() {
+        let d = Settings::from_json("{}").unwrap();
+        assert_eq!(d.new_file.format, TextFormat::DEFAULT);
+        assert_eq!(d.save, SaveSettings::default());
+        let s = Settings::from_json(
+            r#"{"new_file":{"encoding":"Shift_JIS","eol":"lf"},"save":{"trim_trailing_whitespace":true,"ensure_final_newline":true}}"#,
+        )
+        .unwrap();
+        assert_eq!(s.new_file.format.encoding, Encoding::Cp932);
+        assert!(!s.new_file.format.bom);
+        assert_eq!(s.new_file.format.eol, Eol::Lf);
+        assert!(s.save.trim_trailing_whitespace && s.save.ensure_final_newline);
+        let again = Settings::from_json(&s.to_json()).unwrap();
+        assert_eq!(again, s);
+        assert!(s.to_json().contains("\"shift_jis\""));
+        // 不正な値は既定として読み、他の項目は読む。
+        let bad = Settings::from_json(
+            r#"{"new_file":{"encoding":"latin1","eol":"x"},"save":{"trim_trailing_whitespace":"yes","ensure_final_newline":true}}"#,
+        )
+        .unwrap();
+        assert_eq!(bad.new_file.format, TextFormat::DEFAULT);
+        assert!(!bad.save.trim_trailing_whitespace && bad.save.ensure_final_newline);
+        let bom = Settings::from_json(r#"{"new_file":{"encoding":"utf-8-bom"}}"#).unwrap();
+        assert!(bom.new_file.format.bom);
+        assert_eq!(
+            parse_new_file_encoding("utf-16le"),
+            Some((Encoding::Utf16Le, true))
+        );
     }
 
     #[test]

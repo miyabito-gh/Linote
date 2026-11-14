@@ -34,6 +34,7 @@ mod decode;
 mod detect;
 pub mod encode;
 mod eol;
+pub mod tidy;
 
 pub use decode::{decode, Decoded, InvalidBytes};
 pub use detect::{detect, has_bom, Confidence, DetectReason, Detection};

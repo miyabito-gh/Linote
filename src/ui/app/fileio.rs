@@ -22,6 +22,7 @@ use crate::document::{Capability, DocumentKind, DocumentState};
 use crate::file::{
     self, check_external_change, ExternalChange, LoadedText, ReadOptions, SaveOutcome, SaveRequest,
 };
+use crate::text::tidy::TidyOptions;
 use crate::text::{Confidence, Encoding, OnUnmappable};
 use crate::ui::editor::{DocLoader, Language};
 use crate::ui::statusbar::MessageKind;
@@ -723,6 +724,9 @@ impl App {
             }
             self.docs[i].lossy = false;
         }
+        if !is_memo {
+            self.tidy_before_save(id)?;
+        }
         let (stamp, text) = self.text_snapshot(id)?;
         let format = self.docs[i].state.format;
         self.docs[i].saving = true;
@@ -751,6 +755,28 @@ impl App {
                 app.finish_save(id, path, dest_again, export, opts, format, result)
             })));
         });
+        Ok(())
+    }
+
+    /// 保存の直前に、設定（`save`）に従って本文を整形する（V5）。編集欄の上で行い、
+    /// 1 回の Undo で戻せる。メモと巨大文書は対象外。Markdown では行末の空白を除かない。
+    fn tidy_before_save(&mut self, id: DocumentId) -> Result<()> {
+        let i = self.index_of(id)?;
+        let cfg = self.settings.save;
+        if !(cfg.trim_trailing_whitespace || cfg.ensure_final_newline)
+            || !matches!(self.docs[i].view, DocView::Scintilla(_))
+        {
+            return Ok(());
+        }
+        let opts = TidyOptions {
+            trim_trailing_whitespace: cfg.trim_trailing_whitespace
+                && self.docs[i].language != Language::Markdown,
+            ensure_final_newline: cfg.ensure_final_newline,
+            eol: self.docs[i].state.format.eol.as_str(),
+        };
+        if opts.trim_trailing_whitespace || opts.ensure_final_newline {
+            self.with_text(id, |ed| ed.apply_save_tidy(&opts))?;
+        }
         Ok(())
     }
 

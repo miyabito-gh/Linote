@@ -8,6 +8,7 @@ use super::transform::{self, Edit};
 use super::viewopts::is_brace;
 use super::{cstr, Editor};
 use crate::document::{Selection, TextRange};
+use crate::text::tidy::{save_tidy_edits, TidyOptions};
 
 /// すべての一致を強調するインジケーター。
 const INDIC_ALL: usize = 9;
@@ -210,6 +211,33 @@ impl Editor {
     /// 行末の空白を削除する（選択があればその行だけ）。削除した行の数を返す。
     pub fn trim_trailing_whitespace(&self) -> usize {
         self.transform_region(transform::trailing_whitespace_edits)
+    }
+
+    /// 保存時の整形（V5）を本文全体に適用する。1 つの Undo のまとまりにし、先頭表示行と、
+    /// 本文の末尾にあったカーソル・選択の端を保つ（行末の空白の削除では Scintilla が位置を
+    /// 追従させる）。変化がなければ何もせず `false`。
+    pub fn apply_save_tidy(&self, opts: &TidyOptions<'_>) -> bool {
+        let len = self.length();
+        let text = self.text_range(0, len);
+        let edits = save_tidy_edits(&text, opts);
+        if edits.is_empty() {
+            return false;
+        }
+        let sel = self.selection();
+        let top = self.send(SCI_GETFIRSTVISIBLELINE, 0, 0);
+        self.apply_edits(0, &edits);
+        // 末尾への挿入では、末尾にあったカーソルが挿入の後ろへ動くことがあるので戻す。
+        if sel.anchor == len || sel.caret == len {
+            let removed: u64 = edits.iter().map(|e| (e.end - e.start) as u64).sum();
+            let end = len - removed;
+            let now = self.selection();
+            self.set_selection(Selection {
+                anchor: if sel.anchor == len { end } else { now.anchor },
+                caret: if sel.caret == len { end } else { now.caret },
+            });
+        }
+        self.send(SCI_SETFIRSTVISIBLELINE, top.max(0) as usize, 0);
+        true
     }
 
     /// タブ文字をスペースにする（選択があればその行だけ）。変換したタブの数を返す。

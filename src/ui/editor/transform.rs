@@ -6,40 +6,14 @@
 //! 全角文字を含む行で異なることがある）。
 
 /// 置き換え 1 件（`start..end` を `text` に置き換える）。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Edit {
-    pub start: usize,
-    pub end: usize,
-    pub text: String,
-}
+pub use crate::text::tidy::TextEdit as Edit;
 
 fn is_eol(b: u8) -> bool {
     b == b'\n' || b == b'\r'
 }
 
-/// 行末（改行の直前、または本文の末尾）にある空白とタブを取り除く編集。
-pub fn trailing_whitespace_edits(text: &[u8]) -> Vec<Edit> {
-    let mut edits = Vec::new();
-    let mut i = 0;
-    while i < text.len() {
-        if text[i] == b' ' || text[i] == b'\t' {
-            let start = i;
-            while i < text.len() && (text[i] == b' ' || text[i] == b'\t') {
-                i += 1;
-            }
-            if i == text.len() || is_eol(text[i]) {
-                edits.push(Edit {
-                    start,
-                    end: i,
-                    text: String::new(),
-                });
-            }
-        } else {
-            i += 1;
-        }
-    }
-    edits
-}
+/// 行末（改行の直前、または本文の末尾）にある空白とタブを取り除く編集（保存時の整形と共用）。
+pub use crate::text::tidy::trailing_whitespace_edits;
 
 /// タブ文字をタブ位置（`width` 桁ごと）に合わせたスペースにする編集。
 pub fn tabs_to_spaces_edits(text: &[u8], width: usize) -> Vec<Edit> {

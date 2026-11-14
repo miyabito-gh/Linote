@@ -614,6 +614,7 @@ pub fn register(registry: &mut Registry<App>) -> Result<()> {
         match clipboard::read_text(Some(owner)) {
             Ok(Some(text)) => {
                 let mut state = DocumentState::clipboard();
+                state.format = app.settings.new_file.format;
                 if let Some(eol) = EolStats::scan(text.as_bytes()).dominant() {
                     state.format.eol = eol;
                 }

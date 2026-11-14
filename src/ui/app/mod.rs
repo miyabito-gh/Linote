@@ -942,13 +942,9 @@ impl App {
         } else {
             format!("無題 {}", self.untitled_counter)
         };
-        self.open_text(
-            DocumentState::untitled(),
-            "",
-            title,
-            Language::PlainText,
-            true,
-        )
+        let mut state = DocumentState::untitled();
+        state.format = self.settings.new_file.format;
+        self.open_text(state, "", title, Language::PlainText, true)
     }
 
     /// 本文を持つ文書を開く（クリップボード、メモ、復元、読み込んだファイル）。

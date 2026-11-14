@@ -7,8 +7,11 @@
 //! - 数値は範囲を確かめる（[`Item::parse_number`]）。範囲外・数字でない入力は、設定に入れずに
 //!   画面で知らせる。
 
+use crate::text::Eol;
+
 use super::{
-    Settings, ThemeMode, WrapMode, FONT_SIZE_MAX, FONT_SIZE_MIN, WRAP_COLUMN_MAX, WRAP_COLUMN_MIN,
+    new_file_encoding_name, parse_new_file_encoding, Settings, ThemeMode, WrapMode, FONT_SIZE_MAX,
+    FONT_SIZE_MIN, WRAP_COLUMN_MAX, WRAP_COLUMN_MIN,
 };
 
 /// 選択肢 1 つ（設定ファイルでの値と、画面の表示）。
@@ -221,6 +224,85 @@ static GENERAL_ITEMS: &[Item] = &[
     ),
 ];
 
+const NEW_FILE_ENCODING_CHOICES: &[Choice] = &[
+    Choice {
+        value: "utf-8",
+        label: "UTF-8",
+    },
+    Choice {
+        value: "utf-8-bom",
+        label: "UTF-8（BOM 付き）",
+    },
+    Choice {
+        value: "shift_jis",
+        label: "Shift_JIS (CP932)",
+    },
+    Choice {
+        value: "utf-16le",
+        label: "UTF-16 LE（BOM 付き）",
+    },
+    Choice {
+        value: "utf-16be",
+        label: "UTF-16 BE（BOM 付き）",
+    },
+];
+
+const NEW_FILE_EOL_CHOICES: &[Choice] = &[
+    Choice {
+        value: "crlf",
+        label: "CRLF（Windows）",
+    },
+    Choice {
+        value: "lf",
+        label: "LF",
+    },
+];
+
+static FILE_ITEMS: &[Item] = &[
+    Item {
+        id: "new_file.encoding",
+        label: "新規文書の文字コード",
+        kind: ItemKind::Choice(NEW_FILE_ENCODING_CHOICES),
+        get: |s| ItemValue::Text(new_file_encoding_name(&s.new_file.format).to_owned()),
+        set: |s, v| {
+            if let Some((encoding, bom)) = text(v).and_then(parse_new_file_encoding) {
+                s.new_file.format.encoding = encoding;
+                s.new_file.format.bom = bom;
+            }
+        },
+    },
+    Item {
+        id: "new_file.eol",
+        label: "新規文書の改行",
+        kind: ItemKind::Choice(NEW_FILE_EOL_CHOICES),
+        get: |s| {
+            ItemValue::Text(
+                match s.new_file.format.eol {
+                    Eol::Lf => "lf",
+                    // 設定画面にない CR は、設定ファイルで指定されていても CRLF として見せる。
+                    _ => "crlf",
+                }
+                .to_owned(),
+            )
+        },
+        set: |s, v| match text(v) {
+            Some("lf") => s.new_file.format.eol = Eol::Lf,
+            Some("crlf") => s.new_file.format.eol = Eol::CrLf,
+            _ => {}
+        },
+    },
+    check_item!(
+        "save.trim_trailing_whitespace",
+        "保存時に行末の空白を削除（Markdown を除く）",
+        save.trim_trailing_whitespace
+    ),
+    check_item!(
+        "save.ensure_final_newline",
+        "保存時に最終行の改行を補う",
+        save.ensure_final_newline
+    ),
+];
+
 static VIEW_ITEMS: &[Item] = &[
     Item {
         id: "view.wrap",
@@ -320,6 +402,12 @@ static PAGES: &[Page] = &[
         title: "一般",
         kind: PageKind::Items,
         items: GENERAL_ITEMS,
+    },
+    Page {
+        id: "file",
+        title: "ファイル",
+        kind: PageKind::Items,
+        items: FILE_ITEMS,
     },
     Page {
         id: "view",
