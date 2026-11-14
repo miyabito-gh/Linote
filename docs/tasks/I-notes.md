@@ -25,3 +25,9 @@
 ## J（巨大ファイル）
 - UI が検索結果を保持する場合は `BigFile::is_invalidated()` を確認する。
 - 1 GiB の計測は `measure_large_fixtures`（`docs/tasks/J.md`）。
+
+## F（ホットキー・クリップボード）
+- 起動時に `GlobalHotkey::new(main_hwnd, CLIPBOARD_HOTKEY_ID)` → `set_from_text(settings の keys["clipboard.new_tab"] または DEFAULT_CLIPBOARD_CHORD = "Ctrl+Alt+V")`。`Conflict`／`Invalid` なら `status().message()` をステータスバーへ。設定変更時に再度 `set_from_text`。
+- `WM_HOTKEY`（`wParam == CLIPBOARD_HOTKEY_ID`）→ `bring_to_front(hwnd)` → `Registry::execute("clipboard.new_tab")`。ハンドラーで `clipboard::read_text(Some(hwnd))`: `Some` → `DocumentState::clipboard` の未保存タブ、`None` → 「クリップボードにテキストがありません」、`Err(Busy)` → 「クリップボードを開けません」。
+- `clipboard.new_tab` の既定キーを `Ctrl+Alt+V` にそろえる。
+- 実機確認: 他アプリ前面からの前面化、最小化からの復元、競合表示、`Win+` の割り当て、リッチテキスト・画像のみのとき `None`。
