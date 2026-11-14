@@ -53,3 +53,14 @@
 - 品質関門（fmt、clippy、Wine＋Xvfb の `cargo test`、Linux ネイティブの lib テスト、release ビルドと `check-imports.sh`、`--self-test`）。
 - 起動を重くしない（最近使ったファイルの読み込みは設定の読み込みの範囲で、存在確認はしない）。
 - `docs/spec.md` の該当章と「コマンドとキー割り当て一覧」を更新する。Windows 実機の確認項目を `docs/verification/U.md` に追記する。
+
+## U5: 印刷（基本）
+
+- ファイルメニューに「印刷…」（Ctrl+P）と「ページ設定…」。
+- 印刷ダイアログ（`PrintDlgExW` または `PrintDlgW`）: プリンター、部数、ページ範囲、選択範囲のみ。
+- ページ設定（`PageSetupDlgW`）: 用紙、向き、余白。設定に保存。
+- 本文は Scintilla の `SCI_FORMATRANGEFULL`（または `SCI_FORMATRANGE`）でプリンターの DC に描く。ページの区切り位置を先に計算してページ範囲に対応する。
+- ヘッダー（ファイル名またはタブ名、印刷日時）とフッター（ページ番号「n / m」）。
+- 色分けして印刷するか（`SCI_SETPRINTCOLOURMODE`: 色あり／白黒）、行番号を印刷するかの選択。折り返しは印刷時は常に紙幅で折り返す（`SCI_SETPRINTWRAPMODE`）。
+- 対象外: 印刷プレビュー、巨大ファイル（読み取り専用モード）の印刷（メニューを無効にして案内）。PDF は Windows の「Microsoft Print to PDF」で代用。
+- テスト: ページ区切りの計算とヘッダー・フッター文字列の組み立てを純粋な関数にして単体テスト。印刷結果は Windows 実機の確認項目にする。
