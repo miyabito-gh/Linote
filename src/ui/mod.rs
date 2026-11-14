@@ -40,3 +40,6 @@ pub mod statusbar;
 pub mod tabs;
 pub mod theme;
 pub mod window;
+
+/// 画面の入口（`main.rs` から呼ぶ）。タスク B が追加。
+pub use app::{run, RunOptions};
