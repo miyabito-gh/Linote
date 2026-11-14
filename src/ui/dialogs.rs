@@ -79,6 +79,12 @@ pub trait SettingsSession {
     fn confirm(&mut self, owner: HWND, caption: &str, text: &str) -> bool;
     /// OK だけの知らせ（割り当てられないキー、ショートカットの登録の失敗など）。
     fn notice(&mut self, owner: HWND, text: &str);
+    /// 設定ファイルをタブで開く（設定画面は閉じたあと）。既定は何もしない。
+    fn open_settings_file(&mut self) {}
+    /// 「キー」ページを最初に開くか（ヘルプ > キーボード ショートカット）。
+    fn initial_keys_page(&self) -> bool {
+        false
+    }
 }
 
 /// 利用者に尋ねる・知らせる操作の一式。
@@ -275,6 +281,80 @@ fn message_box(owner: HWND, caption: &str, text: &str, style: u32) -> i32 {
     }
 }
 
+/// 説明つきのボタンで選ばせる確認（Windows のタスク ダイアログ）。`buttons` は（ID、表示）。
+/// 戻り値は押したボタンの ID（Esc・閉じるは `cancel_id`）。タスク ダイアログが使えない
+/// 環境では `None`（呼び出し側がメッセージ ボックスで代わりに尋ねる）。
+fn task_dialog(
+    owner: HWND,
+    caption: &str,
+    instruction: &str,
+    content: &str,
+    buttons: &[(i32, &str)],
+    default_id: i32,
+    warning: bool,
+) -> Option<i32> {
+    use windows::Win32::UI::Controls::{
+        TASKDIALOGCONFIG, TASKDIALOG_BUTTON, TDF_ALLOW_DIALOG_CANCELLATION,
+        TDF_POSITION_RELATIVE_TO_WINDOW,
+    };
+    type TaskDialogIndirectFn = unsafe extern "system" fn(
+        *const TASKDIALOGCONFIG,
+        *mut i32,
+        *mut i32,
+        *mut windows::core::BOOL,
+    ) -> windows::core::HRESULT;
+    // コモン コントロール v6（マニフェストで指定）にだけある関数なので、実行時に探す。
+    // SAFETY: 名前で関数を探すだけ。見つかった関数は上の型のとおり（Win32 の定義）。
+    let f: TaskDialogIndirectFn = unsafe {
+        let module =
+            windows::Win32::System::LibraryLoader::LoadLibraryW(windows::core::w!("comctl32.dll"))
+                .ok()?;
+        let p = windows::Win32::System::LibraryLoader::GetProcAddress(
+            module,
+            windows::core::s!("TaskDialogIndirect"),
+        )?;
+        std::mem::transmute::<unsafe extern "system" fn() -> isize, TaskDialogIndirectFn>(p)
+    };
+    let caption = to_wide(caption);
+    let instruction = to_wide(instruction);
+    let content = to_wide(content);
+    let labels: Vec<Vec<u16>> = buttons.iter().map(|(_, t)| to_wide(t)).collect();
+    let items: Vec<TASKDIALOG_BUTTON> = buttons
+        .iter()
+        .zip(&labels)
+        .map(|((id, _), label)| TASKDIALOG_BUTTON {
+            nButtonID: *id,
+            pszButtonText: PCWSTR(label.as_ptr()),
+        })
+        .collect();
+    let mut config = TASKDIALOGCONFIG {
+        cbSize: std::mem::size_of::<TASKDIALOGCONFIG>() as u32,
+        hwndParent: owner,
+        dwFlags: TDF_ALLOW_DIALOG_CANCELLATION | TDF_POSITION_RELATIVE_TO_WINDOW,
+        pszWindowTitle: PCWSTR(caption.as_ptr()),
+        pszMainInstruction: PCWSTR(instruction.as_ptr()),
+        pszContent: PCWSTR(content.as_ptr()),
+        cButtons: items.len() as u32,
+        pButtons: items.as_ptr(),
+        nDefaultButton: default_id,
+        ..Default::default()
+    };
+    // 警告（!）または情報（i）のアイコン（MAKEINTRESOURCE の値）。
+    config.Anonymous1.pszMainIcon =
+        PCWSTR(if warning { 65535 } else { 65533 } as usize as *const u16);
+    let mut pressed = 0i32;
+    // SAFETY: 構造体と、それが指す文字列・ボタンは呼び出しの間有効。モーダル。
+    let hr = unsafe {
+        f(
+            &config,
+            &mut pressed,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    hr.is_ok().then_some(pressed)
+}
+
 impl Prompts for Win32Prompts {
     fn open_files(&self, owner: HWND, initial_dir: Option<&Path>) -> Vec<PathBuf> {
         let mut buffer = vec![0u16; FILE_BUFFER];
@@ -339,6 +419,25 @@ impl Prompts for Win32Prompts {
     }
 
     fn close_choice(&self, owner: HWND, doc_title: &str) -> CloseChoice {
+        if let Some(id) = task_dialog(
+            owner,
+            "Linote",
+            &format!("「{doc_title}」への変更を保存しますか？"),
+            "保存しないと、変更は失われます。",
+            &[
+                (IDYES.0, "保存する"),
+                (IDNO.0, "保存しない"),
+                (IDCANCEL.0, "キャンセル"),
+            ],
+            IDYES.0,
+            true,
+        ) {
+            return match id {
+                i if i == IDYES.0 => CloseChoice::Save,
+                i if i == IDNO.0 => CloseChoice::Discard,
+                _ => CloseChoice::Cancel,
+            };
+        }
         let text = format!(
             "「{doc_title}」には保存していない変更があります。\n\n\
              はい: 保存してから閉じる\nいいえ: 保存せずに閉じる\nキャンセル: 閉じない"
@@ -364,6 +463,25 @@ impl Prompts for Win32Prompts {
     }
 
     fn restore_choice(&self, owner: HWND, text: &str) -> RestoreChoice {
+        if let Some(id) = task_dialog(
+            owner,
+            "Linote - 未保存の内容の復元",
+            "未保存の内容を復元しますか？",
+            text,
+            &[
+                (IDYES.0, "復元して開く"),
+                (IDNO.0, "破棄する"),
+                (IDCANCEL.0, "あとで（次回の起動でもう一度確認）"),
+            ],
+            IDYES.0,
+            false,
+        ) {
+            return match id {
+                i if i == IDYES.0 => RestoreChoice::Restore,
+                i if i == IDNO.0 => RestoreChoice::Discard,
+                _ => RestoreChoice::Later,
+            };
+        }
         let text = format!(
             "{text}\n\nはい: 復元して開く\nいいえ: 破棄する\nキャンセル: 今は何もしない（次回の起動でもう一度確認します）"
         );

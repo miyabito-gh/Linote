@@ -86,6 +86,8 @@ pub enum TabHit {
     Close(usize),
     /// タブのないところ。
     Empty,
+    /// 新しいタブのボタン（＋）。
+    New,
 }
 
 /// 各タブの横の位置（`None` は、あふれて見えないタブ）。
@@ -215,9 +217,10 @@ impl TabBar {
             .iter()
             .map(|t| m.natural_width(measure(&t.title)))
             .collect();
+        // 右に「＋」の場所を空けて並べる。
         self.positions = layout(
             &natural,
-            bar.right - bar.left,
+            (bar.right - bar.left - self.new_button_width()).max(0),
             &m,
             self.active,
             &mut self.scroll,
@@ -233,6 +236,37 @@ impl TabBar {
             right: self.bar.left + x + w,
             bottom: self.bar.bottom,
         })
+    }
+
+    /// 「＋」の幅。極端に狭いバーでは出さない（タブの選択領域を優先する）。
+    fn new_button_width(&self) -> i32 {
+        let w = crate::platform::system::scale(36, self.dpi);
+        if self.bar.right - self.bar.left < w * 4 {
+            0
+        } else {
+            w
+        }
+    }
+
+    /// 「＋」のボタンの矩形（最後に見えているタブの右）。
+    pub fn new_button_rect(&self) -> RECT {
+        let right_of_tabs = (0..self.items.len())
+            .filter_map(|i| self.tab_rect(i))
+            .map(|r| r.right)
+            .max()
+            .unwrap_or(self.bar.left);
+        let w = self.new_button_width();
+        if w == 0 {
+            return RECT::default();
+        }
+        let left = right_of_tabs.min(self.bar.right - w).max(self.bar.left);
+        let inset = crate::platform::system::scale(4, self.dpi);
+        RECT {
+            left: left + inset,
+            right: left + w - inset,
+            top: self.bar.top + inset,
+            bottom: self.bar.bottom - inset - 1,
+        }
     }
 
     fn close_rect(&self, tab: &RECT) -> RECT {
@@ -262,6 +296,10 @@ impl TabBar {
     pub fn hit_test(&self, x: i32, y: i32) -> Option<TabHit> {
         if !crate::ui::window::contains(&self.bar, x, y) {
             return None;
+        }
+        let new_button = self.new_button_rect();
+        if new_button.right > new_button.left && crate::ui::window::contains(&new_button, x, y) {
+            return Some(TabHit::New);
         }
         for i in 0..self.items.len() {
             if let Some(r) = self.tab_rect(i) {
@@ -327,6 +365,34 @@ impl TabBar {
             },
             ui.tab_separator,
         );
+        // 「＋」のボタン（ふだんは記号だけ、マウスが乗ると背景）。
+        if self.new_button_width() > 0 {
+            let b = offset(self.new_button_rect());
+            if self.hover == Some(TabHit::New) {
+                c.fill(&b, ui.tab_hover_bg);
+            }
+            let (cx, cy) = ((b.left + b.right) / 2, (b.top + b.bottom) / 2);
+            let half = c.px(5);
+            let t = c.px(1).max(1);
+            c.fill(
+                &RECT {
+                    left: cx - half,
+                    right: cx + half + 1,
+                    top: cy - t / 2,
+                    bottom: cy - t / 2 + t,
+                },
+                ui.tab_fg,
+            );
+            c.fill(
+                &RECT {
+                    left: cx - t / 2,
+                    right: cx - t / 2 + t,
+                    top: cy - half,
+                    bottom: cy + half + 1,
+                },
+                ui.tab_fg,
+            );
+        }
         for (i, item) in self.items.iter().enumerate() {
             let Some(r) = self.tab_rect(i) else { continue };
             let r = offset(r);

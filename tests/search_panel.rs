@@ -178,13 +178,8 @@ fn panel_greps_opens_hits_and_disables_replace() {
     // 「選択範囲内」のチェックを押すと、切り替えの通知が届く（範囲は ui::app が決める）。
     // SAFETY: 小窓の子のチェックボックスを探して押す。
     unsafe {
-        let check = FindWindowExW(
-            Some(hwnd),
-            None,
-            w!("BUTTON"),
-            w!("選択範囲内（検索・置換を選択範囲に限る）"),
-        )
-        .expect("選択範囲内の項目");
+        let check = FindWindowExW(Some(hwnd), None, w!("BUTTON"), w!("選択範囲内だけ"))
+            .expect("選択範囲内の項目");
         SendMessageW(check, 0x00F1, Some(WPARAM(1)), None); // BM_SETCHECK
     }
     assert!(panel.in_selection());

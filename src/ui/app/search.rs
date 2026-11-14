@@ -23,7 +23,7 @@ use crate::document::{
     Capability, EditTarget, LineCount, MemoryText, Selection, TextRange, TextSource,
 };
 use crate::search::{Direction, Hit, ReplaceSummary, SearchOptions, Searcher};
-use crate::ui::find::{FindEvent, FindPanel};
+use crate::ui::find::{FindEvent, FindMode, FindPanel};
 use crate::ui::statusbar::MessageKind;
 
 use super::{App, UiMessage};
@@ -113,8 +113,9 @@ fn describe(e: &Error) -> String {
 impl App {
     // ---------------------------------------------------------------- 検索欄
 
-    /// 検索欄を出す（初めてなら作る）。`grep` なら Grep の起点のフォルダーも決める。
-    pub fn show_find(&mut self, grep: bool) -> Result<()> {
+    /// 検索欄を `mode` の用途で出す（初めてなら作る）。Grep なら起点のフォルダーも決める。
+    pub fn show_find(&mut self, mode: FindMode) -> Result<()> {
+        let grep = mode == FindMode::Grep;
         if self.find_panel.is_none() {
             let sender = self.sender();
             let on_event: Rc<dyn Fn(FindEvent)> = Rc::new(move |event| {
@@ -137,7 +138,7 @@ impl App {
             }
         }
         self.update_find_context();
-        panel.show(prefill.as_deref());
+        panel.show_mode(mode, prefill.as_deref());
         Ok(())
     }
 
@@ -371,7 +372,7 @@ impl App {
         } else if self.query_from_caret().is_some() {
             self.find_selection(direction)?;
         } else {
-            self.show_find(false)?;
+            self.show_find(FindMode::Find)?;
         }
         Ok(())
     }

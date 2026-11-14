@@ -54,6 +54,13 @@ use crate::memo::{Memo, MemoHit, MemoStore};
 use crate::platform::system::{scale, set_dark_title_bar, to_wide};
 use crate::ui::theme::Theme;
 use crate::ui::window::{UiFont, WM_APP_FIRST_FREE};
+use windows::Win32::Graphics::Gdi::{
+    DrawFocusRect, DrawTextW, SelectObject, SetBkMode, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX,
+    DT_RIGHT, DT_SINGLELINE, DT_VCENTER, TRANSPARENT,
+};
+use windows::Win32::UI::Controls::{DRAWITEMSTRUCT, ODS_FOCUS, ODS_SELECTED};
+use windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
+use windows::Win32::UI::WindowsAndMessaging::{SetWindowTextW, WM_DRAWITEM};
 
 const CLASS: PCWSTR = w!("LinoteMemoPanel");
 /// 作業スレッドからの結果が届いたことを知らせる（`WM_APP + 16`）。
@@ -97,6 +104,8 @@ struct State {
     list: HWND,
     button: HWND,
     delete_button: HWND,
+    /// 一覧が空のときに、一覧の代わりに出す案内。
+    empty: HWND,
     store: MemoStore,
     font: UiFont,
     dpi: u32,
@@ -389,8 +398,28 @@ impl State {
         }
     }
 
+    /// 一覧の 1 行の高さ（名前と日時を 1 行に描く）。
+    fn item_height(&self) -> i32 {
+        self.font.measure_text("あAg", None).cy + scale(10, self.dpi)
+    }
+
     fn apply_font(&self) {
-        for h in [self.edit, self.list, self.button, self.delete_button] {
+        // SAFETY: 自分のリストボックス（自前で描く固定高さの行）。
+        unsafe {
+            SendMessageW(
+                self.list,
+                LB_SETITEMHEIGHT,
+                WPARAM(0),
+                LPARAM(self.item_height() as isize),
+            );
+        }
+        for h in [
+            self.edit,
+            self.list,
+            self.button,
+            self.delete_button,
+            self.empty,
+        ] {
             // SAFETY: 書体は State が保持する間有効。
             unsafe {
                 SendMessageW(
@@ -438,24 +467,30 @@ impl State {
         unsafe {
             let _ = GetClientRect(self.hwnd, &mut rc);
         }
-        let m = scale(8, self.dpi);
-        let edit_h = self.font.measure_text("あAg", None).cy + scale(12, self.dpi);
-        let button_h = edit_h;
+        let px = |n| scale(n, self.dpi);
+        let (m, gap) = (px(12), px(8));
+        let row = self.font.measure_text("あAg", None).cy + px(10);
         let (w, h) = (rc.right - rc.left, rc.bottom - rc.top);
         let inner = (w - 2 * m).max(0);
-        let list_h = (h - edit_h - button_h - 4 * m).max(0);
+        let button_w =
+            |b: HWND| (self.font.measure_text(&window_text(b), None).cx + px(28)).max(px(88));
+        let list_y = m + row + gap;
+        let button_h = row + px(2);
+        let list_h = (h - list_y - gap - button_h - m).max(0);
+        let y = list_y + list_h + gap;
         // SAFETY: 自分の子ウィンドウ。
         unsafe {
-            let _ = MoveWindow(self.edit, m, m, inner, edit_h, true);
-            let _ = MoveWindow(self.list, m, 2 * m + edit_h, inner, list_h, true);
-            let half = ((inner - m) / 2).max(0);
-            let y = 3 * m + edit_h + list_h;
-            let _ = MoveWindow(self.button, m, y, half, button_h, true);
+            let _ = MoveWindow(self.edit, m, m, inner, row, true);
+            let _ = MoveWindow(self.list, m, list_y, inner, list_h, true);
+            let _ = MoveWindow(self.empty, m, list_y + px(8), inner, list_h - px(8), true);
+            // 主な操作（新規メモ）は右、削除は左に離して置く。
+            let new_w = button_w(self.button);
+            let _ = MoveWindow(self.button, m + inner - new_w, y, new_w, button_h, true);
             let _ = MoveWindow(
                 self.delete_button,
-                m + half + m,
+                m,
                 y,
-                (inner - half - m).max(0),
+                button_w(self.delete_button),
                 button_h,
                 true,
             );
@@ -534,6 +569,85 @@ impl State {
             }
         }
         self.hits = hits;
+        self.update_empty();
+    }
+
+    /// 一覧が空なら、一覧の代わりに案内を出す。削除は選択があるときだけ。
+    fn update_empty(&self) {
+        let empty = self.hits.is_empty();
+        let text = if !empty {
+            ""
+        } else if self.query().trim().is_empty() {
+            "メモはまだありません。\n「新規メモ」で作成できます。"
+        } else {
+            "一致するメモはありません。\n「新規メモ」で、この名前のメモを作成できます。"
+        };
+        let wide = to_wide(text);
+        // SAFETY: 自分の子ウィンドウ。
+        unsafe {
+            let _ = SetWindowTextW(self.empty, PCWSTR(wide.as_ptr()));
+            let _ = ShowWindow(self.empty, if empty { SW_SHOW } else { SW_HIDE });
+            let _ = ShowWindow(self.list, if empty { SW_HIDE } else { SW_SHOW });
+            let _ = EnableWindow(self.delete_button, !empty);
+        }
+    }
+
+    /// 一覧の 1 行を描く（名前と抜粋を左、更新日時を右に薄く）。
+    fn draw_item(&self, d: &DRAWITEMSTRUCT) {
+        let Some(hit) = self.hits.get(d.itemID as usize) else {
+            return;
+        };
+        let selected = d.itemState.0 & ODS_SELECTED.0 != 0;
+        let t = &self.theme;
+        let bg = if selected {
+            t.editor.selection_bg
+        } else {
+            t.editor.bg
+        };
+        let px = |n| scale(n, self.dpi);
+        let mut rc = d.rcItem;
+        // SAFETY: WM_DRAWITEM で渡された DC と矩形。
+        unsafe {
+            let brush = CreateSolidBrush(COLORREF(bg.colorref()));
+            FillRect(d.hDC, &rc, brush);
+            let _ = DeleteObject(brush.into());
+            let old_font = SelectObject(d.hDC, self.font.handle().into());
+            SetBkMode(d.hDC, TRANSPARENT);
+            let date = to_wide(&format_updated(hit.updated_ms));
+            let date_w = self
+                .font
+                .measure_text(&format_updated(hit.updated_ms), None)
+                .cx;
+            rc.left += px(6);
+            rc.right -= px(6);
+            let mut date_rc = rc;
+            SetTextColor(d.hDC, COLORREF(t.ui.status_dim.colorref()));
+            let mut date_text = date[..date.len() - 1].to_vec();
+            DrawTextW(
+                d.hDC,
+                &mut date_text,
+                &mut date_rc,
+                DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+            );
+            let mut name_rc = rc;
+            name_rc.right = (rc.right - date_w - px(12)).max(rc.left);
+            let label = match (&hit.snippet, hit.name_match) {
+                (Some(snippet), false) => format!("{}  —  {}", hit.name, snippet),
+                _ => hit.name.clone(),
+            };
+            let mut text: Vec<u16> = label.encode_utf16().collect();
+            SetTextColor(d.hDC, COLORREF(t.editor.fg.colorref()));
+            DrawTextW(
+                d.hDC,
+                &mut text,
+                &mut name_rc,
+                DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS,
+            );
+            SelectObject(d.hDC, old_font);
+            if d.itemState.0 & ODS_FOCUS.0 != 0 {
+                let _ = DrawFocusRect(d.hDC, &d.rcItem);
+            }
+        }
     }
 
     fn emit(&self, event: PanelEvent) {
@@ -647,10 +761,25 @@ extern "system" fn panel_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPAR
                 hwnd,
                 w!("LISTBOX"),
                 w!(""),
-                WS_TABSTOP.0 | WS_VSCROLL.0 | (LBS_NOTIFY | LBS_NOINTEGRALHEIGHT) as u32,
+                WS_TABSTOP.0
+                    | WS_VSCROLL.0
+                    | (LBS_NOTIFY | LBS_NOINTEGRALHEIGHT | LBS_OWNERDRAWFIXED | LBS_HASSTRINGS)
+                        as u32,
                 WS_EX_CLIENTEDGE.0,
                 ID_LIST,
             );
+            let empty = child(hwnd, w!("STATIC"), w!(""), SS_CENTER, 0, 0);
+            // 検索欄の薄い案内（空のときだけ見える）。
+            let cue = to_wide("メモを検索（名前と本文）");
+            // SAFETY: 自分の入力欄。文字列はコピーされる。
+            unsafe {
+                SendMessageW(
+                    edit,
+                    EM_SETCUEBANNER,
+                    WPARAM(1),
+                    LPARAM(cue.as_ptr() as isize),
+                );
+            }
             let button = child(
                 hwnd,
                 w!("BUTTON"),
@@ -674,6 +803,7 @@ extern "system" fn panel_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPAR
                 list,
                 button,
                 delete_button,
+                empty,
                 store,
                 font: UiFont::for_dpi(dpi),
                 dpi,
@@ -735,12 +865,25 @@ extern "system" fn panel_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPAR
             // SAFETY: 既定の処理。
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
-        WM_CTLCOLOREDIT | WM_CTLCOLORLISTBOX => {
+        WM_DRAWITEM => {
+            if lparam.0 != 0 {
+                // SAFETY: WM_DRAWITEM の lparam は DRAWITEMSTRUCT。
+                let d = unsafe { &*(lparam.0 as *const DRAWITEMSTRUCT) };
+                with_state(hwnd, |s| s.draw_item(d));
+            }
+            LRESULT(1)
+        }
+        WM_CTLCOLOREDIT | WM_CTLCOLORLISTBOX | WM_CTLCOLORSTATIC_ => {
             let brush = with_state(hwnd, |s| {
                 let hdc = HDC(wparam.0 as *mut _);
+                let fg = if msg == WM_CTLCOLORSTATIC_ {
+                    s.theme.ui.status_dim
+                } else {
+                    s.theme.editor.fg
+                };
                 // SAFETY: wparam は子ウィンドウの DC。
                 unsafe {
-                    SetTextColor(hdc, COLORREF(s.theme.editor.fg.colorref()));
+                    SetTextColor(hdc, COLORREF(fg.colorref()));
                     SetBkColor(hdc, COLORREF(s.theme.editor.bg.colorref()));
                 }
                 s.list_brush
@@ -862,4 +1005,111 @@ fn is_edit(parent: HWND, hwnd: HWND) -> bool {
 #[allow(non_snake_case)]
 unsafe fn SendMessageW(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
     windows::Win32::UI::WindowsAndMessaging::SendMessageW(h, msg, Some(w), Some(l))
+}
+
+const EM_SETCUEBANNER: u32 = 0x1501;
+const WM_CTLCOLORSTATIC_: u32 = 0x0138;
+const LBS_OWNERDRAWFIXED: i32 = 0x0010;
+const LBS_HASSTRINGS: i32 = 0x0040;
+const LB_SETITEMHEIGHT: u32 = 0x01A0;
+const SS_CENTER: u32 = 0x0001;
+
+fn window_text(h: HWND) -> String {
+    use windows::Win32::UI::WindowsAndMessaging::{GetWindowTextLengthW, GetWindowTextW};
+    // SAFETY: 長さ + 1 の領域を渡す。
+    unsafe {
+        let len = GetWindowTextLengthW(h).max(0) as usize;
+        let mut buf = vec![0u16; len + 1];
+        let n = GetWindowTextW(h, &mut buf).max(0) as usize;
+        String::from_utf16_lossy(&buf[..n])
+    }
+}
+
+/// 更新日時の表示（今日なら時刻、今年なら月日、それより前は年月日）。
+fn format_updated(updated_ms: u64) -> String {
+    let Some(t) = local_parts(updated_ms) else {
+        return String::new();
+    };
+    let now = local_parts(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0),
+    );
+    format_relative(t, now)
+}
+
+/// （年, 月, 日, 時, 分）。
+type DateParts = (u16, u16, u16, u16, u16);
+
+fn format_relative(t: DateParts, now: Option<DateParts>) -> String {
+    let (y, mo, d, h, mi) = t;
+    match now {
+        Some((ny, nmo, nd, _, _)) if (ny, nmo, nd) == (y, mo, d) => format!("{h}:{mi:02}"),
+        Some((ny, _, _, _, _)) if ny == y => format!("{mo}/{d}"),
+        _ => format!("{y}/{mo}/{d}"),
+    }
+}
+
+/// UNIX 時刻（ミリ秒）を地域の日時にする。
+fn local_parts(ms: u64) -> Option<DateParts> {
+    use windows::Win32::Foundation::FILETIME;
+    use windows::Win32::Storage::FileSystem::FileTimeToLocalFileTime;
+    // 1601-01-01 からの 100 ナノ秒単位。
+    const EPOCH_DIFF: u64 = 116_444_736_000_000_000;
+    let ticks = ms.checked_mul(10_000)?.checked_add(EPOCH_DIFF)?;
+    let ft = FILETIME {
+        dwLowDateTime: ticks as u32,
+        dwHighDateTime: (ticks >> 32) as u32,
+    };
+    let mut local = FILETIME::default();
+    // SAFETY: 出力先は呼び出しの間有効。
+    unsafe { FileTimeToLocalFileTime(&ft, &mut local).ok()? };
+    let local_ticks = (u64::from(local.dwHighDateTime) << 32) | u64::from(local.dwLowDateTime);
+    let secs = local_ticks.checked_sub(EPOCH_DIFF)? / 10_000_000;
+    Some(civil(secs))
+}
+
+/// UNIX 秒（地域時刻に直したもの）を年月日時分にする。
+fn civil(secs: u64) -> DateParts {
+    let days = (secs / 86_400) as i64;
+    let rem = secs % 86_400;
+    // H. Hinnant の civil_from_days。
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    (
+        y as u16,
+        m as u16,
+        d as u16,
+        (rem / 3_600) as u16,
+        (rem % 3_600 / 60) as u16,
+    )
+}
+
+#[cfg(test)]
+mod date_tests {
+    use super::*;
+
+    #[test]
+    fn civil_dates() {
+        assert_eq!(civil(0), (1970, 1, 1, 0, 0));
+        assert_eq!(civil(1_700_000_000), (2023, 11, 14, 22, 13));
+        assert_eq!(civil(951_782_400), (2000, 2, 29, 0, 0));
+    }
+
+    #[test]
+    fn relative_format() {
+        let t = (2026, 11, 14, 9, 5);
+        assert_eq!(format_relative(t, Some((2026, 11, 14, 23, 0))), "9:05");
+        assert_eq!(format_relative(t, Some((2026, 12, 1, 0, 0))), "11/14");
+        assert_eq!(format_relative(t, Some((2027, 1, 1, 0, 0))), "2026/11/14");
+        assert_eq!(format_relative(t, None), "2026/11/14");
+    }
 }

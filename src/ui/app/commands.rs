@@ -556,11 +556,11 @@ pub fn register(registry: &mut Registry<App>) -> Result<()> {
     })?;
 
     registry.register(SEARCH_FIND, |app, _| {
-        app.show_find(false)?;
+        app.show_find(crate::ui::find::FindMode::Find)?;
         Ok(Value::Null)
     })?;
     registry.register(SEARCH_REPLACE, |app, _| {
-        app.show_find(false)?;
+        app.show_find(crate::ui::find::FindMode::Replace)?;
         Ok(Value::Null)
     })?;
     registry.register(SEARCH_FIND_NEXT, |app, _| {
@@ -576,7 +576,7 @@ pub fn register(registry: &mut Registry<App>) -> Result<()> {
         Ok(Value::Null)
     })?;
     registry.register(SEARCH_GREP, |app, _| {
-        app.show_find(true)?;
+        app.show_find(crate::ui::find::FindMode::Grep)?;
         Ok(Value::Null)
     })?;
     super::editcmds::register(registry)?;

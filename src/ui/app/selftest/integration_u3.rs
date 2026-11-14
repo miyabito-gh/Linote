@@ -509,7 +509,7 @@ fn scope_search() -> Check {
     reset_search()?;
     let id = new_doc("foo\nfoo foo\nfoo\n")?;
     step(|app| {
-        let _ = app.show_find(false);
+        let _ = app.show_find(crate::ui::find::FindMode::Find);
         if let Some(p) = app.find_panel {
             p.set_query("foo");
         }

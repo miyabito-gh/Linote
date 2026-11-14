@@ -37,6 +37,7 @@ use windows::Win32::Graphics::Gdi::{
     CreateSolidBrush, DeleteObject, FillRect, InvalidateRect, SetBkColor, SetTextColor, HBRUSH, HDC,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::UI::Controls::ShowScrollBar;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     EnableWindow, GetKeyState, SetFocus, VK_ESCAPE, VK_RETURN, VK_SHIFT,
 };
@@ -47,8 +48,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SetWindowPos, SetWindowTextW, ShowWindow, BM_GETCHECK, BM_SETCHECK, BN_CLICKED,
     BS_AUTOCHECKBOX, BS_PUSHBUTTON, CREATESTRUCTW, ES_AUTOHSCROLL, GWLP_USERDATA, GWLP_WNDPROC,
     HMENU, IDC_ARROW, LBN_DBLCLK, LBS_NOINTEGRALHEIGHT, LBS_NOTIFY, LB_ADDSTRING, LB_GETCURSEL,
-    LB_RESETCONTENT, LB_SETCURSEL, MINMAXINFO, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE,
-    SW_SHOW, WM_ACTIVATE, WM_CHAR, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_CTLCOLOREDIT,
+    LB_RESETCONTENT, LB_SETCURSEL, MINMAXINFO, SB_VERT, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
+    SW_HIDE, SW_SHOW, WM_ACTIVATE, WM_CHAR, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_CTLCOLOREDIT,
     WM_CTLCOLORLISTBOX, WM_CTLCOLORSTATIC, WM_ERASEBKGND, WM_GETMINMAXINFO, WM_KEYDOWN,
     WM_NCDESTROY, WM_SETFONT, WM_SIZE, WNDCLASSEXW, WNDPROC, WS_CAPTION, WS_CHILD, WS_CLIPCHILDREN,
     WS_EX_CLIENTEDGE, WS_EX_TOOLWINDOW, WS_POPUP, WS_SYSMENU, WS_TABSTOP, WS_THICKFRAME,
@@ -69,6 +70,10 @@ const CLASS: PCWSTR = w!("LinoteFindPanel");
 /// 作業スレッドからの結果が届いたことを知らせる（`WM_APP + 16`。メモの小窓と同じ番号で、
 /// 別ウィンドウ向けなので衝突しない）。
 const WM_PANEL_RESULT: u32 = WM_APP_FIRST_FREE;
+/// 窓の高さを用途と内容に合わせ直す（State を借りていない所で行うため、投函して後で）。
+const WM_PANEL_FIT: u32 = WM_APP_FIRST_FREE + 1;
+/// 窓の縁と項目の間の余白（96 DPI の px）。
+const MARGIN: i32 = 12;
 
 const ID_QUERY: usize = 201;
 const ID_REPLACE: usize = 202;
@@ -88,6 +93,29 @@ const ID_INSEL: usize = 215;
 const ID_EXTENSIONS: usize = 216;
 const ID_EXCLUDE_DIRS: usize = 217;
 const ID_INCLUDE_HIDDEN: usize = 218;
+const ID_MODE_FIND: usize = 219;
+const ID_MODE_REPLACE: usize = 220;
+const ID_MODE_GREP: usize = 221;
+
+const BS_AUTORADIOBUTTON: u32 = 0x0009;
+const BS_PUSHLIKE: u32 = 0x1000;
+const BS_DEFPUSHBUTTON: u32 = 0x0001;
+const BM_SETSTYLE: u32 = 0x00F4;
+const SS_CENTERIMAGE: u32 = 0x0200;
+const EM_SETCUEBANNER: u32 = 0x1501;
+const CB_SETCUEBANNER: u32 = 0x1703;
+const CB_SETITEMHEIGHT: u32 = 0x0153;
+
+/// 小窓の用途。用途に関係する項目とボタンだけを出す。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FindMode {
+    /// 文書内の検索。
+    Find,
+    /// 文書内の置換。
+    Replace,
+    /// フォルダーの中のファイルを検索。
+    Grep,
+}
 
 /// コンボボックスのメッセージと通知（`CBS_DROPDOWN`: 入力もできる一覧）。
 const CBS_DROPDOWN: u32 = 0x0002;
@@ -193,7 +221,13 @@ struct State {
     extensions: HWND,
     exclude_dirs: HWND,
     include_hidden: HWND,
-    filter_labels: [HWND; 2],
+    /// 各欄の名前（検索、置換後、フォルダー、対象の拡張子、除外フォルダー）。
+    labels: [HWND; 5],
+    /// 用途の切り替え（検索｜置換｜Grep）。
+    mode_buttons: [HWND; 3],
+    mode: FindMode,
+    /// Grep の用途で使っていた窓の高さ（ほかの用途から戻したときに使う）。
+    grep_height: i32,
     /// コンボボックスと Grep 条件の入力欄（キー操作を受ける）。
     edits: [HWND; 6],
     /// 履歴の差し替え中は入力の通知を無視する。
@@ -282,7 +316,7 @@ impl FindPanel {
         match created {
             Ok(hwnd) => {
                 let panel = FindPanel { hwnd };
-                panel.ensure_minimum_size();
+                panel.fit_to_mode();
                 panel.center_on(owner);
                 Ok(panel)
             }
@@ -293,25 +327,49 @@ impl FindPanel {
         }
     }
 
-    fn ensure_minimum_size(&self) {
-        if let Some((min_w, min_h)) = with_state(self.hwnd, |s| s.minimum_outer_size()) {
-            let mut rect = RECT::default();
-            // SAFETY: Compute the size before resizing, so WM_SIZE can borrow State independently.
-            unsafe {
-                let _ = GetWindowRect(self.hwnd, &mut rect);
-                if rect.right - rect.left < min_w || rect.bottom - rect.top < min_h {
-                    let _ = SetWindowPos(
-                        self.hwnd,
-                        None,
-                        0,
-                        0,
-                        (rect.right - rect.left).max(min_w),
-                        (rect.bottom - rect.top).max(min_h),
-                        SWP_NOMOVE | SWP_NOZORDER,
-                    );
-                }
-            }
+    /// 用途に合わせて窓の高さを決める（検索・置換は内容の高さ、Grep は結果の一覧の分も）。
+    fn fit_to_mode(&self) {
+        let Some((min_w, min_h, grep, remembered)) = with_state(self.hwnd, |s| {
+            let (w, h) = s.minimum_outer_size();
+            (w, h, s.mode == FindMode::Grep, s.grep_height)
+        }) else {
+            return;
+        };
+        let mut rect = RECT::default();
+        // SAFETY: 大きさを読んでから変える（WM_SIZE が State を借りられるよう、借用の外で）。
+        unsafe {
+            let _ = GetWindowRect(self.hwnd, &mut rect);
+            let width = (rect.right - rect.left).max(min_w);
+            let height = if grep { remembered.max(min_h) } else { min_h };
+            let _ = SetWindowPos(
+                self.hwnd,
+                None,
+                0,
+                0,
+                width,
+                height,
+                SWP_NOMOVE | SWP_NOZORDER,
+            );
         }
+    }
+
+    /// 用途を切り替える（項目・ボタン・窓の高さが変わる）。
+    pub fn set_mode(&self, mode: FindMode) {
+        let changed = with_state(self.hwnd, |s| s.switch_mode(mode)).unwrap_or(false);
+        if changed {
+            self.fit_to_mode();
+        }
+    }
+
+    /// いまの用途。
+    pub fn mode(&self) -> FindMode {
+        with_state(self.hwnd, |s| s.mode).unwrap_or(FindMode::Find)
+    }
+
+    /// 用途を選んで表示する。
+    pub fn show_mode(&self, mode: FindMode, prefill: Option<&str>) {
+        self.set_mode(mode);
+        self.show(prefill);
     }
 
     fn center_on(&self, owner: HWND) {
@@ -494,9 +552,10 @@ impl FindPanel {
             s.dpi = dpi;
             s.font = UiFont::for_dpi(dpi);
             s.apply_font();
+            s.fit_combo_heights();
             s.layout();
         });
-        self.ensure_minimum_size();
+        self.fit_to_mode();
     }
 
     pub fn destroy(self) {
@@ -641,7 +700,8 @@ impl State {
             self.list,
         ];
         v.extend(self.buttons);
-        v.extend(self.filter_labels);
+        v.extend(self.labels);
+        v.extend(self.mode_buttons);
         v
     }
 
@@ -673,29 +733,182 @@ impl State {
         self.font.measure_text("あAg", None).cy + scale(10, self.dpi)
     }
 
+    /// コンボボックスの入力部分を、ほかの入力欄と同じ高さにする。
+    fn fit_combo_heights(&self) {
+        let h = (self.row_height() - scale(6, self.dpi)).max(1);
+        for c in [self.query, self.replace, self.folder] {
+            // SAFETY: 自分のコンボボックス。wparam = -1 は入力部分。
+            unsafe {
+                SendMessageW(
+                    c,
+                    CB_SETITEMHEIGHT,
+                    Some(WPARAM(usize::MAX)),
+                    Some(LPARAM(h as isize)),
+                );
+            }
+        }
+    }
+
+    /// この用途で出す項目か。
+    fn visible_in_mode(&self, h: HWND) -> bool {
+        let grep = self.mode == FindMode::Grep;
+        let replace = self.mode == FindMode::Replace;
+        let [_, label_replace, label_folder, label_ext, label_exclude] = self.labels;
+        let [next, prev, replace_one, replace_all, grep_button, stop] = self.buttons;
+        if h == self.replace || h == label_replace || h == replace_one || h == replace_all {
+            replace
+        } else if [
+            self.folder,
+            self.extensions,
+            self.exclude_dirs,
+            self.include_hidden,
+            label_folder,
+            label_ext,
+            label_exclude,
+            grep_button,
+            stop,
+            self.list,
+        ]
+        .contains(&h)
+        {
+            grep
+        } else if h == prev {
+            self.mode == FindMode::Find
+        } else if h == self.in_selection || h == next {
+            !grep
+        } else {
+            true
+        }
+    }
+
+    /// 用途を切り替える。変わったら `true`。
+    fn switch_mode(&mut self, mode: FindMode) -> bool {
+        if self.mode == mode && self.mode_checked() == Some(mode) {
+            return false;
+        }
+        if self.mode == FindMode::Grep {
+            let mut r = RECT::default();
+            // SAFETY: 自分のウィンドウ。
+            unsafe {
+                let _ = GetWindowRect(self.hwnd, &mut r);
+            }
+            self.grep_height = r.bottom - r.top;
+        }
+        self.mode = mode;
+        for (i, b) in self.mode_buttons.into_iter().enumerate() {
+            // SAFETY: 自分のラジオボタン。
+            unsafe {
+                SendMessageW(
+                    b,
+                    BM_SETCHECK,
+                    Some(WPARAM((i == mode as usize) as usize)),
+                    None,
+                );
+            }
+        }
+        let [next, _, replace_one, _, grep_button, _] = self.buttons;
+        let default = match mode {
+            FindMode::Find => next,
+            FindMode::Replace => replace_one,
+            FindMode::Grep => grep_button,
+        };
+        for b in self.buttons {
+            let style = if b == default {
+                BS_DEFPUSHBUTTON
+            } else {
+                BS_PUSHBUTTON as u32
+            };
+            // SAFETY: 自分のボタン。見た目（既定の枠）だけを変える。
+            unsafe {
+                SendMessageW(
+                    b,
+                    BM_SETSTYLE,
+                    Some(WPARAM(style as usize)),
+                    Some(LPARAM(1)),
+                );
+            }
+        }
+        for h in self.controls() {
+            if h == self.status {
+                continue;
+            }
+            let show = self.visible_in_mode(h);
+            // SAFETY: 自分の子ウィンドウ。
+            unsafe {
+                let _ = ShowWindow(h, if show { SW_SHOW } else { SW_HIDE });
+            }
+        }
+        self.update_stop();
+        self.layout();
+        true
+    }
+
+    fn mode_checked(&self) -> Option<FindMode> {
+        let modes = [FindMode::Find, FindMode::Replace, FindMode::Grep];
+        self.mode_buttons
+            .iter()
+            .position(|&b| is_checked(b))
+            .map(|i| modes[i])
+    }
+
+    /// 中止は Grep の実行中だけ押せる。
+    fn update_stop(&self) {
+        // SAFETY: 自分のボタン。
+        unsafe {
+            let _ = EnableWindow(self.buttons[5], self.cancel.is_some());
+        }
+    }
+
     fn minimum_client_size(&self) -> (i32, i32) {
         let px = |n| scale(n, self.dpi);
-        let buttons = self
+        let m = px(MARGIN);
+        let (form_bottom, _) = self.form_layout(px(420));
+        let width = self.minimum_form_width() + 2 * m;
+        let height = if self.mode == FindMode::Grep {
+            form_bottom + px(8) + self.row_height() * 5 + m
+        } else {
+            form_bottom + m
+        };
+        (width, height)
+    }
+
+    fn minimum_form_width(&self) -> i32 {
+        let px = |n| scale(n, self.dpi);
+        let label = self.label_width();
+        let buttons: i32 = self
             .buttons
+            .iter()
+            .filter(|h| self.visible_in_mode(**h))
+            .map(|h| self.button_width(*h) + px(8))
+            .sum();
+        let options: i32 = [self.case, self.word, self.regex]
+            .iter()
+            .map(|h| self.check_width(*h) + px(16))
+            .sum();
+        let modes: i32 = self
+            .mode_buttons
+            .iter()
+            .map(|h| self.button_width(*h))
+            .sum();
+        (label + options).max(buttons).max(modes).max(px(360))
+    }
+
+    fn label_width(&self) -> i32 {
+        self.labels
             .iter()
             .map(|h| self.font.measure_text(&text_of(*h), None).cx)
             .max()
             .unwrap_or(0)
-            + px(20);
-        let options = [self.case, self.word, self.regex]
-            .iter()
-            .map(|h| self.font.measure_text(&text_of(*h), None).cx + px(26))
-            .max()
-            .unwrap_or(0)
-            * 3;
-        let scope = self.font.measure_text(&text_of(self.in_selection), None).cx + px(26);
-        let width = (buttons * 6 + px(6) * 5).max(options).max(scope) + px(16);
-        // Eight input/option rows, buttons, up to three status lines and a usable result area.
-        let height = self.row_height() * 9
-            + px(6) * 11
-            + self.font.measure_text("あAg", None).cy * 3
-            + px(70);
-        (width, height)
+            + scale(12, self.dpi)
+    }
+
+    fn button_width(&self, h: HWND) -> i32 {
+        (self.font.measure_text(&text_of(h), None).cx + scale(28, self.dpi))
+            .max(scale(88, self.dpi))
+    }
+
+    fn check_width(&self, h: HWND) -> i32 {
+        self.font.measure_text(&text_of(h), None).cx + scale(24, self.dpi)
     }
 
     fn minimum_outer_size(&self) -> (i32, i32) {
@@ -711,69 +924,131 @@ impl State {
         )
     }
 
+    /// 上から順に項目を並べる。`apply` が偽なら位置を計算するだけ。
+    /// 戻り値は（項目の下端、ボタンの行の上端）。
+    fn place_form(&self, inner: i32, apply: bool) -> (i32, i32) {
+        let d = self.dpi;
+        let px = |n| scale(n, d);
+        let (m, row, gap) = (px(MARGIN), self.row_height(), px(8));
+        let mv = |hwnd: HWND, x: i32, y: i32, w: i32, h: i32| {
+            if apply {
+                // SAFETY: 自分の子ウィンドウ。
+                unsafe {
+                    let _ = MoveWindow(hwnd, x, y, w.max(0), h, true);
+                }
+            }
+        };
+        let mut y = m;
+        // 用途の切り替え（左寄せの区切りボタン）。
+        let mut x = m;
+        for b in self.mode_buttons {
+            let w = self.button_width(b);
+            mv(b, x, y, w, row);
+            x += w;
+        }
+        y += row + px(12);
+        // 名前つきの欄。
+        let label_w = self.label_width();
+        let field_w = inner - label_w;
+        let fields = [
+            (self.labels[0], self.query, true),
+            (self.labels[1], self.replace, true),
+            (self.labels[2], self.folder, true),
+            (self.labels[3], self.extensions, false),
+            (self.labels[4], self.exclude_dirs, false),
+        ];
+        for (label, input, combo) in fields {
+            if !self.visible_in_mode(input) {
+                continue;
+            }
+            mv(label, m, y, label_w, row);
+            // コンボボックスの高さには開いた一覧の分も含める（閉じた見た目は変わらない）。
+            let h = if combo { row + px(DROPDOWN_EXTRA) } else { row };
+            mv(input, m + label_w, y, field_w, h);
+            y += row + gap;
+        }
+        // オプション（欄の位置に揃えて横に並べる）。
+        let mut x = m + label_w;
+        for c in [self.case, self.word, self.regex] {
+            let w = self.check_width(c);
+            mv(c, x, y, w, row);
+            x += w + px(16);
+        }
+        y += row;
+        let second = if self.mode == FindMode::Grep {
+            self.include_hidden
+        } else {
+            self.in_selection
+        };
+        mv(second, m + label_w, y, self.check_width(second), row);
+        y += row + gap;
+        // 状態文（空なら場所を取らない）。
+        let status_text = text_of(self.status);
+        if status_text.is_empty() {
+            mv(self.status, m, y, inner, 0);
+        } else {
+            let line_h = self.font.measure_text("あAg", None).cy.max(1);
+            let text_h = self
+                .font
+                .measure_text(&status_text, Some((inner - px(24)).max(1)))
+                .cy;
+            let status_h = text_h.clamp(line_h, line_h * 3) + px(4);
+            mv(self.status, m, y, inner, status_h);
+            if apply {
+                // 収まらないときだけスクロールバーを出す。
+                // SAFETY: 自分の子ウィンドウ。
+                unsafe {
+                    let _ = ShowScrollBar(self.status, SB_VERT, text_h > line_h * 3);
+                }
+            }
+            y += status_h + gap;
+        }
+        // ボタン（右寄せ。既定のボタンを先頭に）。
+        let buttons: Vec<HWND> = match self.mode {
+            FindMode::Find => vec![self.buttons[0], self.buttons[1]],
+            FindMode::Replace => vec![self.buttons[2], self.buttons[3], self.buttons[0]],
+            FindMode::Grep => vec![self.buttons[4], self.buttons[5]],
+        };
+        let total: i32 = buttons.iter().map(|b| self.button_width(*b)).sum::<i32>()
+            + gap * (buttons.len() as i32 - 1);
+        let mut x = m + inner - total;
+        let button_top = y;
+        for b in buttons {
+            let w = self.button_width(b);
+            mv(b, x, y, w, row + px(2));
+            x += w + gap;
+        }
+        y += row + px(2);
+        (y, button_top)
+    }
+
+    /// 内容に合わせて窓の高さを直す（後で。Grep 以外）。
+    fn fit_height(&self) {
+        // SAFETY: 自分のウィンドウに投函するだけ。
+        unsafe {
+            let _ = PostMessageW(Some(self.hwnd), WM_PANEL_FIT, WPARAM(0), LPARAM(0));
+        }
+    }
+
+    fn form_layout(&self, inner: i32) -> (i32, i32) {
+        self.place_form(inner, false)
+    }
+
     fn layout(&self) {
         let mut rc = RECT::default();
         // SAFETY: 自分のウィンドウ。
         unsafe {
             let _ = GetClientRect(self.hwnd, &mut rc);
         }
-        let d = self.dpi;
-        let (m, row, gap) = (scale(8, d), self.row_height(), scale(6, d));
+        let m = scale(MARGIN, self.dpi);
         let (w, h) = (rc.right - rc.left, rc.bottom - rc.top);
         let inner = (w - 2 * m).max(0);
-        let mut y = m;
-        let mv = |hwnd: HWND, x: i32, y: i32, w: i32, h: i32| {
-            // SAFETY: 自分の子ウィンドウ。
-            unsafe {
-                let _ = MoveWindow(hwnd, x, y, w.max(0), h, true);
-            }
-        };
-        for e in [self.query, self.replace, self.folder] {
-            // 高さには開いた一覧の分も含める（閉じているときの見た目は変わらない）。
-            mv(e, m, y, inner, row + scale(DROPDOWN_EXTRA, d));
-            y += row + gap;
+        let (bottom, _) = self.place_form(inner, true);
+        let y = bottom + scale(8, self.dpi);
+        // SAFETY: 自分の子ウィンドウ。
+        unsafe {
+            let _ = MoveWindow(self.list, m, y, inner, (h - y - m).max(0), true);
         }
-        let cw = inner / 3;
-        for (i, c) in [self.case, self.word, self.regex].into_iter().enumerate() {
-            mv(c, m + cw * i as i32, y, cw, row);
-        }
-        y += row + gap;
-        mv(self.in_selection, m, y, inner, row);
-        y += row + gap;
-        let label_width = self
-            .filter_labels
-            .iter()
-            .map(|h| self.font.measure_text(&text_of(*h), None).cx)
-            .max()
-            .unwrap_or(0)
-            + gap;
-        for (label, input) in self
-            .filter_labels
-            .into_iter()
-            .zip([self.extensions, self.exclude_dirs])
-        {
-            mv(label, m, y + scale(3, d), label_width, row);
-            mv(input, m + label_width, y, inner - label_width, row);
-            y += row + gap;
-        }
-        mv(self.include_hidden, m, y, inner, row);
-        y += row + gap;
-        let bw = (inner - 5 * gap) / 6;
-        for (i, b) in self.buttons.into_iter().enumerate() {
-            mv(b, m + (bw + gap) * i as i32, y, bw, row + gap);
-        }
-        y += row + 2 * gap;
-        let line_h = self.font.measure_text("あAg", None).cy.max(1);
-        // Leave room for the edit border and scrollbar when measuring wrapped status text.
-        let status_h = (self
-            .font
-            .measure_text(&text_of(self.status), Some((inner - scale(24, d)).max(1)))
-            .cy)
-            .clamp(line_h, line_h * 3)
-            + scale(4, d);
-        mv(self.status, m, y, inner, status_h);
-        y += status_h + gap;
-        mv(self.list, m, y, inner, (h - y - m).max(0));
     }
 
     fn options(&self) -> SearchOptions {
@@ -788,7 +1063,24 @@ impl State {
     fn show_status(&mut self, text: &str, error: bool) {
         self.status_is_error = error;
         set_text(self.status, text);
-        self.layout();
+        if self.mode == FindMode::Grep {
+            self.layout();
+            // 動いた項目の跡を残さない（子ウィンドウも描き直す）。
+            // SAFETY: 自分のウィンドウ。
+            unsafe {
+                use windows::Win32::Graphics::Gdi::{
+                    RedrawWindow, RDW_ALLCHILDREN, RDW_ERASE, RDW_INVALIDATE,
+                };
+                let _ = RedrawWindow(
+                    Some(self.hwnd),
+                    None,
+                    None,
+                    RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN,
+                );
+            }
+        } else {
+            self.fit_height();
+        }
         // SAFETY: 自分の子ウィンドウ（色が変わるので描き直す）。
         unsafe {
             let _ = InvalidateRect(Some(self.status), None, true);
@@ -877,6 +1169,7 @@ impl State {
         let generation = self.generation;
         let cancel = CancelToken::new();
         self.cancel = Some(cancel.clone());
+        self.update_stop();
         self.hits.clear();
         self.grep_root = root.clone();
         // SAFETY: 自分のリストボックス。
@@ -920,6 +1213,7 @@ impl State {
         if let Some(c) = self.cancel.take() {
             c.cancel();
         }
+        self.update_stop();
     }
 
     fn open_selected(&self) {
@@ -1039,7 +1333,7 @@ extern "system" fn panel_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPAR
                 check(w!("単語単位"), ID_WORD),
                 check(w!("正規表現"), ID_REGEX),
             );
-            let in_selection = check(w!("選択範囲内（検索・置換を選択範囲に限る）"), ID_INSEL);
+            let in_selection = check(w!("選択範囲内だけ"), ID_INSEL);
             let extensions = child(
                 hwnd,
                 w!("EDIT"),
@@ -1057,16 +1351,68 @@ extern "system" fn panel_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPAR
                 ID_EXCLUDE_DIRS,
             );
             let include_hidden = check(w!("隠しファイルも対象"), ID_INCLUDE_HIDDEN);
-            let filter_labels = [
-                child(hwnd, w!("STATIC"), w!("対象（拡張子）"), 0, 0, 0),
-                child(hwnd, w!("STATIC"), w!("除外フォルダー"), 0, 0, 0),
+            let label = |text: PCWSTR| child(hwnd, w!("STATIC"), text, SS_CENTERIMAGE, 0, 0);
+            let labels = [
+                label(w!("検索する文字列")),
+                label(w!("置換後の文字列")),
+                label(w!("フォルダー")),
+                label(w!("対象の拡張子")),
+                label(w!("除外フォルダー")),
             ];
+            let mode_button = |text: PCWSTR, id, first: bool| {
+                let group = if first {
+                    0x0002_0000 /* WS_GROUP */
+                } else {
+                    0
+                };
+                child(
+                    hwnd,
+                    w!("BUTTON"),
+                    text,
+                    WS_TABSTOP.0 | BS_AUTORADIOBUTTON | BS_PUSHLIKE | group,
+                    0,
+                    id,
+                )
+            };
+            let mode_buttons = [
+                mode_button(w!("検索"), ID_MODE_FIND, true),
+                mode_button(w!("置換"), ID_MODE_REPLACE, false),
+                mode_button(w!("Grep"), ID_MODE_GREP, false),
+            ];
+            // 入力欄の中の薄い案内（空のときだけ見える）。
+            for (h, text, combo) in [
+                (
+                    query,
+                    "検索する語（Enter で次へ、Shift+Enter で前へ）",
+                    true,
+                ),
+                (replace, "置き換える語（空なら削除）", true),
+                (folder, "検索するフォルダー", true),
+                (extensions, "例: *.rs;*.txt（空ならすべて）", false),
+                (exclude_dirs, "; で区切る", false),
+            ] {
+                let wide = to_wide(text);
+                let msg = if combo {
+                    CB_SETCUEBANNER
+                } else {
+                    EM_SETCUEBANNER
+                };
+                // SAFETY: 自分の子ウィンドウ。文字列は呼び出しの間有効（コピーされる）。
+                unsafe {
+                    SendMessageW(
+                        h,
+                        msg,
+                        Some(WPARAM(1)),
+                        Some(LPARAM(wide.as_ptr() as isize)),
+                    );
+                }
+            }
             let buttons = [
-                button(w!("次へ"), ID_NEXT),
-                button(w!("前へ"), ID_PREV),
+                button(w!("次を検索"), ID_NEXT),
+                button(w!("前を検索"), ID_PREV),
                 button(w!("置換"), ID_REPLACE_ONE),
                 button(w!("すべて置換"), ID_REPLACE_ALL),
-                button(w!("Grep"), ID_GREP),
+                button(w!("検索開始"), ID_GREP),
                 button(w!("中止"), ID_STOP),
             ];
             // Read-only multi-line status keeps long regex diagnostics accessible by scrolling.
@@ -1100,7 +1446,10 @@ extern "system" fn panel_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPAR
                 extensions,
                 exclude_dirs,
                 include_hidden,
-                filter_labels,
+                labels,
+                mode_buttons,
+                mode: FindMode::Find,
+                grep_height: scale(600, dpi),
                 edits: [HWND::default(); 6],
                 quiet: false,
                 buttons,
@@ -1145,7 +1494,8 @@ extern "system" fn panel_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPAR
             }
             with_state(hwnd, |s| {
                 set_dark_title_bar(hwnd, s.theme.dark);
-                s.layout();
+                s.fit_combo_heights();
+                s.switch_mode(FindMode::Find);
             });
             LRESULT(0)
         }
@@ -1225,6 +1575,16 @@ extern "system" fn panel_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPAR
                     s.validate();
                     s.emit(FindEvent::Changed(s.options()));
                 }
+                (ID_MODE_FIND | ID_MODE_REPLACE | ID_MODE_GREP, BN_CLICKED) => {
+                    let mode = match id {
+                        ID_MODE_FIND => FindMode::Find,
+                        ID_MODE_REPLACE => FindMode::Replace,
+                        _ => FindMode::Grep,
+                    };
+                    if s.switch_mode(mode) {
+                        s.fit_height();
+                    }
+                }
                 (ID_INSEL, BN_CLICKED) => s.emit(FindEvent::Scope(is_checked(s.in_selection))),
                 (ID_NEXT, BN_CLICKED) => s.find(true),
                 (ID_PREV, BN_CLICKED) => s.find(false),
@@ -1238,7 +1598,14 @@ extern "system" fn panel_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPAR
             LRESULT(0)
         }
         WM_PANEL_RESULT => {
-            with_state(hwnd, |s| s.drain());
+            with_state(hwnd, |s| {
+                s.drain();
+                s.update_stop();
+            });
+            LRESULT(0)
+        }
+        WM_PANEL_FIT => {
+            FindPanel { hwnd }.fit_to_mode();
             LRESULT(0)
         }
         WM_ACTIVATE => {
@@ -1304,7 +1671,9 @@ extern "system" fn key_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
             // SAFETY: キー状態の問い合わせだけ。
             let shift = unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0;
             with_state(parent, |s| {
-                if hwnd == s.edits[0] {
+                if hwnd == s.edits[0] && s.mode == FindMode::Grep {
+                    s.start_grep();
+                } else if hwnd == s.edits[0] {
                     s.find(!shift);
                 } else if hwnd == s.edits[1] {
                     s.replace(false);

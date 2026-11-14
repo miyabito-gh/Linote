@@ -319,6 +319,8 @@ pub struct App {
     paths: Option<AppPaths>,
     settings: Settings,
     settings_state: fileio::SettingsState,
+    /// 次に開く設定画面を「キー」ページから始める（ヘルプ > キーボード ショートカット）。
+    settings_open_keys: bool,
     /// 前回読んだ（または書いた）ときの設定ファイルの印。前面に戻ったとき、これと比べて
     /// 変わっていれば再読み込みする（V4-1）。
     settings_stamp: Option<crate::appdata::settings::SettingsStamp>,
@@ -465,6 +467,12 @@ pub(crate) fn dispatch(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> 
                 }
             }
             None
+        }
+        windows::Win32::UI::WindowsAndMessaging::WM_CONTEXTMENU
+            if is_our_editor(HWND(wparam.0 as *mut _)) =>
+        {
+            with_app(|app| app.show_editor_menu());
+            Some(LRESULT(0))
         }
         WM_CLOSE => {
             if with_app(|app| app.can_exit()) == Some(true) {
@@ -693,6 +701,7 @@ impl App {
             settings_writes_pending: 0,
             settings,
             settings_state,
+            settings_open_keys: false,
             prompts: Rc::new(Win32Prompts),
             keymap: KeyMap::default(),
             menu: None,
@@ -1882,6 +1891,9 @@ impl App {
                     SetCapture(self.hwnd);
                 }
             }
+            Some(TabHit::New) => {
+                self.run_command(CommandId::new("file.new"), Value::Null);
+            }
             Some(TabHit::Empty) | None => {
                 if let Some(seg) = self
                     .settings
@@ -1892,9 +1904,48 @@ impl App {
                 {
                     if let Some(hook) = self.hooks.status_click {
                         hook(self, seg);
+                    } else {
+                        self.on_status_click(seg, x, y);
                     }
                 }
             }
+        }
+    }
+
+    /// ステータスバーの項目のクリック: 文字コード・改行・言語はメニューと同じ一覧を
+    /// その場に出し、位置は「行へ移動」を開く。
+    fn on_status_click(&mut self, seg: StatusSegment, x: i32, y: i32) {
+        let command = match seg {
+            StatusSegment::Encoding => "file.save_encoding",
+            StatusSegment::Eol => "file.save_eol",
+            StatusSegment::Language => "view.language",
+            StatusSegment::Position => {
+                self.run_command(CommandId::new("edit.goto_line"), Value::Null);
+                return;
+            }
+            _ => return,
+        };
+        let Some(popup) = self
+            .menu()
+            .and_then(|m| m.popup_containing(CommandId::new(command)))
+        else {
+            return;
+        };
+        let mut pt = windows::Win32::Foundation::POINT { x, y };
+        // SAFETY: 自分のウィンドウの座標を画面座標にし、メニューを出す（選ばれた項目は
+        // いつもの WM_COMMAND で届く）。
+        unsafe {
+            let _ = windows::Win32::Graphics::Gdi::ClientToScreen(self.hwnd, &mut pt);
+            let _ = windows::Win32::UI::WindowsAndMessaging::TrackPopupMenu(
+                popup,
+                windows::Win32::UI::WindowsAndMessaging::TPM_LEFTALIGN
+                    | windows::Win32::UI::WindowsAndMessaging::TPM_BOTTOMALIGN,
+                pt.x,
+                pt.y,
+                None,
+                self.hwnd,
+                None,
+            );
         }
     }
 

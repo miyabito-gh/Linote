@@ -84,10 +84,15 @@ fn order() -> Result<Vec<DocumentId>, String> {
 fn menu_and_commands() -> Check {
     step(|app| -> Check {
         let entries = app.menu().ok_or("メニューがない")?.entries().to_vec();
+        // タブ固有の操作はタブの右クリックメニューに置く（ファイルメニューからは外した）。
         for command in ["file.close_right", "file.move_to_new_window"] {
             check!(
-                entries.iter().any(|e| e.command == CommandId::new(command)),
-                "メニューに {command} がない"
+                TAB_MENU.iter().flatten().any(|(c, _)| *c == command),
+                "右クリックメニューに {command} がない"
+            );
+            check!(
+                !entries.iter().any(|e| e.command == CommandId::new(command)),
+                "ファイルメニューに {command} が残っている"
             );
         }
         // 右クリックメニューのコマンドはすべて登録されている。
