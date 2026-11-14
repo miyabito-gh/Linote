@@ -38,3 +38,10 @@
 - 巨大モードのタブでは `set_replace_enabled(false, 案内)`、検索は `bigfile::BigFile::find`。`set_grep_folder`／`set_theme`／`set_dpi`。
 - Scintilla を包む `TextSource`／`EditTarget` のアダプタは `ui::editor` 側で用意する。
 - Grep は自前実装になったため `grep-searcher` 系の依存は削除した。
+
+## L（巨大ファイルのビュー）
+- `BigView::create(parent, hinstance, id, visible)`、`move_to(RECT)`、`show(bool)`、`set_source(Option<Arc<BigFile>>)`、タブ切替で `state()`／`restore_state`、`set_theme`、`set_dpi`。
+- `set_callback`: `Status` → ステータスバー（行・位置・索引の進み・読み取り専用）、`GotoLineRequested` → 入力欄 → `logic::parse_line_number` → `goto_line(n)`、`Found`／`SearchState`／`Message`／`Error`／`Focused`。
+- 索引の進みと外部変更の反映のため、タイマーで `refresh()` を呼ぶ。検索は `find(Arc<SearchPattern>, Direction)`、`cancel_find`。
+- 巨大ファイルを開いたとき（`bigfile::large_mode_reason`）に BigView のタブを作る。
+- 実機確認: Direct2D 経路（Wine では GDI に代替）、全角の桁ずれ、数 GB での操作感、高 DPI、Ctrl+C。
