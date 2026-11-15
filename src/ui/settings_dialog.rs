@@ -278,11 +278,22 @@ fn text_dip_height(font: &UiFont, text: &str, width: i32, dpi: u32) -> i32 {
 }
 fn row_height(item: &Item, font: &UiFont, page_w: i32, label_w: i32, row: i32, dpi: u32) -> i32 {
     match item.kind {
-        ItemKind::Font => row * 2 + text_dip_height(font, &"Ｍ".repeat(48), page_w, dpi) + 8,
+        ItemKind::Font => font_value_height(font, page_w - label_w, dpi).max(row - 6) + 6 + row + 4,
         ItemKind::Check => row.max(text_dip_height(font, item.label, page_w - 24, dpi) + 10),
         _ => row.max(text_dip_height(font, item.label, label_w - 8, dpi) + 10),
     }
 }
+/// 書体の表示（「書体名、11 pt」）の高さ。長い書体名は折り返す。
+fn font_value_height(font: &UiFont, width: i32, dpi: u32) -> i32 {
+    text_dip_height(font, &"Ｍ".repeat(24), width.max(1), dpi) + 4
+}
+
+/// 文字に合わせたボタンの幅（DIP）。短い語でも小さくなりすぎないよう最小幅を持つ。
+fn button_width(font: &UiFont, label: &str, dpi: u32) -> i32 {
+    let text = (font.measure_text(label, None).cx * 96 + dpi as i32 - 1) / dpi.max(1) as i32;
+    (text + 32).max(88)
+}
+
 fn key_row_height(font: &UiFont, width: i32, dpi: u32) -> i32 {
     let text = text_dip_height(font, "すべて既定に戻す", ((width - 8) / 2 - 20).max(1), dpi);
     (text + 12).max(28)
@@ -370,7 +381,16 @@ fn build(dlg: HWND, state: &mut State<'_>, owner: HWND) {
         })
         .max()
         .unwrap_or(200);
-    let label_w = (page_w - choice_w).clamp(page_w / 3, page_w / 2);
+    // 欄の名前の列は、いちばん長い名前に合わせる（値の列の左端を揃える）。
+    // ページごとに、いちばん長い名前に合わせる（ページの中で値の列の左端を揃える）。
+    let mut label_ws = vec![120; pages().len()];
+    for (page, item) in &state.items {
+        if !matches!(item.kind, ItemKind::Check) {
+            let w = dip(state.font.measure_text(item.label, None).cx) + 24;
+            label_ws[*page] = label_ws[*page].max(w.min(page_w / 2));
+        }
+    }
+    let choice_w = choice_w.clamp(160, (page_w - page_w / 2).max(160));
     let row_h = (dip(state.font.measure_text("国Ag", None).cy) + 12).max(28);
     let banner_h = warning.as_ref().map_or(0, |text| {
         text_dip_height(&state.font, text, list_w + 14 + page_w + gutter, dpi) + 8
@@ -378,7 +398,7 @@ fn build(dlg: HWND, state: &mut State<'_>, owner: HWND) {
     let body_top = margin + if banner_h > 0 { banner_h + 8 } else { 0 };
     let mut page_heights = vec![8; pages().len()];
     for (page, item) in &state.items {
-        page_heights[*page] += row_height(item, &state.font, page_w, label_w, row_h, dpi);
+        page_heights[*page] += row_height(item, &state.font, page_w, label_ws[*page], row_h, dpi);
     }
     for (i, page) in pages().iter().enumerate() {
         if page.kind == PageKind::Keys {
@@ -389,7 +409,7 @@ fn build(dlg: HWND, state: &mut State<'_>, owner: HWND) {
             );
         }
     }
-    let bw = (92.max(dip(state.font.measure_text("キャンセル", None).cx) + 24))
+    let bw = button_width(&state.font, "キャンセル", dpi)
         .min((margin + list_w + 14 + page_w + gutter - 16) / 3);
     let button_h = row_h.max(text_dip_height(&state.font, "キャンセル", bw - 16, dpi) + 12);
     let desired_body = page_heights.iter().copied().max().unwrap_or(160);
@@ -469,6 +489,7 @@ fn build(dlg: HWND, state: &mut State<'_>, owner: HWND) {
         let parent = hosts[page];
         let page_x = 0;
         let y = row_in_page[page];
+        let label_w = label_ws[page];
         let item_h = row_height(item, &state.font, page_w, label_w, row_h, dpi);
         row_in_page[page] += item_h;
         let ctl_x = page_x + label_w;
@@ -506,7 +527,7 @@ fn build(dlg: HWND, state: &mut State<'_>, owner: HWND) {
                     "",
                     CBS_DROPDOWNLIST | WS_VSCROLL | tab,
                     0,
-                    (px(ctl_x), px(y), px(ctl_w), px(200)),
+                    (px(ctl_x), px(y), px(choice_w.min(ctl_w)), px(200)),
                     id(SUB_MAIN),
                     &state.font,
                 );
@@ -539,15 +560,16 @@ fn build(dlg: HWND, state: &mut State<'_>, owner: HWND) {
                 ));
             }
             ItemKind::Font => {
-                // A full-width label/value, followed by a separate button row.
-                // Long family names never compete with the selection buttons.
+                // 名前は左の列、値（書体名、pt）は値の列。その下に文字幅のボタンを並べる。
+                // 長い書体名は値の列の中で折り返す。
+                let value_h = font_value_height(&state.font, ctl_w, dpi).max(row_h - 6);
                 made.push(child(
                     parent,
                     windows::core::w!("STATIC"),
                     item.label,
                     0,
                     0,
-                    (0, px(y + 3), px(page_w), px(row_h - 6)),
+                    (px(page_x), px(y + 3), px(label_w - 8), px(row_h - 6)),
                     id(SUB_LABEL),
                     &state.font,
                 ));
@@ -557,30 +579,28 @@ fn build(dlg: HWND, state: &mut State<'_>, owner: HWND) {
                     "",
                     0,
                     0,
-                    (0, px(y + row_h), px(page_w), px(item_h - row_h * 2 - 4)),
+                    (px(ctl_x), px(y + 3), px(ctl_w), px(value_h)),
                     id(SUB_MAIN),
                     &state.font,
                 ));
-                let choose_w = (page_w - 8) * 2 / 3;
-                for (label, sub, x, width) in [
-                    ("フォントを選択...", SUB_FONT_CHOOSE, 0, choose_w),
-                    (
-                        "既定",
-                        SUB_FONT_DEFAULT,
-                        choose_w + 8,
-                        page_w - choose_w - 8,
-                    ),
+                let mut bx = ctl_x;
+                let by = y + 3 + value_h + 6;
+                for (label, sub) in [
+                    ("フォントを選択...", SUB_FONT_CHOOSE),
+                    ("既定に戻す", SUB_FONT_DEFAULT),
                 ] {
+                    let bw = button_width(&state.font, label, dpi).min(ctl_w);
                     made.push(child(
                         parent,
                         windows::core::w!("BUTTON"),
                         label,
-                        BS_PUSHBUTTON | 0x2000 /* BS_MULTILINE */ | tab,
+                        BS_PUSHBUTTON | tab,
                         0,
-                        (px(x), px(y + item_h - row_h), px(width), px(row_h - 4)),
+                        (px(bx), px(by), px(bw), px(row_h - 4)),
                         id(sub),
                         &state.font,
                     ));
+                    bx += bw + 8;
                 }
             }
         }
@@ -849,7 +869,7 @@ fn build_keys_page(
         font,
     ));
     let hint_h = text_dip_height(font, KEY_HELP, w, dpi) + 6;
-    let list_h = (body_h - key_row * 4 - hint_h - 24).max(100);
+    let list_h = (body_h - key_row * 3 - hint_h - 24).max(100);
     let list = child(
         dlg,
         WC_LISTVIEWW,
@@ -896,13 +916,18 @@ fn build_keys_page(
         ID_KEY_CAPTURE_LABEL,
         font,
     ));
+    // 1 行目: 新しいキー［入力欄］［割り当て］。2 行目（入力欄の位置に揃える）:
+    // ［割り当てを外す］［既定に戻す］…右端に［すべて既定に戻す］。ボタンは文字の幅。
+    let bh = key_row - 4;
+    let assign_w = button_width(font, "割り当て", dpi);
+    let capture_w = (w - label_w - assign_w - 8).max(120);
     let capture = child(
         dlg,
         windows::core::w!("EDIT"),
         "",
         ES_READONLY | WS_BORDER | WS_TABSTOP,
         0,
-        (px(x0 + label_w), px(y1), px(w - label_w), px(key_row - 6)),
+        (px(x0 + label_w), px(y1), px(capture_w), px(key_row - 6)),
         ID_KEY_CAPTURE,
         font,
     );
@@ -911,38 +936,39 @@ fn build_keys_page(
         let _ = SetWindowSubclass(capture, Some(capture_proc), 1, 0);
     }
     made.push(capture);
-    let buttons: [(&str, i32, i32, i32, i32); 4] = [
-        ("割り当て", ID_KEY_ASSIGN, x0, y1 + key_row, (w - 8) / 2),
-        (
-            "割り当てを外す",
-            ID_KEY_CLEAR,
-            x0 + (w - 8) / 2 + 8,
-            y1 + key_row,
-            (w - 8) / 2,
-        ),
-        (
-            "既定に戻す",
-            ID_KEY_RESET,
-            x0,
-            y1 + key_row * 2,
-            (w - 8) / 2,
-        ),
-        (
-            "すべて既定に戻す",
-            ID_KEY_RESET_ALL,
-            x0 + (w - 8) / 2 + 8,
-            y1 + key_row * 2,
-            (w - 8) / 2,
-        ),
-    ];
+    let mut buttons: Vec<(&str, i32, i32, i32, i32)> = vec![(
+        "割り当て",
+        ID_KEY_ASSIGN,
+        x0 + label_w + capture_w + 8,
+        y1 - 1,
+        assign_w,
+    )];
+    let y2 = y1 + key_row;
+    let mut bx = x0 + label_w;
+    for (label, id) in [
+        ("割り当てを外す", ID_KEY_CLEAR),
+        ("既定に戻す", ID_KEY_RESET),
+    ] {
+        let bw = button_width(font, label, dpi);
+        buttons.push((label, id, bx, y2, bw));
+        bx += bw + 8;
+    }
+    let reset_all_w = button_width(font, "すべて既定に戻す", dpi);
+    buttons.push((
+        "すべて既定に戻す",
+        ID_KEY_RESET_ALL,
+        (x0 + w - reset_all_w).max(bx + 8),
+        y2,
+        reset_all_w,
+    ));
     for (label, id, bx, by, bw) in buttons {
         made.push(child(
             dlg,
             windows::core::w!("BUTTON"),
             label,
-            BS_PUSHBUTTON | 0x2000 /* BS_MULTILINE */ | WS_TABSTOP,
+            BS_PUSHBUTTON | WS_TABSTOP,
             0,
-            (px(bx), px(by), px(bw), px(key_row - 4)),
+            (px(bx), px(by), px(bw), px(bh)),
             id,
             font,
         ));
@@ -953,7 +979,7 @@ fn build_keys_page(
         KEY_HELP,
         0,
         0,
-        (px(x0), px(y1 + key_row * 3 + 8), px(w), px(hint_h)),
+        (px(x0), px(y1 + key_row * 2 + 8), px(w), px(hint_h)),
         ID_KEY_HINT,
         font,
     ));
@@ -1093,6 +1119,13 @@ fn refresh_key_list(dlg: HWND, state: &mut State<'_>) {
         let content = send(list, 0x101D /* LVM_GETCOLUMNWIDTH */, column, 0);
         let header = state.font.measure_text(title, None).cx + scale(24, state.dpi);
         send(list, 0x101E, column, content.max(header as isize));
+    }
+    // 最後の列は一覧の右端まで広げる（右に空きを残さない）。
+    let last = KEY_COLUMNS.len() - 1;
+    let before = send(list, 0x101D, last, 0);
+    send(list, 0x101E, last, -2 /* LVSCW_AUTOSIZE_USEHEADER */);
+    if send(list, 0x101D, last, 0) < before {
+        send(list, 0x101E, last, before);
     }
     if let Some(i) = selected.and_then(|id| state.key_visible.iter().position(|r| r.id == id)) {
         select_key_index(list, i);
