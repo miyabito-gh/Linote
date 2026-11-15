@@ -8,9 +8,9 @@ use std::cell::RefCell;
 use windows::core::PWSTR;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    CreateSolidBrush, DeleteObject, DrawTextW, GetDC, GetSysColorBrush, ReleaseDC, RestoreDC,
-    SaveDC, SelectObject, SetBkMode, SetTextColor, COLOR_MENU, DT_HIDEPREFIX, DT_RIGHT,
-    DT_SINGLELINE, DT_VCENTER, HBRUSH, TRANSPARENT,
+    CreateSolidBrush, DeleteObject, DrawTextW, GetDC, ReleaseDC, RestoreDC, SaveDC, SelectObject,
+    SetBkMode, SetTextColor, DT_HIDEPREFIX, DT_RIGHT, DT_SINGLELINE, DT_VCENTER, HBRUSH,
+    TRANSPARENT,
 };
 use windows::Win32::UI::Controls::{
     DRAWITEMSTRUCT, MEASUREITEMSTRUCT, ODS_CHECKED, ODS_DISABLED, ODS_GRAYED, ODS_HOTLIGHT,
@@ -71,10 +71,12 @@ pub(super) fn apply(hwnd: HWND, bar: HMENU, theme: &Theme, dpi: u32) {
 }
 
 unsafe fn configure(menu: HMENU, bar: bool, previous: &[Item], painter: &mut Painter) {
+    // ライトでは背景を指定しない（null で既定に戻す）。COLOR_MENU の筆で塗ると、
+    // Windows 11 の標準メニューの描画（左の印の列・選択の色）と食い違い、灰色の帯が出る。
     let bg = if painter.theme.dark {
         painter.brush
     } else {
-        unsafe { GetSysColorBrush(COLOR_MENU) }
+        HBRUSH::default()
     };
     let info = MENUINFO {
         cbSize: std::mem::size_of::<MENUINFO>() as u32,

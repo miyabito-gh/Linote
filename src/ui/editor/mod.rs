@@ -270,6 +270,9 @@ impl Editor {
         self.send(SCI_SETMARGINTYPEN, 0, SC_MARGIN_NUMBER);
         self.send(SCI_SETMARGINLEFT, 0, 4);
         self.send(SCI_SETTABWIDTH, 4, 0);
+        // 横スクロールバーは、表示した行が幅を超えたときだけ出す（既定の 2000 px のままだと、
+        // 短い文書でも常に出て、Windows 11 では左下に細い線として見える）。
+        self.send(SCI_SETSCROLLWIDTH, 1, 0);
         self.send(SCI_SETSCROLLWIDTHTRACKING, 1, 0);
         self.send(SCI_SETLAYOUTCACHE, SC_CACHE_PAGE, 0);
         // 着色は見えている範囲を優先し、残りは空き時間に行う。
@@ -337,6 +340,8 @@ impl Editor {
     /// 参照を 1 つ返す。切り替えると選択とスクロールは先頭に戻る（[`ViewState`] で戻す）。
     pub fn set_document(&self, doc: SciDoc) {
         self.send(SCI_SETDOCPOINTER, 0, doc.0);
+        // 前の文書の長い行で広がった横スクロールの幅を持ち越さない（表示に合わせて広がる）。
+        self.send(SCI_SETSCROLLWIDTH, 1, 0);
         // コードページはドキュメントごとの設定。読み込み口で作った文書にも必ず設定する。
         self.send(SCI_SETCODEPAGE, SC_CP_UTF8, 0);
         // タブ幅などはドキュメント側の設定なので、切り替えのたびに合わせる。
