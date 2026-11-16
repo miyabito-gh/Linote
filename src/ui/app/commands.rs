@@ -315,14 +315,14 @@ pub const SEARCH_GREP: CommandDef = CommandDef::new(
 pub const VIEW_PREVIEW_PANE: CommandDef = CommandDef::new(
     CommandId::new("view.preview_pane"),
     "Markdown プレビュー（右ペイン）",
-    "Markdown 文書（.md／.markdown）のプレビューを右ペインに開く（開いていれば閉じる）。初めて使うときに WebView2 を初期化する。",
+    "アクティブな文書（無題・任意の拡張子・メモを含む。巨大ファイルを除く）を Markdown として右ペインにプレビューする（開いていれば閉じる）。初めて使うときに WebView2 を初期化する。",
 )
 .default_key("Ctrl+Shift+P");
 
 pub const VIEW_PREVIEW_WINDOW: CommandDef = CommandDef::new(
     CommandId::new("view.preview_window"),
     "Markdown プレビュー（別ウィンドウ）",
-    "Markdown 文書（.md／.markdown）のプレビューを別ウィンドウに開く（開いていれば閉じる）。",
+    "アクティブな文書（巨大ファイルを除く）を Markdown として別ウィンドウにプレビューする（開いていれば閉じる）。",
 );
 
 pub const MEMO_OPEN_PANEL: CommandDef = CommandDef::new(
@@ -899,6 +899,16 @@ impl App {
             }
             if self.active.is_none() && self.needs_document(entry.command) {
                 return false;
+            }
+            if matches!(
+                entry.command.as_str(),
+                "view.preview_pane" | "view.preview_window"
+            ) && !self.preview_available()
+            {
+                // 巨大文書では、開いているプレビューを閉じる操作だけ残す。
+                return (entry.command.as_str() == "view.preview_pane" && self.preview_pane_open())
+                    || (entry.command.as_str() == "view.preview_window"
+                        && self.preview_window_open());
             }
             if entry.command.as_str() == "file.reopen_closed" {
                 return !self.closed_tabs_is_empty();

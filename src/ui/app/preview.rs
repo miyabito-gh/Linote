@@ -7,11 +7,10 @@
 //! - 編集 → [`PreviewScheduler::note_change`] → UI のタイマー（[`TIMER_PREVIEW`]）→
 //!   本文の写しをワーカーで変換（[`spawn_render`]）→ [`PreviewScheduler::accept`] で
 //!   文書 ID と版を照合 → [`compose_document`] → `set_document`。
-//! - 対象は Markdown 文書（拡張子 `.md`／`.markdown`）だけ。プレビューは、最後にアクティブに
-//!   なった Markdown 文書に追従する。
+//! - 対象は本文を Scintilla で編集している文書すべて（無題・任意の拡張子・メモを含む。巨大文書は
+//!   対象外）。プレビューは、最後にアクティブになった対象の文書に追従する。
 //! - ランタイムがなければ案内を出し、編集は続けられる。
 
-use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -22,7 +21,6 @@ use crate::markdown::{
     compose_document, spawn_render, PreviewPalette, PreviewScheduler, PreviewUpdate, Rgb,
     Stylesheet, DEFAULT_MAX_INPUT_BYTES,
 };
-use crate::ui::editor::Language;
 use crate::ui::preview::{PaneStatus, PreviewHost, PreviewPane, PreviewWindow};
 use crate::ui::statusbar::MessageKind;
 use crate::ui::theme::{Rgb as ThemeRgb, Theme};
@@ -46,23 +44,11 @@ pub(super) struct PreviewState {
     pub timer: bool,
 }
 
-/// 文書がプレビューの対象（Markdown）か。拡張子 `.md`／`.markdown`。まだファイルでない文書は
-/// 言語の指定で判断する。
-pub(super) fn is_markdown(doc: &OpenDoc) -> bool {
-    if !matches!(doc.view, DocView::Scintilla(_)) {
-        return false;
-    }
-    match doc.state.path() {
-        Some(path) => has_markdown_extension(path),
-        None => doc.language == Language::Markdown,
-    }
-}
-
-fn has_markdown_extension(path: &Path) -> bool {
-    path.extension()
-        .and_then(|e| e.to_str())
-        .map(str::to_ascii_lowercase)
-        .is_some_and(|e| e == "md" || e == "markdown")
+/// 文書がプレビューの対象か。本文を Scintilla で編集している文書すべて（無題、任意の拡張子、
+/// クリップボード由来、メモ、読み取り専用を含む。言語や拡張子は問わず Markdown として変換する）。
+/// 巨大文書（`DocView::External`）は対象外。
+pub(super) fn is_previewable(doc: &OpenDoc) -> bool {
+    matches!(doc.view, DocView::Scintilla(_))
 }
 
 fn rgb(c: ThemeRgb) -> Rgb {
@@ -83,7 +69,8 @@ pub(super) fn palette_for(theme: &Theme) -> PreviewPalette {
     }
 }
 
-const NOT_MARKDOWN: &str = "Markdown の文書（拡張子 .md または .markdown）でだけプレビューできます";
+const NOT_PREVIEWABLE: &str = "巨大ファイルはプレビューできません";
+const NO_DOCUMENT: &str = "プレビューする文書がありません";
 
 impl App {
     /// プレビューの状態（初めてなら作る。ここでは WebView2 に何もしない）。
@@ -104,25 +91,30 @@ impl App {
         })
     }
 
-    /// アクティブな Markdown 文書（なければ理由を状態表示に出して `None`）。
+    /// アクティブなプレビュー対象の文書（なければ理由を状態表示に出して `None`）。
     fn markdown_target(&mut self) -> Option<DocumentId> {
         let doc = self.active.map(|i| &self.docs[i]);
         match doc {
-            Some(d) if is_markdown(d) => Some(d.id()),
-            _ => {
-                self.set_status(NOT_MARKDOWN, MessageKind::Info);
+            Some(d) if is_previewable(d) => Some(d.id()),
+            other => {
+                let msg = if other.is_some() {
+                    NOT_PREVIEWABLE
+                } else {
+                    NO_DOCUMENT
+                };
+                self.set_status(msg, MessageKind::Info);
                 None
             }
         }
     }
 
-    /// 開く対象: アクティブな Markdown 文書。アクティブが Markdown でなくても、もう一方の
+    /// 開く対象: アクティブな文書。アクティブが巨大文書などで対象外でも、もう一方の
     /// 表示（右ペイン／別ウィンドウ）が文書を表示中なら、それを引き継ぐ（切り替えのため）。
     fn preview_open_target(&mut self) -> Option<DocumentId> {
-        let active_md = self
+        let active_doc = self
             .active
             .map(|i| &self.docs[i])
-            .filter(|d| is_markdown(d))
+            .filter(|d| is_previewable(d))
             .map(|d| d.id());
         let showing = self
             .preview
@@ -130,7 +122,14 @@ impl App {
             .filter(|p| p.pane.is_some() || p.window.is_some())
             .and_then(|p| p.target)
             .filter(|&id| self.document(id).is_some());
-        active_md.or(showing).or_else(|| self.markdown_target())
+        active_doc.or(showing).or_else(|| self.markdown_target())
+    }
+
+    /// アクティブな文書をプレビューできるか（メニューの有効・無効）。
+    pub(super) fn preview_available(&self) -> bool {
+        self.active
+            .map(|i| &self.docs[i])
+            .is_some_and(is_previewable)
     }
 
     pub fn preview_pane_open(&self) -> bool {
@@ -353,7 +352,7 @@ impl App {
         }
     }
 
-    /// アクティブな文書が替わった。Markdown ならプレビューを追従させる。
+    /// アクティブな文書が替わった。プレビュー対象の文書なら追従させる（巨大文書では追従せず、直前の表示を保つ）。
     pub(super) fn preview_active_changed(&mut self, id: DocumentId) {
         let following = self
             .preview
@@ -362,7 +361,7 @@ impl App {
         if !following || self.preview.as_ref().and_then(|p| p.target) == Some(id) {
             return;
         }
-        if self.document(id).is_some_and(is_markdown) {
+        if self.document(id).is_some_and(is_previewable) {
             self.preview_retarget(id);
             self.retitle_preview_window(id);
         }

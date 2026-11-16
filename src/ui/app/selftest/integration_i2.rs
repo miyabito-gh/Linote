@@ -492,7 +492,7 @@ fn big_view(ctx: &Ctx) -> Check {
     Ok(())
 }
 
-/// Markdown プレビュー: 初めて使うまで何も作らない。Markdown 以外は案内だけ。WebView2 が
+/// Markdown プレビュー: 初めて使うまで何も作らない。無題・任意の拡張子でも開け、巨大文書だけが対象外。WebView2 が
 /// なければ案内を出し、編集は続けられる（あれば表示できる状態になる）。
 fn preview(ctx: &Ctx) -> Check {
     let md = ctx.dir.join("note.md");
@@ -503,19 +503,76 @@ fn preview(ctx: &Ctx) -> Check {
         "開く前はプレビューがない"
     );
 
-    // Markdown でない文書では開かない。
+    // 無題の文書・Markdown でない拡張子のファイルでも開ける（本文を Markdown として変換する）。
     let txt = new_doc("plain\n")?;
+    check!(
+        step(|app| app.preview_available())?,
+        "無題の文書はプレビューできる"
+    );
     cmd("view.preview_pane", Value::Null)?;
     check!(
-        step(
-            |app| app.status_message().is_some_and(|m| m.contains("Markdown"))
-                && !app.preview_pane_open()
-        )?,
-        "Markdown 以外では案内だけ {:?}",
-        step(|app| app.status_message().map(str::to_owned))?
+        step(move |app| app.preview_pane_open()
+            && app.preview.as_ref().and_then(|p| p.target) == Some(txt))?,
+        "無題の文書で右ペインが開く"
     );
-    check!(step(|app| app.preview.is_none())?, "対象外では何も作らない");
+    cmd("view.preview_pane", Value::Null)?;
+    check!(step(|app| !app.preview_pane_open())?, "閉じる");
     step(move |app| app.close_document(txt, true))?.map_err(super::e2s)?;
+    let plain = ctx.dir.join("plain.txt");
+    std::fs::write(&plain, "# text\n").map_err(|e| e.to_string())?;
+    let plain_id = open_and_wait(&plain)?;
+    cmd("view.preview_window", Value::Null)?;
+    check!(
+        step(move |app| app.preview_window_open()
+            && app.preview.as_ref().and_then(|p| p.target) == Some(plain_id))?,
+        ".txt のファイルで別ウィンドウが開く"
+    );
+    // タブの切り替えに追従する。
+    step(move |app| app.activate(id))?.map_err(super::e2s)?;
+    check!(
+        step(move |app| app.preview.as_ref().and_then(|p| p.target) == Some(id))?,
+        "切り替えに追従する"
+    );
+    // 巨大文書がアクティブでも追従せず、直前の文書を保つ。メニューは無効。
+    step(|app| {
+        app.large_thresholds = LargeModeThresholds {
+            max_bytes: 16,
+            max_lines: 1_000_000,
+            max_line_bytes: 1 << 20,
+        }
+    })?;
+    let big = ctx.dir.join("big-preview.txt");
+    std::fs::write(&big, "line\n".repeat(100)).map_err(|e| e.to_string())?;
+    cmd("file.open", json!({ "path": big.to_string_lossy() }))?;
+    let b = big.clone();
+    wait("巨大文書が開く", move |app| {
+        find_big(app, &b).is_some()
+    })?;
+    let big_id = step(|app| find_big(app, &big).unwrap())?;
+    check!(
+        step(move |app| app.bigviews.contains_key(&big_id) && app.active_id() == Some(big_id))?,
+        "巨大文書がアクティブ"
+    );
+    check!(
+        step(|app| !app.preview_available())?,
+        "巨大文書はプレビュー対象外"
+    );
+    check!(
+        step(move |app| app.preview.as_ref().and_then(|p| p.target) == Some(id))?,
+        "巨大文書では追従しない"
+    );
+    cmd("view.preview_window", Value::Null)?;
+    cmd("view.preview_pane", Value::Null)?;
+    // 別ウィンドウは閉じ、巨大文書では右ペインを新しく開けない（直前の表示を引き継ぐ操作は可）。
+    step(|app| app.large_thresholds = LargeModeThresholds::DEFAULT)?;
+    step(move |app| app.close_document(big_id, true))?.map_err(super::e2s)?;
+    step(move |app| app.close_document(plain_id, true))?.map_err(super::e2s)?;
+    if step(|app| app.preview_pane_open())? {
+        cmd("view.preview_pane", Value::Null)?;
+    }
+    if step(|app| app.preview_window_open())? {
+        cmd("view.preview_window", Value::Null)?;
+    }
 
     step(move |app| app.activate(id))?.map_err(super::e2s)?;
     cmd("view.preview_pane", Value::Null)?;
