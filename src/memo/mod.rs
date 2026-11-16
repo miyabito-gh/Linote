@@ -20,10 +20,12 @@
 //! - 開いているメモのタブは [`crate::document::DocumentKind::Memo`]。自動保存が成功したら
 //!   [`crate::document::DocumentState::record_saved`] を呼ぶ。
 
+mod name;
 mod search;
 mod store;
 mod tab;
 
+pub use name::{derive_name, DEFAULT_NAME, MAX_NAME_CHARS};
 pub use search::{fold_for_search, MemoHit};
 pub use store::{Listing, Memo, MemoStore, SaveOutcome, MAX_BODY_BYTES};
 pub use tab::{Finished, MemoTab};

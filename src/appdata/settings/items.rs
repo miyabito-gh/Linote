@@ -341,6 +341,11 @@ static FILE_ITEMS: &[Item] = &[
         "保存時に最終行の改行を補う",
         save.ensure_final_newline
     ),
+    check_item!(
+        "save.untitled_to_memo",
+        "無題の文書の保存先をメモにする（Ctrl+S でファイルを選ばずメモに保存）",
+        save.untitled_to_memo
+    ),
 ];
 
 static VIEW_ITEMS: &[Item] = &[

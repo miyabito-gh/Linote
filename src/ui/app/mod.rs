@@ -85,7 +85,7 @@ use crate::core::{
     ui_channel, Actor, CancelToken, DocStamp, DocumentId, Error, Result, TargetRef, UiReceiver,
     UiSender, Version,
 };
-use crate::document::{Capabilities, Capability, DocumentState};
+use crate::document::{Capabilities, Capability, DocumentKind, DocumentState};
 use crate::file::FileStamp;
 use crate::memo::MemoTab;
 use crate::platform::hotkey::GlobalHotkey;
@@ -99,6 +99,7 @@ use crate::ui::memo_panel::MemoPanel;
 use crate::ui::menu::{KeyMap, MenuModel};
 use crate::ui::statusbar::{MessageKind, StatusBar, StatusInfo, StatusSegment};
 use crate::ui::tabs::{drag_end, DragEnd, TabBar, TabDrag, TabHit, TabItem, DRAG_THRESHOLD_DIP};
+use crate::ui::tabtip::TabTip;
 use crate::ui::theme::Theme;
 use crate::ui::window::{self, Layout, UiFont, WM_APP_REPAINT, WM_APP_WAKE};
 
@@ -108,6 +109,9 @@ const TIMER_STATUS: usize = 1;
 const STATUS_MESSAGE_MS: u32 = 5000;
 /// 復元データ・メモの書き出しの時刻を見るタイマー（統合 I1 が使う。100 以降）。
 const TIMER_AUTOSAVE: usize = 110;
+/// タブの案内を出すまでの待ち（マウスを置いてから）。
+const TIMER_TAB_TIP: usize = 150;
+const TAB_TIP_DELAY_MS: u32 = 600;
 /// 書き出しの時刻を見る間隔（ミリ秒）。
 const AUTOSAVE_TICK_MS: u32 = 500;
 
@@ -376,6 +380,10 @@ pub struct App {
     startup_notes: Vec<String>,
     /// 押しているタブのドラッグ（U4）。
     tab_drag: Option<TabDrag>,
+    /// タブにマウスを置いたときの案内（吹き出し）。
+    tab_tip: TabTip,
+    /// 案内を出そうとしているタブ（マウスが乗っているタブ）。
+    tip_for: Option<usize>,
     /// 別ウィンドウへの移動で、受け取りを待っているもの（U4）。
     handoffs: Vec<tabops::PendingHandoff>,
     handoff_timer: bool,
@@ -759,6 +767,8 @@ impl App {
             clipboard_counter: 0,
             startup_notes: Vec::new(),
             tab_drag: None,
+            tab_tip: TabTip::new(),
+            tip_for: None,
             handoffs: Vec::new(),
             handoff_timer: false,
             handoff_seq: 0,
@@ -1424,9 +1434,11 @@ impl App {
                 dirty: d.state.is_dirty(),
                 ai_edits: d.state.has_ai_edits(),
                 read_only: !d.state.capabilities().contains(Capability::Edit),
+                memo: matches!(d.state.kind(), DocumentKind::Memo(_)),
             })
             .collect();
         if self.tabs.set_items(items, self.active) {
+            self.reset_tab_tip();
             self.relayout_tabs();
             self.invalidate(self.layout.tabs);
         }
@@ -1606,6 +1618,7 @@ impl App {
             return;
         }
         self.theme = theme;
+        self.reset_tab_tip();
         if let Some(menu) = &self.menu {
             menu.apply_theme(self.hwnd, &self.theme, self.dpi);
         }
@@ -1696,6 +1709,9 @@ impl App {
             }
             WM_ACTIVATE => {
                 let active = (wparam.0 & 0xFFFF) != 0;
+                if !active {
+                    self.reset_tab_tip();
+                }
                 if active {
                     // 設定ファイルが変わっていれば読み直す（ほかのウィンドウや手での編集。V4-1）。
                     self.check_settings_file();
@@ -1708,6 +1724,10 @@ impl App {
                     hook(self, active);
                 }
                 None
+            }
+            WM_TIMER if wparam.0 == TIMER_TAB_TIP => {
+                self.show_tab_tip();
+                Some(LRESULT(0))
             }
             WM_TIMER if wparam.0 == TIMER_STATUS => {
                 // SAFETY: 自分のタイマーを止める。
@@ -1727,6 +1747,7 @@ impl App {
             WM_DPICHANGED => {
                 self.dpi = ((wparam.0 >> 16) & 0xFFFF) as u32;
                 self.font = UiFont::for_dpi(self.dpi);
+                self.reset_tab_tip();
                 if let Some(menu) = &self.menu { menu.apply_theme(self.hwnd, &self.theme, self.dpi); }
                 // SAFETY: lParam は推奨の位置（RECT）を指す。
                 let r = unsafe { *(lparam.0 as *const RECT) };
@@ -1791,6 +1812,7 @@ impl App {
             }
             0x02A3 /* WM_MOUSELEAVE */ => {
                 self.tracking_mouse = false;
+                self.reset_tab_tip();
                 if self.tabs.set_hover(None) {
                     self.invalidate(self.layout.tabs);
                 }
@@ -1898,12 +1920,96 @@ impl App {
             // SAFETY: 構造体は呼び出しの間有効。
             self.tracking_mouse = unsafe { TrackMouseEvent(&mut tme) }.is_ok();
         }
-        if self.tabs.set_hover(self.tabs.hit_test(x, y)) {
+        let hit = self.tabs.hit_test(x, y);
+        if self.tabs.set_hover(hit) {
             self.invalidate(self.layout.tabs);
+        }
+        self.track_tab_tip(hit);
+    }
+
+    /// マウスが乗っているタブが替わったら、案内を隠して、出すまでの待ちを始め直す。
+    fn track_tab_tip(&mut self, hit: Option<TabHit>) {
+        let tab = match hit {
+            Some(TabHit::Tab(i) | TabHit::Close(i)) => Some(i),
+            _ => None,
+        };
+        if tab == self.tip_for {
+            return;
+        }
+        self.reset_tab_tip();
+        self.tip_for = tab;
+        if tab.is_some() {
+            // SAFETY: 自分のウィンドウのタイマー。
+            unsafe {
+                SetTimer(Some(self.hwnd), TIMER_TAB_TIP, TAB_TIP_DELAY_MS, None);
+            }
         }
     }
 
+    /// 案内を隠し、待ちを止める。
+    pub(super) fn reset_tab_tip(&mut self) {
+        self.tip_for = None;
+        self.tab_tip.hide();
+        // SAFETY: 自分のウィンドウのタイマー（なければ何もしない）。
+        unsafe {
+            let _ = KillTimer(Some(self.hwnd), TIMER_TAB_TIP);
+        }
+    }
+
+    /// タブの案内を出す（マウスが同じタブに乗り続けているとき）。
+    fn show_tab_tip(&mut self) {
+        // SAFETY: 自分のウィンドウのタイマー。
+        unsafe {
+            let _ = KillTimer(Some(self.hwnd), TIMER_TAB_TIP);
+        }
+        let Some(i) = self.tip_for else { return };
+        let on_tab = matches!(
+            self.tabs.hover(),
+            Some(TabHit::Tab(h) | TabHit::Close(h)) if h == i
+        );
+        let (Some(rect), Some(text)) = (self.tabs.tab_rect(i), self.tab_hint(i)) else {
+            return;
+        };
+        if !on_tab {
+            return;
+        }
+        let mut tl = windows::Win32::Foundation::POINT {
+            x: rect.left,
+            y: rect.top,
+        };
+        let mut br = windows::Win32::Foundation::POINT {
+            x: rect.right,
+            y: rect.bottom,
+        };
+        // SAFETY: 出力先は POINT 1 つずつ。
+        unsafe {
+            let _ = windows::Win32::Graphics::Gdi::ClientToScreen(self.hwnd, &mut tl);
+            let _ = windows::Win32::Graphics::Gdi::ClientToScreen(self.hwnd, &mut br);
+        }
+        let anchor = RECT {
+            left: tl.x,
+            top: tl.y,
+            right: br.x,
+            bottom: br.y,
+        };
+        self.tab_tip
+            .show(self.hwnd, anchor, &text, &self.theme, &self.font, self.dpi);
+    }
+
+    /// タブの案内の文字: メモ、ファイルのパス、まだ保存していない文書。
+    fn tab_hint(&self, i: usize) -> Option<String> {
+        let d = self.docs.get(i)?;
+        Some(match d.state.kind() {
+            DocumentKind::Memo(_) => "メモ（自動保存）".to_owned(),
+            _ => match d.state.path() {
+                Some(p) => p.display().to_string(),
+                None => "未保存（保存先なし）".to_owned(),
+            },
+        })
+    }
+
     fn on_left_down(&mut self, x: i32, y: i32) {
+        self.reset_tab_tip();
         if self
             .layout
             .splitter

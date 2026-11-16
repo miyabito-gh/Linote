@@ -41,6 +41,7 @@ pub mod print;
 pub mod settings_dialog;
 pub mod statusbar;
 pub mod tabs;
+pub mod tabtip;
 pub mod theme;
 pub mod window;
 

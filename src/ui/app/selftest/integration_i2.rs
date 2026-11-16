@@ -45,6 +45,7 @@ pub(super) fn run(ctx: &Ctx) -> Check {
     big_view(ctx)?;
     preview(ctx)?;
     preview_tab_switch_stress(ctx)?;
+    save_as_memo(ctx)?;
     Ok(())
 }
 
@@ -803,5 +804,144 @@ pub(super) fn preview_tab_switch_stress(ctx: &Ctx) -> Check {
     for id in ids {
         step(move |app| app.close_document(id, true))?.map_err(super::e2s)?;
     }
+    Ok(())
+}
+
+/// 「メモとして保存」: 無題は同じタブがメモになる（名前は最初の一文）、ファイルはメモに複製、
+/// 設定で `Ctrl+S` もメモ、閉じる確認の「メモに保存」。
+pub(super) fn save_as_memo(ctx: &Ctx) -> Check {
+    use crate::core::MemoId;
+    use crate::ui::dialogs::CloseChoice;
+    let store = crate::memo::MemoStore::new(&ctx.paths);
+    let find_by_name = |name: &str| -> Option<MemoId> {
+        let listing = store
+            .list(&crate::core::TaskContext::detached())
+            .ok()?
+            .value;
+        listing
+            .memos
+            .into_iter()
+            .find(|m| m.name == name)
+            .map(|m| m.id)
+    };
+
+    // 1. 無題の文書: 同じタブがメモになる。
+    let id = new_doc("# 買い物リスト\n牛乳と卵。\n")?;
+    cmd("file.save_as_memo", Value::Null)?;
+    check!(
+        step(move |app| matches!(
+            app.document(id).map(|d| d.state.kind().clone()),
+            Some(DocumentKind::Memo(_))
+        ))?,
+        "無題のタブがメモになる"
+    );
+    check!(
+        step(move |app| app.document(id).map(|d| d.title.clone()))? == Some("買い物リスト".into()),
+        "名前は最初の一文（見出しの記号は除く）"
+    );
+    check!(
+        step(move |app| !app.state(id).unwrap().is_dirty())?,
+        "メモにした直後は未保存でない"
+    );
+    check!(
+        step(move |app| app.tabs.items().iter().any(|t| t.id == id && t.memo))?,
+        "メモのタブにしるしが付く"
+    );
+    let mid = find_by_name("買い物リスト").ok_or("メモが保存領域にない")?;
+    check!(
+        store.load(&mid).map_err(|e| e.to_string())?.body == "# 買い物リスト\n牛乳と卵。\n",
+        "本文がそのまま保存される"
+    );
+    // 以降は自動保存。
+    step(move |app| app.with_text(id, |ed| ed.set_text("# 買い物リスト\n追記\n")))?
+        .map_err(super::e2s)?;
+    let s = store.clone();
+    let m2 = mid.clone();
+    wait("メモの自動保存", move |_| {
+        s.load(&m2).is_ok_and(|m| m.body.contains("追記"))
+    })?;
+    step(move |app| app.close_document(id, true))?.map_err(super::e2s)?;
+
+    // 2. 名前を指定する。空の本文は既定の名前。
+    let id = new_doc("")?;
+    cmd("file.save_as_memo", Value::Null)?;
+    check!(
+        step(move |app| app.document(id).map(|d| d.title.clone()))? == Some("無題のメモ".into()),
+        "空の本文は既定の名前"
+    );
+    step(move |app| app.close_document(id, true))?.map_err(super::e2s)?;
+    let id = new_doc("本文")?;
+    cmd("file.save_as_memo", json!({ "name": "指定した名前" }))?;
+    check!(find_by_name("指定した名前").is_some(), "指定した名前で保存");
+    step(move |app| app.close_document(id, true))?.map_err(super::e2s)?;
+
+    // 3. ファイルを開いているタブ: メモに複製し、元のタブは変えない。
+    let path = ctx.dir.join("to-memo.txt");
+    std::fs::write(&path, "ファイルの中身\n").map_err(|e| e.to_string())?;
+    let fid = open_and_wait(&path)?;
+    cmd("file.save_as_memo", Value::Null)?;
+    check!(
+        step(move |app| matches!(
+            app.document(fid).map(|d| d.state.kind().clone()),
+            Some(DocumentKind::File)
+        ))?,
+        "ファイルのタブは変わらない"
+    );
+    let copied = find_by_name("to-memo.txt").ok_or("複製のメモがない")?;
+    check!(
+        store.load(&copied).map_err(|e| e.to_string())?.body == "ファイルの中身\n",
+        "複製の本文"
+    );
+    check!(
+        step(move |app| app.active_id() != Some(fid))?,
+        "複製は新しいタブで開く"
+    );
+    step(move |app| app.close_document(fid, true))?.map_err(super::e2s)?;
+
+    ctx.prompts.shown.borrow_mut().clear();
+    // 4. 設定: 無題の Ctrl+S がメモになる（保存先は尋ねない）。
+    step(|app| app.settings.save.untitled_to_memo = true)?;
+    let id = new_doc("設定でメモ。次の文")?;
+    cmd("file.save", Value::Null)?;
+    check!(
+        step(move |app| matches!(
+            app.document(id).map(|d| d.state.kind().clone()),
+            Some(DocumentKind::Memo(_))
+        ))?,
+        "設定で無題の保存がメモになる"
+    );
+    check!(
+        find_by_name("設定でメモ").is_some(),
+        "最初の一文が名前になる"
+    );
+    check!(
+        !ctx.prompts
+            .shown
+            .borrow()
+            .iter()
+            .any(|s| s.starts_with("save_file")),
+        "保存先を尋ねていない"
+    );
+    // 閉じる確認の「保存する」もメモ。
+    let id2 = new_doc("閉じるときの本文\n")?;
+    ctx.prompts.close.borrow_mut().push_back(CloseChoice::Save);
+    step(move |app| app.close_document(id2, false))?.map_err(super::e2s)?;
+    check!(
+        find_by_name("閉じるときの本文").is_some(),
+        "閉じる確認の保存もメモ"
+    );
+    check!(step(move |app| app.document(id2).is_none())?, "閉じた");
+    step(|app| app.settings.save.untitled_to_memo = false)?;
+    step(move |app| app.close_document(id, true))?.map_err(super::e2s)?;
+
+    // 5. 設定なし: 閉じる確認の「メモに保存」で、保存先を尋ねずに残して閉じる。
+    let id = new_doc("退避する内容\n")?;
+    ctx.prompts
+        .close
+        .borrow_mut()
+        .push_back(CloseChoice::SaveAsMemo);
+    step(move |app| app.close_document(id, false))?.map_err(super::e2s)?;
+    check!(step(move |app| app.document(id).is_none())?, "閉じる");
+    check!(find_by_name("退避する内容").is_some(), "メモに残る");
     Ok(())
 }

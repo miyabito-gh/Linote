@@ -115,6 +115,7 @@ impl App {
 
     /// タブ `index` の右クリックメニューを出し、選ばれたコマンドを実行する。
     pub(super) fn show_tab_menu(&mut self, index: usize) {
+        self.reset_tab_tip();
         let Some(doc) = self.docs.get(index) else {
             return;
         };

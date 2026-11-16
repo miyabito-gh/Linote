@@ -36,6 +36,8 @@ pub fn plan(kind: &DocumentKind, dirty: bool) -> ClosePlan {
 pub enum ChoiceAction {
     /// 保存を始め、成功したら閉じる。
     SaveThenClose,
+    /// メモに保存して閉じる（保存先は選ばない）。
+    SaveAsMemoThenClose,
     /// 保存せずに閉じる（復元データも破棄する）。
     DiscardAndClose,
     /// 閉じない。
@@ -45,6 +47,7 @@ pub enum ChoiceAction {
 pub fn act_on(choice: CloseChoice) -> ChoiceAction {
     match choice {
         CloseChoice::Save => ChoiceAction::SaveThenClose,
+        CloseChoice::SaveAsMemo => ChoiceAction::SaveAsMemoThenClose,
         CloseChoice::Discard => ChoiceAction::DiscardAndClose,
         CloseChoice::Cancel => ChoiceAction::Keep,
     }
@@ -94,6 +97,10 @@ mod tests {
     #[test]
     fn choices_map_to_actions() {
         assert_eq!(act_on(CloseChoice::Save), ChoiceAction::SaveThenClose);
+        assert_eq!(
+            act_on(CloseChoice::SaveAsMemo),
+            ChoiceAction::SaveAsMemoThenClose
+        );
         assert_eq!(act_on(CloseChoice::Discard), ChoiceAction::DiscardAndClose);
         assert_eq!(act_on(CloseChoice::Cancel), ChoiceAction::Keep);
         assert!(needs_save_as(false) && !needs_save_as(true));

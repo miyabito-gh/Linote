@@ -66,6 +66,17 @@ pub const FILE_SAVE_AS: CommandDef = CommandDef::new(
 .requires(Capabilities::of(&[Capability::SaveAs]))
 .default_key("Ctrl+Shift+S");
 
+pub const FILE_SAVE_AS_MEMO: CommandDef = CommandDef::new(
+    CommandId::new("file.save_as_memo"),
+    "メモとして保存",
+    "文書をメモとして保存する。無題の文書は同じタブがメモになり、ファイルはメモに複製する。\
+     name を省くと、無題の文書は本文の最初の一文（40 文字まで）、ファイルはファイル名を名前にする。",
+)
+.target(TargetKind::Document)
+.params(&[ParamDef::optional("name", ParamType::String, "メモの名前")])
+.requires(Capabilities::of(&[Capability::SaveAs]))
+.default_key("Ctrl+Alt+M");
+
 /// 文字コードの指定の値。
 const ENCODINGS: &[&str] = &["utf-8", "utf-8-bom", "utf-16le", "utf-16be", "cp932"];
 
@@ -385,6 +396,12 @@ pub fn register(registry: &mut Registry<App>) -> Result<()> {
             }
             None => app.save_as_flow(id, After::Nothing)?,
         }
+        Ok(Value::Null)
+    })?;
+    registry.register(FILE_SAVE_AS_MEMO, |app, call| {
+        let id = call.document()?;
+        let name = string_arg(call, "name");
+        app.save_as_memo(id, name.as_deref())?;
         Ok(Value::Null)
     })?;
     registry.register(FILE_REOPEN, |app, call| {

@@ -200,6 +200,13 @@ impl App {
                 }
                 continue;
             }
+            if self.docs[i].state.path().is_none() && self.wants_memo_save(id) {
+                match self.save_as_memo(id, None) {
+                    Ok(()) => saved += 1,
+                    Err(e) => self.report_failure("保存できませんでした", &e),
+                }
+                continue;
+            }
             if self.docs[i].state.path().is_none() {
                 let _ = self.activate(id);
                 match self.save_as_flow_asked(id, After::Nothing) {

@@ -230,6 +230,22 @@ impl DocumentState {
         state
     }
 
+    /// 無題・クリップボード由来の文書を、保存したメモ（`id`）のタブに切り替える。`version` は
+    /// メモに書いた時点の本文の版（それまでを保存済みとする）。ファイルなど、ほかの種類の
+    /// 文書では何もせず `false`。
+    pub fn become_memo(&mut self, id: MemoId, version: Version) -> bool {
+        if !matches!(self.kind, DocumentKind::Untitled | DocumentKind::Clipboard) {
+            return false;
+        }
+        debug_assert!(version <= self.version);
+        self.kind = DocumentKind::Memo(id);
+        self.path = None;
+        self.disk = None;
+        self.external_change = false;
+        self.saved_version = Some(version);
+        true
+    }
+
     /// 復元データから開いた文書に使う: 現在の内容はどこにも保存されていない。
     pub fn mark_unsaved(&mut self) {
         self.saved_version = None;

@@ -437,6 +437,8 @@ pub struct SaveSettings {
     pub trim_trailing_whitespace: bool,
     /// 最終行に改行を補う。
     pub ensure_final_newline: bool,
+    /// 無題の文書の保存先をメモにする（`Ctrl+S` でファイルの保存先を尋ねず、メモにする）。
+    pub untitled_to_memo: bool,
 }
 
 impl SaveSettings {
@@ -445,6 +447,7 @@ impl SaveSettings {
         SaveSettings {
             trim_trailing_whitespace: flag("trim_trailing_whitespace"),
             ensure_final_newline: flag("ensure_final_newline"),
+            untitled_to_memo: flag("untitled_to_memo"),
         }
     }
 
@@ -458,6 +461,7 @@ impl SaveSettings {
             "ensure_final_newline".into(),
             self.ensure_final_newline.into(),
         );
+        m.insert("untitled_to_memo".into(), self.untitled_to_memo.into());
         m
     }
 }

@@ -32,6 +32,10 @@ pub struct TabMetrics {
     pub dot: i32,
     /// 選択中のタブの上端の線の太さ。
     pub accent: i32,
+    /// メモのしるし（紙のアイコン）の幅・高さと、題名との間。
+    pub icon_w: i32,
+    pub icon_h: i32,
+    pub icon_gap: i32,
 }
 
 impl TabMetrics {
@@ -44,6 +48,9 @@ impl TabMetrics {
         max_width: 220,
         dot: 8,
         accent: 2,
+        icon_w: 10,
+        icon_h: 13,
+        icon_gap: 5,
     };
 
     pub fn scaled(dpi: u32) -> TabMetrics {
@@ -58,7 +65,21 @@ impl TabMetrics {
             max_width: s(d.max_width),
             dot: s(d.dot),
             accent: s(d.accent).max(1),
+            icon_w: s(d.icon_w),
+            icon_h: s(d.icon_h),
+            icon_gap: s(d.icon_gap),
         }
+    }
+
+    /// メモのしるしが題名の左に取る幅。
+    pub fn memo_extra(&self) -> i32 {
+        self.icon_w + self.icon_gap
+    }
+
+    /// 題名に使える幅 `avail` で、メモのしるしを出してよいか。しるしは補助なので、題名が最低でも
+    /// しるし 2 つ分（全角 1〜2 文字）は残るときだけ出す（タブが縮んだときは題名を優先する）。
+    pub fn memo_icon_fits(&self, avail: i32) -> bool {
+        avail >= self.memo_extra() + 2 * self.icon_w
     }
 
     /// 文字の幅 `text_width` のタブの自然な幅。
@@ -77,6 +98,8 @@ pub struct TabItem {
     pub ai_edits: bool,
     /// 読み取り専用（巨大ファイルなど）。選択中でも題名を控えめな色にする。
     pub read_only: bool,
+    /// メモ（題名の左に紙のしるしを描く）。
+    pub memo: bool,
 }
 
 /// マウスの位置にあるもの。
@@ -215,7 +238,10 @@ impl TabBar {
         let natural: Vec<i32> = self
             .items
             .iter()
-            .map(|t| m.natural_width(measure(&t.title)))
+            .map(|t| {
+                let extra = if t.memo { m.memo_extra() } else { 0 };
+                m.natural_width(measure(&t.title) + extra)
+            })
             .collect();
         // 右に「＋」の場所を空けて並べる。
         self.positions = layout(
@@ -314,6 +340,11 @@ impl TabBar {
             }
         }
         Some(TabHit::Empty)
+    }
+
+    /// マウスの位置にあるもの。
+    pub fn hover(&self) -> Option<TabHit> {
+        self.hover
     }
 
     /// マウスが動いた。描き直しが要れば `true`。
@@ -440,15 +471,21 @@ impl TabBar {
             } else {
                 r.right - m.pad_right
             };
-            let text_rect = RECT {
-                left: text_left,
-                right: text_right.max(text_left),
-                ..r
-            };
             let fg = if active && !item.read_only {
                 ui.tab_active_fg
             } else {
                 ui.tab_fg
+            };
+            // メモは題名の左に紙のしるし（文字と同じ色。テーマに従う）。
+            let mut title_left = text_left;
+            if item.memo && m.memo_icon_fits(text_right - text_left) {
+                draw_memo_icon(&c, text_left, (r.top + r.bottom) / 2, &m, fg);
+                title_left += m.memo_extra();
+            }
+            let text_rect = RECT {
+                left: title_left,
+                right: text_right.max(title_left),
+                ..r
             };
             c.text(&text_rect, &item.title, fg, false);
             if item.ai_edits {
@@ -480,6 +517,43 @@ impl TabBar {
             }
         }
     }
+}
+
+/// メモのしるし: 罫線の入った小さな紙。`x` は左端、`cy` は縦の中心。色は題名と同じ。
+fn draw_memo_icon(
+    c: &crate::ui::window::Canvas,
+    x: i32,
+    cy: i32,
+    m: &TabMetrics,
+    color: crate::ui::theme::Rgb,
+) {
+    let t = c.px(1).max(1);
+    let (w, h) = (m.icon_w, m.icon_h);
+    let top = cy - h / 2;
+    let (right, bottom) = (x + w, top + h);
+    let edge = |l: i32, tp: i32, r: i32, b: i32| {
+        c.fill(
+            &RECT {
+                left: l,
+                top: tp,
+                right: r,
+                bottom: b,
+            },
+            color,
+        );
+    };
+    // 枠。
+    edge(x, top, right, top + t);
+    edge(x, bottom - t, right, bottom);
+    edge(x, top, x + t, bottom);
+    edge(right - t, top, right, bottom);
+    // 罫線 2 本。
+    let inset = t + c.px(2);
+    let (l, r) = (x + inset, right - inset);
+    let y1 = top + h / 3;
+    let y2 = top + h * 2 / 3;
+    edge(l, y1, r, y1 + t);
+    edge(l, y2, r, y2 + t);
 }
 
 // ------------------------------------------------------------------ ドラッグ（U4）
@@ -611,6 +685,7 @@ pub const TAB_MENU: &[Option<(&str, &str)>] = &[
     Some(("file.close_others", "ほかのタブを閉じる")),
     Some(("file.close_right", "右側のタブを閉じる")),
     None,
+    Some(("file.save_as_memo", "メモとして保存")),
     Some(("file.move_to_new_window", "新しいウィンドウに移動")),
     None,
     Some(("file.copy_path", "フルパスをコピー")),
@@ -749,6 +824,7 @@ mod tests {
             dirty: false,
             ai_edits: false,
             read_only: false,
+            memo: false,
         }
     }
 
@@ -887,6 +963,65 @@ mod tests {
     }
 
     #[test]
+    fn memo_tabs_reserve_room_for_the_icon() {
+        let mut bar = TabBar::new();
+        let mut memo = item(2, "bbbbbbbb");
+        memo.memo = true;
+        bar.set_items(vec![item(1, "bbbbbbbb"), memo], Some(0));
+        bar.relayout(
+            RECT {
+                left: 0,
+                top: 0,
+                right: 2000,
+                bottom: 30,
+            },
+            96,
+            &|s| s.chars().count() as i32 * 10,
+        );
+        let plain = bar.tab_rect(0).unwrap();
+        let with_icon = bar.tab_rect(1).unwrap();
+        let m = TabMetrics::scaled(96);
+        assert_eq!(
+            (with_icon.right - with_icon.left) - (plain.right - plain.left),
+            m.memo_extra()
+        );
+    }
+
+    #[test]
+    fn memo_icon_gives_way_to_the_title_in_narrow_tabs() {
+        for dpi in [96, 144, 192] {
+            let m = TabMetrics::scaled(dpi);
+            // 最小幅のタブで題名に使える幅: しるしは出さない（題名を優先）。
+            let at_min = m.min_width - (m.pad_left + m.gap + m.close + m.pad_right);
+            assert!(!m.memo_icon_fits(at_min), "dpi {dpi}");
+            // 自然な幅のタブなら出す。
+            let natural = m.natural_width(100 + m.memo_extra());
+            let avail = natural - (m.pad_left + m.gap + m.close + m.pad_right);
+            assert!(m.memo_icon_fits(avail), "dpi {dpi}");
+        }
+    }
+
+    #[test]
+    fn long_memo_titles_stay_within_the_max_width() {
+        let mut bar = TabBar::new();
+        let mut memo = item(1, "x");
+        memo.memo = true;
+        bar.set_items(vec![memo], Some(0));
+        bar.relayout(
+            RECT {
+                left: 0,
+                top: 0,
+                right: 2000,
+                bottom: 30,
+            },
+            96,
+            &|_| 5000,
+        );
+        let r = bar.tab_rect(0).unwrap();
+        assert_eq!(r.right - r.left, TabMetrics::scaled(96).max_width);
+    }
+
+    #[test]
     fn tab_menu_enablement() {
         assert!(tab_menu_enabled("file.close", 0, 1, false));
         assert!(!tab_menu_enabled("file.close_others", 0, 1, true));
@@ -897,6 +1032,7 @@ mod tests {
         assert!(tab_menu_enabled("file.move_to_new_window", 0, 2, false));
         assert!(!tab_menu_enabled("file.copy_path", 0, 2, false));
         assert!(tab_menu_enabled("file.reveal_in_explorer", 0, 2, true));
-        assert_eq!(TAB_MENU.iter().flatten().count(), 6);
+        assert!(tab_menu_enabled("file.save_as_memo", 0, 1, false));
+        assert_eq!(TAB_MENU.iter().flatten().count(), 7);
     }
 }

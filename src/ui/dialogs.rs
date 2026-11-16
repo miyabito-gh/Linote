@@ -39,6 +39,8 @@ use crate::platform::system::{dpi_for_window, from_wide, os_from_wide, to_wide};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CloseChoice {
     Save,
+    /// メモに保存して閉じる（無題の文書などで、保存先を選ばずに残す）。
+    SaveAsMemo,
     Discard,
     Cancel,
 }
@@ -98,8 +100,9 @@ pub trait Prompts {
         suggested_name: &str,
         initial_dir: Option<&Path>,
     ) -> Option<PathBuf>;
-    /// 未保存の文書を閉じる前の確認（保存／保存しない／取り消し）。
-    fn close_choice(&self, owner: HWND, doc_title: &str) -> CloseChoice;
+    /// 未保存の文書を閉じる前の確認（保存／メモに保存／保存しない／取り消し）。`can_memo` が
+    /// 偽のときは「メモに保存」を出さない。
+    fn close_choice(&self, owner: HWND, doc_title: &str, can_memo: bool) -> CloseChoice;
     /// はい／いいえの確認。
     fn confirm(&self, owner: HWND, caption: &str, text: &str) -> bool;
     /// OK だけの知らせ。
@@ -158,7 +161,7 @@ impl Prompts for ScriptedPrompts {
         self.save.borrow_mut().pop_front().flatten()
     }
 
-    fn close_choice(&self, _: HWND, title: &str) -> CloseChoice {
+    fn close_choice(&self, _: HWND, title: &str, _can_memo: bool) -> CloseChoice {
         self.record("close", title);
         self.close
             .borrow_mut()
@@ -418,22 +421,26 @@ impl Prompts for Win32Prompts {
         Some(PathBuf::from(os_from_wide(&buffer[..end])))
     }
 
-    fn close_choice(&self, owner: HWND, doc_title: &str) -> CloseChoice {
+    fn close_choice(&self, owner: HWND, doc_title: &str, can_memo: bool) -> CloseChoice {
+        const ID_MEMO: i32 = 1001;
+        let mut buttons = vec![(IDYES.0, "保存する")];
+        if can_memo {
+            buttons.push((ID_MEMO, "メモに保存"));
+        }
+        buttons.push((IDNO.0, "保存しない"));
+        buttons.push((IDCANCEL.0, "キャンセル"));
         if let Some(id) = task_dialog(
             owner,
             "Linote",
             &format!("「{doc_title}」への変更を保存しますか？"),
-            "保存しないと、変更は失われます。",
-            &[
-                (IDYES.0, "保存する"),
-                (IDNO.0, "保存しない"),
-                (IDCANCEL.0, "キャンセル"),
-            ],
+            "保存しないと、変更は失われます。「メモに保存」は、保存先を選ばずにメモとして残します。",
+            &buttons,
             IDYES.0,
             true,
         ) {
             return match id {
                 i if i == IDYES.0 => CloseChoice::Save,
+                ID_MEMO => CloseChoice::SaveAsMemo,
                 i if i == IDNO.0 => CloseChoice::Discard,
                 _ => CloseChoice::Cancel,
             };
@@ -987,7 +994,7 @@ mod tests {
         let p = ScriptedPrompts::new();
         let owner = HWND::default();
         assert!(p.open_files(owner, None).is_empty());
-        assert_eq!(p.close_choice(owner, "a"), CloseChoice::Cancel);
+        assert_eq!(p.close_choice(owner, "a", true), CloseChoice::Cancel);
         assert!(!p.confirm(owner, "c", "t"));
         assert_eq!(p.restore_choice(owner, "t"), RestoreChoice::Later);
         p.confirm.borrow_mut().push_back(true);

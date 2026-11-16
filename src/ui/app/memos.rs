@@ -306,6 +306,131 @@ impl App {
         results.iter().all(|&ok| ok)
     }
 
+    /// 文書がまだ名前を持たない（無題・クリップボード由来）か。名前を持たなければ、メモにする
+    /// ときに本文の最初の一文を名前にする。
+    fn is_unnamed(&self, i: usize) -> bool {
+        matches!(
+            self.docs[i].state.kind(),
+            DocumentKind::Untitled | DocumentKind::Clipboard
+        )
+    }
+
+    /// 文書を新しいメモとして残せるか（メモの保存場所があり、メモ以外の編集できる文書）。
+    pub(super) fn can_save_as_memo(&self, id: DocumentId) -> bool {
+        self.memo_store().is_some()
+            && self.document(id).is_some_and(|d| {
+                matches!(d.view, super::DocView::Scintilla(_))
+                    && !matches!(d.state.kind(), DocumentKind::Memo(_))
+            })
+    }
+
+    /// 設定（`save.untitled_to_memo`）に従って、この文書の保存先をメモにするか
+    /// （まだ名前のない文書で、メモを残せるとき）。
+    pub(super) fn wants_memo_save(&self, id: DocumentId) -> bool {
+        self.settings.save.untitled_to_memo
+            && self.can_save_as_memo(id)
+            && self.index_of(id).is_ok_and(|i| self.is_unnamed(i))
+    }
+
+    /// 閉じる前に、内容をメモに残す（タブは変えない。そのまま閉じる）。残せたら `true`。
+    /// 失敗したら理由を出して `false`（閉じない）。
+    pub(super) fn keep_in_memo(&mut self, id: DocumentId) -> bool {
+        match self.create_memo_from(id, None) {
+            Ok(memo) => {
+                self.set_status(
+                    &format!("メモ「{}」として保存しました", memo.name),
+                    MessageKind::Info,
+                );
+                true
+            }
+            Err(e) => {
+                self.report_failure("メモに保存できませんでした", &e);
+                false
+            }
+        }
+    }
+
+    /// 文書の今の本文から、保存領域に新しいメモを作る（タブは変えない）。名前は `name`
+    /// （空なら、名前のない文書は本文の最初の一文、ファイルはそのファイル名）。
+    pub(super) fn create_memo_from(&mut self, id: DocumentId, name: Option<&str>) -> Result<Memo> {
+        self.sync();
+        let i = self.index_of(id)?;
+        if !matches!(self.docs[i].view, super::DocView::Scintilla(_)) {
+            return Err(Error::unsupported(
+                "巨大ファイルは読み取り専用のため、メモにできません",
+            ));
+        }
+        let store = self
+            .memo_store()
+            .ok_or_else(|| Error::unavailable("メモ", "データの保存場所がありません"))?;
+        let (_, text) = self.text_snapshot(id)?;
+        let name = match name.map(str::trim).filter(|n| !n.is_empty()) {
+            Some(n) => n.to_owned(),
+            None if self.is_unnamed(i) => crate::memo::derive_name(&text),
+            None => self.docs[i].title.clone(),
+        };
+        let memo = store.create(&name, &text)?;
+        if let Some(panel) = self.memo_panel {
+            panel.refresh();
+        }
+        Ok(memo)
+    }
+
+    /// 「メモとして保存」（`file.save_as_memo`）。
+    ///
+    /// - 無題・クリップボード由来の文書: 同じタブのままメモに切り替える（本文・Undo・カーソルは
+    ///   そのまま。以降はメモの自動保存）。
+    /// - ファイルを開いている文書: メモに複製して新しいタブで開く（元のタブは変えない）。
+    /// - メモ: 今の内容を保存する。
+    ///
+    /// 保存に失敗したときは何も変えない（タブは未保存のまま）。
+    pub fn save_as_memo(&mut self, id: DocumentId, name: Option<&str>) -> Result<()> {
+        self.sync();
+        let i = self.index_of(id)?;
+        if matches!(self.docs[i].state.kind(), DocumentKind::Memo(_)) {
+            return if self.save_memo_now(id) {
+                Ok(())
+            } else {
+                Err(Error::Busy {
+                    what: "メモの保存".into(),
+                })
+            };
+        }
+        let in_place = self.is_unnamed(i);
+        let version = self.docs[i].state.version();
+        let memo = self.create_memo_from(id, name)?;
+        if in_place {
+            let i = self.index_of(id)?;
+            if !self.docs[i].state.become_memo(memo.id.clone(), version) {
+                return Ok(());
+            }
+            self.docs[i].memo = Some(MemoTab::opened(&memo));
+            // 内容はメモに保存した。無題の復元データはいらない。
+            if let Some(slot) = self.docs[i].slot.take() {
+                super::recover::discard_slot(slot);
+            }
+            self.docs[i].pending = None;
+            self.docs[i].savepoint_valid = true;
+            self.with_text(id, |ed| ed.set_save_point())?;
+            self.set_title(id, memo.name.clone())?;
+            self.sync();
+            self.refresh_tabs();
+            self.refresh_status();
+            self.set_status(
+                &format!("メモ「{}」として保存しました", memo.name),
+                MessageKind::Info,
+            );
+        } else {
+            let name = memo.name.clone();
+            self.open_memo(memo)?;
+            self.set_status(
+                &format!("メモ「{name}」に複製しました（元のファイルは変えていません）"),
+                MessageKind::Info,
+            );
+        }
+        Ok(())
+    }
+
     /// 開いているメモの名前を変える。
     pub fn rename_memo(&mut self, id: DocumentId, name: &str) -> Result<()> {
         let i = self.index_of(id)?;

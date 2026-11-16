@@ -790,6 +790,10 @@ impl App {
                 };
             }
             if closing::needs_save_as(d.state.path().is_some()) {
+                // 設定で無題の保存先がメモなら、保存先を尋ねずにメモにする。
+                if matches!(after, After::Nothing) && self.wants_memo_save(id) {
+                    return self.save_as_memo(id, None);
+                }
                 self.save_as_flow(id, after)
             } else {
                 self.save_document(id, SaveDest::Current, SaveOpts::new(after))
@@ -1065,9 +1069,13 @@ pub(super) fn confirm_close(app: &mut App, id: DocumentId) -> bool {
             let title = d.title.clone();
             let owner = app.hwnd;
             let prompts = app.prompts.clone();
-            match closing::act_on(prompts.close_choice(owner, &title)) {
+            let can_memo = app.can_save_as_memo(id);
+            match closing::act_on(prompts.close_choice(owner, &title, can_memo)) {
                 ChoiceAction::Keep => false,
                 ChoiceAction::DiscardAndClose => true,
+                // 設定で無題の保存先がメモなら、「保存する」もメモに保存する。
+                ChoiceAction::SaveThenClose if app.wants_memo_save(id) => app.keep_in_memo(id),
+                ChoiceAction::SaveAsMemoThenClose => app.keep_in_memo(id),
                 ChoiceAction::SaveThenClose => {
                     app.save_then(id, After::Close);
                     false
@@ -1103,12 +1111,28 @@ pub(super) fn confirm_exit(app: &mut App) -> bool {
         };
         let owner = app.hwnd;
         let prompts = app.prompts.clone();
-        match closing::act_on(prompts.close_choice(owner, &title)) {
+        let can_memo = app.can_save_as_memo(id);
+        match closing::act_on(prompts.close_choice(owner, &title, can_memo)) {
             ChoiceAction::Keep => {
                 app.exit_discard.clear();
                 return false;
             }
             ChoiceAction::DiscardAndClose => {
+                app.exit_discard.insert(id, version);
+            }
+            // メモに残した文書は、終了では「保存しない」と同じく飛ばす（内容はメモにある）。
+            ChoiceAction::SaveAsMemoThenClose => {
+                if !app.keep_in_memo(id) {
+                    app.exit_discard.clear();
+                    return false;
+                }
+                app.exit_discard.insert(id, version);
+            }
+            ChoiceAction::SaveThenClose if app.wants_memo_save(id) => {
+                if !app.keep_in_memo(id) {
+                    app.exit_discard.clear();
+                    return false;
+                }
                 app.exit_discard.insert(id, version);
             }
             ChoiceAction::SaveThenClose => {

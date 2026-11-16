@@ -197,6 +197,7 @@ static MENUS: &[MenuDef] = &[
             Item::Separator,
             Item::Cmd(CommandId::new("file.save")),
             Item::Cmd(CommandId::new("file.save_as")),
+            Item::Cmd(CommandId::new("file.save_as_memo")),
             Item::Cmd(CommandId::new("file.save_all")),
             Item::Separator,
             Item::Cmd(CommandId::new("file.reload")),
