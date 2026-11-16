@@ -51,6 +51,22 @@ pub(super) fn is_previewable(doc: &OpenDoc) -> bool {
     matches!(doc.view, DocView::Scintilla(_))
 }
 
+/// タブの切り替えで追従する文書か（Markdown のファイル）。拡張子 `.md`／`.markdown`。
+/// まだファイルでない文書は言語の指定（Markdown）で判断する。開くときの対象は
+/// [`is_previewable`] で、こちらは開いた後の追従だけに使う。
+pub(super) fn follows_on_switch(doc: &OpenDoc) -> bool {
+    if !is_previewable(doc) {
+        return false;
+    }
+    match doc.state.path() {
+        Some(path) => path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("md") || e.eq_ignore_ascii_case("markdown")),
+        None => doc.language == crate::ui::editor::Language::Markdown,
+    }
+}
+
 fn rgb(c: ThemeRgb) -> Rgb {
     Rgb::new(c.0, c.1, c.2)
 }
@@ -361,7 +377,7 @@ impl App {
         if !following || self.preview.as_ref().and_then(|p| p.target) == Some(id) {
             return;
         }
-        if self.document(id).is_some_and(is_previewable) {
+        if self.document(id).is_some_and(follows_on_switch) {
             self.preview_retarget(id);
             self.retitle_preview_window(id);
         }

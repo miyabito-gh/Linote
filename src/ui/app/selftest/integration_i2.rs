@@ -533,6 +533,12 @@ fn preview(ctx: &Ctx) -> Check {
         step(move |app| app.preview.as_ref().and_then(|p| p.target) == Some(id))?,
         "切り替えに追従する"
     );
+    // Markdown でないファイルに切り替えても追従しない（直前の Markdown の表示を保つ）。
+    step(move |app| app.activate(plain_id))?.map_err(super::e2s)?;
+    check!(
+        step(move |app| app.preview.as_ref().and_then(|p| p.target) == Some(id))?,
+        "Markdown でない文書には追従しない"
+    );
     // 巨大文書がアクティブでも追従せず、直前の文書を保つ。メニューは無効。
     step(|app| {
         app.large_thresholds = LargeModeThresholds {
