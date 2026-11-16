@@ -47,6 +47,8 @@ impl App {
     /// 巨大ファイルを読み取り専用のビューのタブで開く（本文は読み込まない）。
     pub fn open_big(&mut self, path: &Path) -> Result<DocumentId> {
         let path = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+        // 巨大ファイルは元から読み取り専用（起動オプションの `-r` は何もしなくてよい）。
+        self.pending_read_only.remove(&path);
         let file = Arc::new(BigFile::open(&path, BigFileConfig::default())?);
         // 巨大ファイルのビューは UTF-8（ASCII 互換）の本文だけを扱う。
         if !file.looks_like_utf8()? {

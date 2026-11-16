@@ -944,7 +944,9 @@ impl App {
     }
 
     /// `line`・`column`（1 始まり。`column` は文字数）へカーソルを移す。
-    fn jump_to(&mut self, id: DocumentId, line: u64, column: u64) {
+    pub(super) fn jump_to(&mut self, id: DocumentId, line: u64, column: u64) {
+        // 移動先の文書を表示する（隠れた編集欄では、選択とスクロールが残らない）。
+        let _ = self.activate(id);
         if self.bigviews.contains_key(&id) {
             let _ = self.big_goto(id, Some(line.max(1)));
             return;
@@ -965,6 +967,8 @@ impl App {
             let pos = (start + offset.min(bytes.len()) as u64).min(ed.length());
             let pos = if ed.is_char_boundary(pos) { pos } else { start };
             EditTarget::set_selection(ed, Selection::caret_at(pos));
+            // その行が画面の中ほどに見えるようにする。
+            ed.center_line(l);
         });
         if moved.is_ok() {
             self.refresh_status();

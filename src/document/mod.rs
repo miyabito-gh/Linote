@@ -188,6 +188,7 @@ pub struct DocumentState {
     external_change: bool,
     last_actor: Actor,
     ai_edited: bool,
+    read_only: bool,
     /// ファイルの形式。再読み込みや利用者の指定で変わる（本文の版は進めない。
     /// 未保存扱いにしたい場合は呼び出し側が [`record_edit`](Self::record_edit) を呼ぶ）。
     pub format: TextFormat,
@@ -245,6 +246,7 @@ impl DocumentState {
             external_change: false,
             last_actor: Actor::User,
             ai_edited: false,
+            read_only: false,
             format,
         }
     }
@@ -355,12 +357,29 @@ impl DocumentState {
         self.external_change
     }
 
+    /// 読み取り専用で開いた文書か（起動オプション `-r`、V8）。
+    pub fn is_read_only(&self) -> bool {
+        self.read_only
+    }
+
+    /// 読み取り専用にする（編集・Undo・上書き保存ができなくなる。別名での保存はできる）。
+    pub fn set_read_only(&mut self, read_only: bool) {
+        self.read_only = read_only;
+    }
+
     /// 現在使える機能。種類の基本の機能から、状態による制限を引いたもの。
     ///
     /// - 外部変更を検知している間は上書き保存（`Save`）ができない
     ///   （別名での保存はできる）。
+    /// - 読み取り専用の間は、編集・Undo・上書き保存ができない。
     pub fn capabilities(&self) -> Capabilities {
         let mut caps = self.kind.capabilities();
+        if self.read_only {
+            caps = caps
+                .without(Capability::Edit)
+                .without(Capability::Undo)
+                .without(Capability::Save);
+        }
         if self.external_change {
             caps = caps.without(Capability::Save);
         }
@@ -423,6 +442,23 @@ mod tests {
         let memo = DocumentKind::Memo(MemoId::generate()).capabilities();
         assert!(memo.contains_all(Capabilities::of(&[Edit, Undo, AutoSave, SaveAs])));
         assert!(!memo.contains(Save) && !memo.contains(Recover));
+    }
+
+    #[test]
+    fn read_only_removes_edit_undo_and_save_but_keeps_save_as() {
+        use Capability::*;
+        let mut doc =
+            DocumentState::open_file("a.txt".into(), false, TextFormat::DEFAULT, stamp(1));
+        assert!(doc
+            .capabilities()
+            .contains_all(Capabilities::of(&[Edit, Undo, Save])));
+        doc.set_read_only(true);
+        assert!(doc.is_read_only());
+        let caps = doc.capabilities();
+        assert!(!caps.contains(Edit) && !caps.contains(Undo) && !caps.contains(Save));
+        assert!(caps.contains(SaveAs) && caps.contains(Print));
+        doc.set_read_only(false);
+        assert!(doc.capabilities().contains(Edit));
     }
 
     #[test]

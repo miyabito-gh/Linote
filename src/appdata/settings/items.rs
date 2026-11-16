@@ -257,6 +257,11 @@ static GENERAL_ITEMS: &[Item] = &[
         "起動時に前回のタブを開き直す",
         restore_session
     ),
+    check_item!(
+        "open_in_existing_window",
+        "起動したとき、開いている Linote のウィンドウがあればそこで開く",
+        open_in_existing_window
+    ),
 ];
 
 const NEW_FILE_ENCODING_CHOICES: &[Choice] = &[

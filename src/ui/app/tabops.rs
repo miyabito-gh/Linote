@@ -573,7 +573,8 @@ impl App {
 fn spawn_adopter(file: &Path, position: Option<(i32, i32)>) -> Result<std::process::Child> {
     let exe = std::env::current_exe().map_err(|e| Error::io("起動", Path::new("linote"), e))?;
     let mut cmd = std::process::Command::new(&exe);
-    cmd.arg("--adopt").arg(file);
+    // `--adopt` だけでも新しいウィンドウ扱いだが、既存のウィンドウに渡さないことを明示する（V8）。
+    cmd.arg("--new-window").arg("--adopt").arg(file);
     if let Some(p) = position {
         cmd.arg("--pos").arg(handoff::format_position(p));
     }

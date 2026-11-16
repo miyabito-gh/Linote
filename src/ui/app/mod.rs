@@ -33,6 +33,7 @@ mod emptyview;
 mod fileio;
 mod fileops;
 mod highlight;
+pub mod launch;
 mod memos;
 mod preview;
 mod printing;
@@ -68,7 +69,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     LoadCursorW, PostMessageW, PostQuitMessage, SendMessageW, SetCursor, SetTimer, SetWindowPos,
     SetWindowTextW, ShowWindow, TranslateMessage, HMENU, HTCLIENT, IDC_SIZEWE, MSG, SWP_NOACTIVATE,
     SWP_NOZORDER, SW_HIDE, SW_SHOW, SW_SHOWDEFAULT, WM_ACTIVATE, WM_CAPTURECHANGED, WM_CLOSE,
-    WM_COMMAND, WM_DESTROY, WM_DPICHANGED, WM_DROPFILES, WM_ERASEBKGND, WM_HOTKEY,
+    WM_COMMAND, WM_COPYDATA, WM_DESTROY, WM_DPICHANGED, WM_DROPFILES, WM_ERASEBKGND, WM_HOTKEY,
     WM_INITMENUPOPUP, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONUP, WM_MOUSEMOVE,
     WM_NOTIFY, WM_PAINT, WM_RBUTTONUP, WM_SETCURSOR, WM_SETFOCUS, WM_SETTINGCHANGE, WM_SIZE,
     WM_TIMER,
@@ -253,9 +254,14 @@ impl Default for Hooks {
 /// [`run`] の指定。
 #[derive(Default)]
 pub struct RunOptions {
-    /// 起動時に開くファイル。空で、受け渡し（`adopt`）もなければ、前回のタブを開き直す
+    /// 起動時に開くファイル（行・桁・文字コード・読み取り専用の指定つき）。空で、受け渡し
+    /// （`adopt`）も標準入力もなく `no_session` でもなければ、前回のタブを開き直す
     /// （設定 `restore_session`）。それもなければ文書 0 件で起動する。
-    pub files: Vec<PathBuf>,
+    pub files: Vec<crate::cli::FileSpec>,
+    /// 標準入力から読んだ内容（`-`）。無題の文書として開く。
+    pub stdin: Option<Vec<u8>>,
+    /// 前回のタブを開き直さない（`--no-session`）。
+    pub no_session: bool,
     /// 明暗の指定。`None` なら設定ファイルの値（なければ Windows に合わせる）。
     pub theme: Option<ThemeMode>,
     /// データ（設定・メモ・復元データ）の保存場所。`None` なら環境から決める。
@@ -349,6 +355,10 @@ pub struct App {
     worker_search_bytes: usize,
     /// Grep の結果を開いたあとの移動先（開き終えるまで待たせる）。
     pending_jumps: HashMap<PathBuf, (u64, u64)>,
+    /// 起動オプションで読み取り専用を指定して開いている最中のパス（V8）。
+    pending_read_only: HashSet<PathBuf>,
+    /// 起動オプションで文字コードを指定して開いている最中のパス（V8）。
+    pending_encodings: HashMap<PathBuf, (crate::text::Encoding, bool)>,
     /// 巨大ファイルのタブの部品。
     bigviews: HashMap<DocumentId, bigdoc::BigDoc>,
     /// 巨大モードにする条件。
@@ -562,6 +572,8 @@ pub fn start(options: RunOptions) -> Result<()> {
     APP.with(|cell| *cell.borrow_mut() = Some(app));
     let RunOptions {
         files,
+        stdin,
+        no_session,
         setup,
         adopt,
         window_pos,
@@ -583,9 +595,12 @@ pub fn start(options: RunOptions) -> Result<()> {
         }
         // 開くものがなければ、前回のタブを開き直す。それもなければ文書 0 件のまま
         // （無題の文書は作らない。読み込みは非同期なので、`docs` の空きでは判断しない）。
-        let nothing_given = files.is_empty() && adopt.is_none();
-        for path in &files {
-            app.open_path(path);
+        let nothing_given = files.is_empty() && adopt.is_none() && stdin.is_none() && !no_session;
+        for spec in &files {
+            app.open_spec(spec);
+        }
+        if let Some(bytes) = stdin {
+            app.open_stdin(bytes);
         }
         if nothing_given {
             app.begin_session_restore();
@@ -732,6 +747,8 @@ impl App {
             search_cancel: None,
             worker_search_bytes: search::WORKER_SEARCH_BYTES,
             pending_jumps: HashMap::new(),
+            pending_read_only: HashSet::new(),
+            pending_encodings: HashMap::new(),
             bigviews: HashMap::new(),
             large_thresholds: LargeModeThresholds::DEFAULT,
             big_timer: false,
@@ -973,14 +990,19 @@ impl App {
         loader
     }
 
-    /// 新しい空の文書を開き、アクティブにする。
-    pub fn new_untitled(&mut self) -> Result<DocumentId> {
+    /// 次の無題の文書の表題（「無題」「無題 2」…）。
+    pub(crate) fn next_untitled_title(&mut self) -> String {
         self.untitled_counter += 1;
-        let title = if self.untitled_counter == 1 {
+        if self.untitled_counter == 1 {
             "無題".to_owned()
         } else {
             format!("無題 {}", self.untitled_counter)
-        };
+        }
+    }
+
+    /// 新しい空の文書を開き、アクティブにする。
+    pub fn new_untitled(&mut self) -> Result<DocumentId> {
+        let title = self.next_untitled_title();
         let mut state = DocumentState::untitled();
         state.format = self.settings.new_file.format;
         self.open_text(state, "", title, Language::PlainText, true)
@@ -1738,6 +1760,7 @@ impl App {
                 Some(LRESULT(0))
             }
             WM_HOTKEY => self.on_hotkey(wparam),
+            WM_COPYDATA => launch::on_copy_data(self, lparam),
             WM_DROPFILES => {
                 self.on_drop_files(windows::Win32::UI::Shell::HDROP(wparam.0 as *mut _));
                 Some(LRESULT(0))

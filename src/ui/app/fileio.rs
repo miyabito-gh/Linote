@@ -312,6 +312,8 @@ impl App {
         reopen: Option<(DocStamp, Option<Encoding>, bool)>,
         automatic: bool,
     ) -> Result<()> {
+        // 起動オプションの文字コード（`-e`）。開き直しの指定があればそちらを使う。
+        let launch_encoding = self.pending_encodings.remove(path);
         let meta = std::fs::metadata(path).map_err(|e| Error::io("読み込み", path, e))?;
         let thresholds = self.large_thresholds;
         let max = thresholds.max_bytes;
@@ -333,7 +335,10 @@ impl App {
         let loader = self.create_loader(meta.len())?;
         let (reopen_of, encoding, force_bom) = match reopen {
             Some((stamp, encoding, bom)) => (Some(stamp), encoding, bom),
-            None => (None, None, false),
+            None => match launch_encoding {
+                Some((encoding, bom)) => (None, Some(encoding), bom),
+                None => (None, None, false),
+            },
         };
         let request = OpenRequest {
             path: path.to_path_buf(),
@@ -392,6 +397,13 @@ impl App {
             self.finish_automatic_reload(request, result);
             return;
         }
+        // 読み取り専用の指定（`-r`）と、開き直し元が読み取り専用だったこと。失敗しても
+        // 指定は残さない。
+        let read_only = self.pending_read_only.remove(&request.path)
+            || request
+                .reopen_of
+                .and_then(|old| self.state(old.document))
+                .is_some_and(|s| s.is_read_only());
         let (loaded, loader, big) = match result {
             Ok(r) => r,
             Err(e) => {
@@ -435,7 +447,8 @@ impl App {
         }
         let title = file_title(&request.path);
         let language = Language::from_path(&request.path);
-        let state = DocumentState::open_file(request.path.clone(), false, format, loaded.stamp);
+        let mut state = DocumentState::open_file(request.path.clone(), false, format, loaded.stamp);
+        state.set_read_only(read_only);
         let id = match self.add_loaded(state, doc, title, language, true) {
             Ok(id) => id,
             Err(e) => {
@@ -445,7 +458,13 @@ impl App {
         };
         self.add_recent(&request.path);
         if let Some(old) = request.reopen_of {
+            // 古い文書を閉じると、同じパスの待たせた移動（起動オプションの行指定）も消えるので、
+            // 退避して戻す。
+            let jump = self.pending_jumps.remove(&request.path);
             let _ = self.close_document_quietly(old.document);
+            if let Some(jump) = jump {
+                self.pending_jumps.insert(request.path.clone(), jump);
+            }
         }
         let lossy = loaded.is_lossy();
         if let Ok(i) = self.index_of(id) {
@@ -531,6 +550,7 @@ impl App {
         };
         let language = self.docs[i].language;
         let format = loaded.format;
+        let read_only = self.docs[i].state.is_read_only();
         let aux = match self.aux() {
             Ok(aux) => aux,
             Err(e) => {
@@ -542,6 +562,7 @@ impl App {
         aux.set_document(doc);
         aux.finish_loaded_document();
         aux.set_eol(format.eol);
+        aux.set_read_only(read_only);
         aux.set_language(language);
         self.aux_doc = Some(doc);
         // 新しいドキュメントが送った保存位置通知は、まだ一覧に加える前に捨てる。

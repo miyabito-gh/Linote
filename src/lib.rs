@@ -13,6 +13,7 @@
 
 // 共通の取り決め（タスク C0）。
 pub mod appdata;
+pub mod cli;
 pub mod command;
 pub mod core;
 pub mod document;

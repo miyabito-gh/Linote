@@ -527,6 +527,16 @@ impl Editor {
         self.send(SCI_GOTOLINE, line as usize, 0);
     }
 
+    /// 行（0 始まり）が画面の中ほどに見えるようにスクロールする（折り返しも考慮）。
+    pub fn center_line(&self, line: u64) {
+        let line = line.min(self.line_count().saturating_sub(1));
+        self.send(SCI_ENSUREVISIBLE, line as usize, 0);
+        let display = self.send(SCI_VISIBLEFROMDOCLINE, line as usize, 0).max(0);
+        let visible = self.send(SCI_LINESONSCREEN, 0, 0).max(1);
+        let first = (display - visible / 2).max(0);
+        self.send(SCI_SETFIRSTVISIBLELINE, first as usize, 0);
+    }
+
     // ---------------------------------------------------------------- 選択
 
     pub fn selection(&self) -> Selection {

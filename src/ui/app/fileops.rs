@@ -162,6 +162,8 @@ impl App {
     pub(super) fn spawn_new_window(&mut self) -> Result<()> {
         let exe = std::env::current_exe().map_err(|e| Error::io("起動", Path::new("linote"), e))?;
         std::process::Command::new(&exe)
+            // 既存のウィンドウに渡さず、必ず新しいウィンドウで開く（V8）。
+            .arg("--new-window")
             .spawn()
             .map_err(|e| Error::io("新しいウィンドウの起動", &exe, e))?;
         Ok(())

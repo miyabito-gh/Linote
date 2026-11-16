@@ -11,6 +11,7 @@
 //!   "view": { "wrap": "word", "wrap_column": 80, "zoom": 0, "line_numbers": true },
 //!   "print": { "margin_left": 2000, "landscape": false, "color": true },
 //!   "restore_session": true,
+//!   "open_in_existing_window": true,
 //!   "window": { "x": 100, "y": 80, "width": 1100, "height": 720, "maximized": false },
 //!   "mcp": { "enabled": false }
 //! }
@@ -27,6 +28,8 @@
 //! - `print`: 印刷の設定（[`PrintSettings`]。余白は 0.01 mm、用紙の種類と向き、色、行番号、
 //!   ヘッダー、フッター）。値が不正な項目は既定値にして読む。
 //! - `restore_session`: 起動時に前回のタブを開き直す（既定 `true`。記録は `session.json`）。
+//! - `open_in_existing_window`: 起動したとき、既存の Linote のウィンドウがあればそこで開く
+//!   （既定 `true`。`--new-window` で個別に避けられる）。
 //! - `window`: 前回のウィンドウの位置と大きさ（通常状態の矩形と最大化の有無。V1）。値が
 //!   不正なら無視して既定の位置で開く。
 //! - `search_history`: 検索欄・置換欄・Grep の起点欄の履歴（`find`／`replace`／`grep_dir`。
@@ -705,6 +708,7 @@ pub struct SettingsChanges {
     pub view: bool,
     pub print: bool,
     pub restore_session: bool,
+    pub open_in_existing_window: bool,
     pub new_file: bool,
     pub save: bool,
     pub recent_files: bool,
@@ -732,6 +736,7 @@ impl SettingsChanges {
             (self.keys, "キー割り当て"),
             (self.print, "印刷"),
             (self.restore_session, "前回のタブの復元"),
+            (self.open_in_existing_window, "既存のウィンドウで開く"),
             (self.new_file, "新規文書の既定"),
             (self.save, "保存時の整形"),
             (
@@ -769,6 +774,8 @@ pub struct Settings {
     pub print: PrintSettings,
     /// 起動時に前回のタブを開き直す。
     pub restore_session: bool,
+    /// 起動時に、既存のウィンドウがあればそこで開く。
+    pub open_in_existing_window: bool,
     /// 新規文書の既定の形式。
     pub new_file: NewFileSettings,
     /// 保存時の整形。
@@ -794,6 +801,7 @@ impl Default for Settings {
             view: ViewSettings::default(),
             print: PrintSettings::default(),
             restore_session: true,
+            open_in_existing_window: true,
             new_file: NewFileSettings::default(),
             save: SaveSettings::default(),
             window: None,
@@ -915,6 +923,9 @@ impl Settings {
             // 真偽値でなければ既定（有効）のまま。
             settings.restore_session = v.as_bool().unwrap_or(true);
         }
+        if let Some(v) = map.remove("open_in_existing_window") {
+            settings.open_in_existing_window = v.as_bool().unwrap_or(true);
+        }
         if let Some(Value::Object(w)) = map.remove("window") {
             settings.window = WindowSettings::from_value(&w);
         }
@@ -986,6 +997,10 @@ impl Settings {
         map.insert("view".into(), Value::Object(view));
         map.insert("print".into(), Value::Object(self.print.to_value()));
         map.insert("restore_session".into(), self.restore_session.into());
+        map.insert(
+            "open_in_existing_window".into(),
+            self.open_in_existing_window.into(),
+        );
         map.insert("new_file".into(), Value::Object(self.new_file.to_value()));
         map.insert("save".into(), Value::Object(self.save.to_value()));
         match self.window {
@@ -1014,6 +1029,7 @@ impl Settings {
             view: self.view != other.view,
             print: self.print != other.print,
             restore_session: self.restore_session != other.restore_session,
+            open_in_existing_window: self.open_in_existing_window != other.open_in_existing_window,
             new_file: self.new_file != other.new_file,
             save: self.save != other.save,
             recent_files: self.recent_files != other.recent_files,
@@ -1097,6 +1113,21 @@ mod tests {
         let value: Value = serde_json::from_str(&text).unwrap();
         assert_eq!(value["version"], 1);
         assert_eq!(value["mcp"]["enabled"], true);
+    }
+
+    #[test]
+    fn open_in_existing_window_defaults_to_true_and_round_trips() {
+        let mut s = Settings::default();
+        assert!(s.open_in_existing_window);
+        s.open_in_existing_window = false;
+        let back = Settings::from_json(&s.to_json()).unwrap();
+        assert!(!back.open_in_existing_window);
+        assert!(
+            Settings::from_json(r#"{"open_in_existing_window":"x"}"#)
+                .unwrap()
+                .open_in_existing_window
+        );
+        assert!(Settings::default().diff(&s).open_in_existing_window);
     }
 
     #[test]
