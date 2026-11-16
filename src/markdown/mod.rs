@@ -41,6 +41,15 @@ pub use style::{
 };
 pub use url::{classify_link, LinkPolicy};
 
+/// 変換できなかったときなどに、本文の代わりに出す 1 段落（`<body>` の中身）。`message` は
+/// 文字として出す（エスケープする）。
+pub fn notice_body(message: &str) -> String {
+    let mut out = String::from("<p>");
+    render::escape_attr(&mut out, message);
+    out.push_str("</p>\n");
+    out
+}
+
 use crate::core::{CancelToken, Limits, Result};
 
 /// Markdown を、表示用の完全な HTML 文書に変換する（同期。短い文書やテスト向け）。
@@ -58,6 +67,12 @@ pub fn render_document(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn notice_body_escapes_the_message() {
+        let b = notice_body("a <b>&\"x\"");
+        assert_eq!(b, "<p>a &lt;b&gt;&amp;&quot;x&quot;</p>\n");
+    }
 
     #[test]
     fn full_document_is_safe() {

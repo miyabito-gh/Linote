@@ -38,14 +38,18 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use super::host::PreviewHost;
 use super::policy::{
-    decide_navigation, fits_navigate_to_string, guidance_text, oversize_notice_html,
-    parse_scroll_result, scroll_restore_script, NavDecision, ScrollPos, SCROLL_CAPTURE_SCRIPT,
+    decide_navigation, fits_navigate_to_string, guidance_text, navigation_failed_notice_html,
+    oversize_notice_html, parse_scroll_result, scroll_restore_script, NavDecision, ScrollPos,
+    SCROLL_CAPTURE_SCRIPT,
 };
 use crate::core::{DocumentId, Error, Result};
 use crate::markdown::{PreviewPalette, Rgb};
 use crate::platform::system::to_wide;
 
 const CLASS: PCWSTR = w!("LinotePreviewPane");
+
+/// スクロール位置の読み取りの完了をこれ以上待たない（次の表示の更新で読み取りを捨てる）。
+const CAPTURE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// ペインの状態。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -81,6 +85,12 @@ struct PaneInner {
     navigating: Cell<bool>,
     /// スクロール位置を読んでいる最中（`ExecuteScript` の完了待ち）。その文書の ID。
     capturing: Cell<Option<DocumentId>>,
+    /// 読み取りを始めた時刻（応答がないまま居座らないよう、長すぎれば待つのをやめる）。
+    capture_started: Cell<Option<std::time::Instant>>,
+    /// 読み取りの世代。待つのをやめた読み取りの完了が、あとで届いても使わない。
+    capture_gen: Cell<u64>,
+    /// 読み込みの失敗を知らせる案内を出している最中（失敗が続いても繰り返さない）。
+    failure_notice: Cell<bool>,
     /// 次の読み込みが終わったら戻すスクロール位置。
     restore: Cell<Option<ScrollPos>>,
     palette: RefCell<PreviewPalette>,
@@ -118,6 +128,9 @@ impl PreviewPane {
             loading: Cell::new(None),
             navigating: Cell::new(false),
             capturing: Cell::new(None),
+            capture_started: Cell::new(None),
+            capture_gen: Cell::new(0),
+            failure_notice: Cell::new(false),
             restore: Cell::new(None),
             palette: RefCell::new(palette.clone()),
             on_status: RefCell::new(None),
@@ -307,9 +320,24 @@ impl PaneInner {
 
     /// 渡された文書を表示する。同じ文書の更新なら、先にスクロール位置を読んでから。
     fn navigate(this: &Rc<PaneInner>) {
-        if *this.status.borrow() != PaneStatus::Ready || this.capturing.get().is_some() {
-            // 位置の読み取り中なら、その完了で最新の文書を表示する。
+        if *this.status.borrow() != PaneStatus::Ready {
             return;
+        }
+        if let Some(captured) = this.capturing.get() {
+            // 位置の読み取り中。同じ文書の更新なら、その完了で最新の文書を表示する。
+            // 別の文書に替わった・応答が長く返らないときは待たない（待つと、読み取りの完了が
+            // 届かない限り表示が替わらず、空白のまま固まって見える）。
+            let other_document = this.document_key.get() != Some(captured);
+            let stalled = this
+                .capture_started
+                .get()
+                .is_some_and(|t| t.elapsed() > CAPTURE_TIMEOUT);
+            if !other_document && !stalled {
+                return;
+            }
+            this.capture_gen.set(this.capture_gen.get().wrapping_add(1));
+            this.capturing.set(None);
+            this.restore.set(None);
         }
         let Some(doc) = this.document.borrow().clone() else {
             return;
@@ -339,10 +367,15 @@ impl PaneInner {
         let Some(wv) = webview else { return false };
         let Some(key) = key else { return false };
         let weak = Rc::downgrade(this);
+        let generation = this.capture_gen.get();
         let handler = ExecuteScriptCompletedHandler::create(Box::new(move |hr, json| {
             let Some(inner) = weak.upgrade() else {
                 return Ok(());
             };
+            if inner.capture_gen.get() != generation {
+                // 待つのをやめた読み取り。いまの状態には触れない。
+                return Ok(());
+            }
             inner.capturing.set(None);
             if inner.destroyed.get() {
                 return Ok(());
@@ -356,6 +389,7 @@ impl PaneInner {
         }));
         let script = to_wide(SCROLL_CAPTURE_SCRIPT);
         this.capturing.set(Some(key));
+        this.capture_started.set(Some(std::time::Instant::now()));
         // SAFETY: 有効な WebView。文字列は NUL 終端で呼び出しの間有効。
         let r = unsafe { wv.ExecuteScript(PCWSTR(script.as_ptr()), &handler) };
         if r.is_err() {
@@ -369,6 +403,7 @@ impl PaneInner {
         let Some(doc) = self.document.borrow().clone() else {
             return;
         };
+        self.failure_notice.set(false);
         let webview = self.webview.borrow().clone();
         let Some(wv) = webview else { return };
         let html: std::borrow::Cow<str> = if fits_navigate_to_string(&doc) {
@@ -393,12 +428,22 @@ impl PaneInner {
     }
 
     /// 読み込みが終わった（`NavigationCompleted`）。こちらの読み込みなら位置を戻す。
-    fn on_navigation_completed(&self, navigation_id: u64) {
+    fn on_navigation_completed(&self, navigation_id: u64, success: bool) {
         if self.loading.get() != Some(navigation_id) {
             return;
         }
         self.loading.set(None);
         self.navigating.set(false);
+        if !success {
+            // 表示できなかった（大きすぎる URL など）。空白のままにせず、案内を出す。
+            // 案内の読み込みまで失敗しても繰り返さない。
+            self.restore.set(None);
+            if !self.failure_notice.replace(true) {
+                self.show_failure_notice();
+            }
+            return;
+        }
+        self.failure_notice.set(false);
         let Some(script) = self.restore.take().and_then(scroll_restore_script) else {
             return;
         };
@@ -409,6 +454,25 @@ impl PaneInner {
         // SAFETY: 有効な WebView。文字列は NUL 終端で呼び出しの間有効。
         unsafe {
             let _ = wv.ExecuteScript(PCWSTR(script.as_ptr()), &handler);
+        }
+    }
+}
+
+impl PaneInner {
+    /// 読み込みに失敗した文書の代わりに、案内を表示する。
+    fn show_failure_notice(&self) {
+        let webview = self.webview.borrow().clone();
+        let Some(wv) = webview else { return };
+        let html = navigation_failed_notice_html(&self.palette.borrow());
+        let wide = to_wide(&html);
+        self.ours.set(true);
+        self.loading.set(None);
+        // SAFETY: 有効な WebView。文字列は NUL 終端で呼び出しの間有効。
+        let r = unsafe { wv.NavigateToString(PCWSTR(wide.as_ptr())) };
+        if r.is_err() {
+            self.ours.set(false);
+        } else {
+            self.navigating.set(true);
         }
     }
 }
@@ -524,7 +588,10 @@ fn configure(
             };
             let mut id = 0u64;
             if args.NavigationId(&mut id).is_ok() {
-                inner.on_navigation_completed(id);
+                let mut ok = BOOL(0);
+                // 取れなければ成功として扱う（位置を戻す従来の動き）。
+                let success = args.IsSuccess(&mut ok).map_or(true, |()| ok.as_bool());
+                inner.on_navigation_completed(id, success);
             }
             Ok(())
         }));

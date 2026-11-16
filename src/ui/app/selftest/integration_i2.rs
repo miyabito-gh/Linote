@@ -44,6 +44,7 @@ pub(super) fn run(ctx: &Ctx) -> Check {
     grep_and_open_hit(ctx)?;
     big_view(ctx)?;
     preview(ctx)?;
+    preview_tab_switch_stress(ctx)?;
     Ok(())
 }
 
@@ -533,13 +534,16 @@ fn preview(ctx: &Ctx) -> Check {
         step(move |app| app.preview.as_ref().and_then(|p| p.target) == Some(id))?,
         "切り替えに追従する"
     );
-    // Markdown でないファイルに切り替えても追従しない（直前の Markdown の表示を保つ）。
+    // Markdown でないファイルに切り替えたら、プレビュー（右ペインも別ウィンドウも）を閉じる。
     step(move |app| app.activate(plain_id))?.map_err(super::e2s)?;
     check!(
-        step(move |app| app.preview.as_ref().and_then(|p| p.target) == Some(id))?,
-        "Markdown でない文書には追従しない"
+        step(|app| !app.preview_window_open()
+            && !app.preview_pane_open()
+            && app.right.is_none()
+            && app.preview.as_ref().and_then(|p| p.target).is_none())?,
+        "Markdown でない文書に替えるとプレビューが閉じる"
     );
-    // 巨大文書がアクティブでも追従せず、直前の文書を保つ。メニューは無効。
+    // 巨大文書: プレビュー対象外。Markdown で開いたプレビューは、巨大文書に替えると閉じる。
     step(|app| {
         app.large_thresholds = LargeModeThresholds {
             max_bytes: 16,
@@ -563,19 +567,37 @@ fn preview(ctx: &Ctx) -> Check {
         step(|app| !app.preview_available())?,
         "巨大文書はプレビュー対象外"
     );
-    check!(
-        step(move |app| app.preview.as_ref().and_then(|p| p.target) == Some(id))?,
-        "巨大文書では追従しない"
-    );
-    cmd("view.preview_window", Value::Null)?;
+    step(move |app| app.activate(id))?.map_err(super::e2s)?;
     cmd("view.preview_pane", Value::Null)?;
-    // 別ウィンドウは閉じ、巨大文書では右ペインを新しく開けない（直前の表示を引き継ぐ操作は可）。
+    check!(step(|app| app.preview_pane_open())?, "右ペインが開く");
+    step(move |app| app.activate(big_id))?.map_err(super::e2s)?;
+    check!(
+        step(|app| !app.preview_pane_open() && app.right.is_none())?,
+        "巨大文書に替えると右ペインが閉じる"
+    );
+    // 巨大文書では新しく開けない。
+    step(|app| app.toggle_preview_pane())?.map_err(super::e2s)?;
+    check!(
+        step(|app| !app.preview_pane_open())?,
+        "巨大文書では開かない"
+    );
     step(|app| app.large_thresholds = LargeModeThresholds::DEFAULT)?;
+    // 対象の文書を閉じたらプレビューも閉じる。
+    step(move |app| app.activate(plain_id))?.map_err(super::e2s)?;
+    cmd("view.preview_window", Value::Null)?;
+    check!(step(|app| app.preview_window_open())?, "別ウィンドウが開く");
     step(move |app| app.close_document(big_id, true))?.map_err(super::e2s)?;
     step(move |app| app.close_document(plain_id, true))?.map_err(super::e2s)?;
-    if step(|app| app.preview_pane_open())? {
-        cmd("view.preview_pane", Value::Null)?;
-    }
+    // 隣が Markdown なら追従して残り、そうでなければ閉じる。閉じた文書は表示しない。
+    check!(
+        step(move |app| {
+            let t = app.preview.as_ref().and_then(|p| p.target);
+            t != Some(plain_id)
+                && (app.preview_window_open() == t.is_some())
+                && (t.is_none() || t.is_some_and(|d| app.document(d).is_some()))
+        })?,
+        "対象の文書を閉じても、閉じた文書の表示は残らない"
+    );
     if step(|app| app.preview_window_open())? {
         cmd("view.preview_window", Value::Null)?;
     }
@@ -628,5 +650,158 @@ fn preview(ctx: &Ctx) -> Check {
         "別ウィンドウが閉じる"
     );
     step(move |app| app.close_document(id, true))?.map_err(super::e2s)?;
+    Ok(())
+}
+
+/// プレビューを出したまま、種類の違う文書（Markdown・小さい文字列・大きい文字列・上限超え・
+/// 病的な入れ子）の間でタブを切り替え続けても、画面が固まらず、表示が対象に追いつく。
+pub(super) fn preview_tab_switch_stress(ctx: &Ctx) -> Check {
+    let write = |name: &str, body: String| -> Result<std::path::PathBuf, String> {
+        let p = ctx.dir.join(name);
+        std::fs::write(&p, body).map_err(|e| e.to_string())?;
+        Ok(p)
+    };
+    let md = write("s-note.md", "# 見出し\n\n本文\n".repeat(50))?;
+    let small = write("s-small.txt", "plain text\nline2\n".to_owned())?;
+    let log = write(
+        "s-log.log",
+        (0..40_000)
+            .map(|i| {
+                format!(
+                    "2026-11-16 12:00:{:02} INFO line {i} <b>&amp;</b>\n",
+                    i % 60
+                )
+            })
+            .collect::<String>(),
+    )?;
+    let long_line = write("s-oneline.txt", "x".repeat(1_500_000))?;
+    let nested = write("s-nested.txt", format!("{}a\n", "> ".repeat(20_000)))?;
+    let list = write("s-list.txt", "- a\n".repeat(200_000))?;
+    let files = [md, small, log, long_line, nested, list];
+    let mut ids = Vec::new();
+    for f in &files {
+        ids.push(open_and_wait(f)?);
+    }
+    // メモ（小さい・上限付近・上限超え）も同じ切り替えの対象にする。
+    let store = crate::memo::MemoStore::new(&ctx.paths);
+    for (name, body) in [
+        ("stress small", "メモ本文\n".repeat(10)),
+        ("stress mid", "- a\n".repeat(120_000)),
+        ("stress big", "- a\n".repeat(200_000)),
+    ] {
+        let memo = store.create(name, &body).map_err(|e| e.to_string())?;
+        ids.push(step(|app| app.open_memo(memo.clone()))?.map_err(super::e2s)?);
+    }
+    // 保存していない無題の文書（小さい・上限超え）も対象にする。
+    for body in ["無題の本文\n".repeat(5), "- a\n".repeat(200_000)] {
+        let id = step(|app| app.new_untitled())?.map_err(super::e2s)?;
+        step(move |app| app.with_text(id, |ed| ed.set_text(&body)))?.map_err(super::e2s)?;
+        ids.push(id);
+    }
+    // 最初は .txt（Markdown でない）でプレビューを開く。
+    let first = ids[1];
+    step(move |app| app.activate(first))?.map_err(super::e2s)?;
+    cmd("view.preview_pane", Value::Null)?;
+    wait("プレビューの初期化の結果", |app| {
+        app.preview
+            .as_ref()
+            .and_then(|p| p.pane.as_ref())
+            .is_some_and(|p| p.status() != PaneStatus::Initializing)
+    })?;
+    let unavailable = step(|app| {
+        matches!(
+            app.preview
+                .as_ref()
+                .and_then(|p| p.pane.as_ref())
+                .map(|p| p.status()),
+            Some(PaneStatus::Unavailable(_))
+        )
+    })?;
+    if unavailable {
+        return Ok(());
+    }
+    let md_id = ids[0];
+    let shown_wait = |what: String, id: DocumentId| {
+        wait(&what, move |app| {
+            app.preview.as_ref().is_some_and(|p| {
+                !p.scheduler.is_running() && p.scheduler.shown().is_some_and(|s| s.document == id)
+            }) || app
+                .status_message()
+                .is_some_and(|m| m.contains("プレビューを作れませんでした"))
+        })
+    };
+    for round in 0..3 {
+        for (n, &heavy) in ids.iter().enumerate().skip(1) {
+            // 重い文書で開く（直前に閉じているので、開く操作の対象はアクティブな文書）。
+            step(move |app| app.activate(heavy))?.map_err(super::e2s)?;
+            if !step(|app| app.preview_pane_open())? {
+                cmd("view.preview_pane", Value::Null)?;
+            }
+            shown_wait(format!("{round} 周目 {n}: 開いた文書のプレビュー"), heavy)?;
+            // Markdown へ切り替える（追従する）。
+            step(move |app| app.activate(md_id))?.map_err(super::e2s)?;
+            shown_wait(format!("{round} 周目 {n}: 切り替え先のプレビュー"), md_id)?;
+            // 軽い応答の確認。
+            check!(step(|app| app.preview_pane_open())?, "右ペインが開いている");
+            // もう一度重い文書へ（追従しないのでプレビューが閉じる）。
+            step(move |app| app.activate(heavy))?.map_err(super::e2s)?;
+            let follows = step(move |app| {
+                app.document(heavy)
+                    .is_some_and(crate::ui::app::preview::follows_on_switch)
+            })?;
+            check!(
+                step(|app| app.preview_pane_open())? == follows,
+                "追従しない文書に替えると右ペインが閉じる（追従する文書なら開いたまま）"
+            );
+        }
+    }
+    if step(|app| app.preview_pane_open())? {
+        cmd("view.preview_pane", Value::Null)?;
+    }
+    // 別ウィンドウ: 開く → 文書を替える → 閉じるボタンで戻る／右ペインに替える。
+    for round in 0..2 {
+        for (n, &doc) in ids.iter().enumerate() {
+            step(move |app| app.activate(doc))?.map_err(super::e2s)?;
+            cmd("view.preview_window", Value::Null)?;
+            check!(step(|app| app.preview_window_open())?, "別ウィンドウが開く");
+            shown_wait(format!("窓 {round} 周目 {n}: 開いた文書"), doc)?;
+            step(move |app| app.activate(md_id))?.map_err(super::e2s)?;
+            if n % 2 == 0 {
+                // 表示の更新が終わる前に閉じるボタン（WM_CLOSE）で閉じる。
+                let hwnd = step(|app| {
+                    app.preview
+                        .as_ref()
+                        .and_then(|p| p.window.as_ref())
+                        .map(|w| w.hwnd().0 as isize)
+                })?
+                .ok_or("別ウィンドウがない")?;
+                // SAFETY: UI スレッドで、自分のウィンドウへ WM_CLOSE を送る。
+                unsafe {
+                    windows::Win32::UI::WindowsAndMessaging::SendMessageW(
+                        windows::Win32::Foundation::HWND(hwnd as *mut _),
+                        windows::Win32::UI::WindowsAndMessaging::WM_CLOSE,
+                        None,
+                        None,
+                    );
+                }
+                wait(
+                    "閉じるボタンで別ウィンドウが閉じる",
+                    |app| !app.preview_window_open(),
+                )?;
+            } else {
+                // 別ウィンドウから右ペインへ。
+                cmd("view.preview_pane", Value::Null)?;
+                check!(
+                    step(|app| app.preview_pane_open() && !app.preview_window_open())?,
+                    "右ペインに替わる"
+                );
+                shown_wait(format!("窓→ペイン {round} 周目 {n}"), md_id)?;
+                cmd("view.preview_pane", Value::Null)?;
+            }
+        }
+    }
+    for id in ids {
+        step(move |app| app.close_document(id, true))?.map_err(super::e2s)?;
+    }
     Ok(())
 }

@@ -1142,6 +1142,9 @@ impl App {
         self.refresh_tabs();
         self.refresh_status();
         self.update_window_title();
+        if new_path.is_some() {
+            self.preview_title_changed(id);
+        }
         Ok(())
     }
 
@@ -1380,6 +1383,7 @@ impl App {
         self.docs[i].title = title;
         self.refresh_tabs();
         self.update_window_title();
+        self.preview_title_changed(id);
         Ok(())
     }
 

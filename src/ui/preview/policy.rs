@@ -71,8 +71,13 @@ fn is_fragment_of_current(uri: &str, current_source: &str) -> bool {
     }
 }
 
-/// `NavigateToString` に渡せる大きさか（WebView2 の上限は 2 MB。余裕を見る）。
-pub const MAX_NAVIGATE_BYTES: usize = 1_800_000;
+/// `NavigateToString` に渡せる大きさ（UTF-8 のバイト数）。
+///
+/// WebView2 は文字列を `data:text/html;charset=utf-8;base64,…` の URL にして読み込み、その長さの
+/// 上限は 2 MiB（2 097 152 文字）。base64 は 4/3 倍になるので、本文は約 1.57 MB（1 572 837 バイト）
+/// までしか表示できない。これを超えると、エラーも案内も出ないまま空白（背景色だけ）になる。
+/// 実機では 1.49 MB は表示でき、1.6 MB は空白だった。余裕を見て 1.5 MB（1 500 000 バイト）にする。
+pub const MAX_NAVIGATE_BYTES: usize = 1_500_000;
 
 pub fn fits_navigate_to_string(html: &str) -> bool {
     html.len() <= MAX_NAVIGATE_BYTES
@@ -88,6 +93,18 @@ pub fn oversize_notice_html(palette: &PreviewPalette, bytes: usize) -> String {
         bg = palette.background.to_css(),
         fg = palette.foreground.to_css(),
         mb = bytes as f64 / 1_000_000.0,
+    )
+}
+
+/// 読み込みが失敗したとき（`NavigationCompleted` が失敗）に出す文書。空白のまま放置しない。
+pub fn navigation_failed_notice_html(palette: &PreviewPalette) -> String {
+    format!(
+        "<!doctype html><html><head><meta charset=\"utf-8\">\
+<meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; style-src 'unsafe-inline'\">\
+<style>body{{font-family:'Segoe UI','Yu Gothic UI',sans-serif;margin:24px;background:{bg};color:{fg}}}</style>\
+</head><body><p>プレビューを表示できませんでした。編集は続けられます。</p></body></html>",
+        bg = palette.background.to_css(),
+        fg = palette.foreground.to_css(),
     )
 }
 
@@ -223,6 +240,10 @@ mod tests {
 
     #[test]
     fn size_limit() {
+        // base64 の data: URL が 2 MiB に収まること（これを超えると空白になる）。
+        let url_chars =
+            "data:text/html;charset=utf-8;base64,".len() + MAX_NAVIGATE_BYTES.div_ceil(3) * 4;
+        assert!(url_chars < 2 * 1024 * 1024, "{url_chars}");
         assert!(fits_navigate_to_string("abc"));
         assert!(!fits_navigate_to_string(
             &"a".repeat(MAX_NAVIGATE_BYTES + 1)
@@ -230,6 +251,9 @@ mod tests {
         let n = oversize_notice_html(&PreviewPalette::dark(), 3_500_000);
         assert!(n.contains("3.5 MB"));
         assert!(n.contains("default-src 'none'"));
+        let f = navigation_failed_notice_html(&PreviewPalette::dark());
+        assert!(f.contains("表示できませんでした"));
+        assert!(f.contains("default-src 'none'"));
     }
 
     #[test]

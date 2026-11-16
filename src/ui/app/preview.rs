@@ -18,8 +18,8 @@ use windows::Win32::UI::WindowsAndMessaging::{KillTimer, SetTimer};
 
 use crate::core::{DocStamp, DocumentId, Limits, Result, WorkerPool};
 use crate::markdown::{
-    compose_document, spawn_render, PreviewPalette, PreviewScheduler, PreviewUpdate, Rgb,
-    Stylesheet, DEFAULT_MAX_INPUT_BYTES,
+    compose_document, notice_body, spawn_render, PreviewPalette, PreviewScheduler, PreviewUpdate,
+    Rgb, Stylesheet, DEFAULT_MAX_INPUT_BYTES,
 };
 use crate::ui::preview::{PaneStatus, PreviewHost, PreviewPane, PreviewWindow};
 use crate::ui::statusbar::MessageKind;
@@ -380,7 +380,39 @@ impl App {
         if self.document(id).is_some_and(follows_on_switch) {
             self.preview_retarget(id);
             self.retitle_preview_window(id);
+        } else {
+            // 追従しない文書（Markdown のファイル以外、巨大文書など）に替わったら、
+            // 右ペインも別ウィンドウも閉じる（前の文書の表示を残さない）。
+            self.close_preview_all(true);
         }
+    }
+
+    /// 右ペインと別ウィンドウをどちらも閉じる。`focus` なら編集欄にフォーカスを戻す。
+    fn close_preview_all(&mut self, focus: bool) {
+        if let Some(p) = self.preview.as_mut() {
+            if let Some(pane) = p.pane.take() {
+                pane.destroy();
+                self.set_right_pane(None);
+            }
+        }
+        if let Some(p) = self.preview.as_mut() {
+            if let Some(w) = p.window.take() {
+                w.destroy();
+            }
+        }
+        self.preview_stop_if_idle();
+        if focus {
+            self.focus_active();
+        }
+    }
+
+    /// 文書の表題が替わった（名前を付けて保存、メモの名前の変更）。対象なら表示に反映する。
+    pub(super) fn preview_title_changed(&mut self, id: DocumentId) {
+        if self.preview.as_ref().and_then(|p| p.target) != Some(id) {
+            return;
+        }
+        self.retitle_preview_window(id);
+        self.show_preview_body(id);
     }
 
     fn retitle_preview_window(&mut self, id: DocumentId) {
@@ -428,6 +460,8 @@ impl App {
                 p.target = None;
                 p.body = None;
             }
+            // 対象の文書がなくなったので、プレビューも閉じる。
+            self.close_preview_all(false);
         }
     }
 
@@ -503,10 +537,14 @@ impl App {
                 p.body = Some(body);
                 self.show_preview_body(accepted.stamp.document);
             }
-            Err(e) => self.set_status(
-                &format!("プレビューを作れませんでした: {e}"),
-                MessageKind::Warning,
-            ),
+            Err(e) => {
+                // 前の文書の内容を残さない（別の文書の内容を、この文書のものとして見せない）。
+                // 案内を本文として持つので、テーマの変更でもそのまま組み直せる。
+                let message = format!("プレビューを作れませんでした: {e}");
+                p.body = Some(Arc::from(notice_body(&message)));
+                self.show_preview_body(accepted.stamp.document);
+                self.set_status(&message, MessageKind::Warning);
+            }
         }
     }
 
