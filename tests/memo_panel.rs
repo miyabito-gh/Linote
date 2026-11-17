@@ -91,6 +91,8 @@ fn panel_opens_closes_and_opens_memos() {
                 o.borrow_mut().push(m);
             }
             PanelEvent::Delete { .. } => e.borrow_mut().push("delete".into()),
+            PanelEvent::ContentToggled(b) => e.borrow_mut().push(format!("toggled {b}")),
+            PanelEvent::Geometry(_) => e.borrow_mut().push("geometry".into()),
             PanelEvent::Closed => e.borrow_mut().push("closed".into()),
             PanelEvent::Failed(err) => e.borrow_mut().push(format!("failed {err}")),
         }),
@@ -147,6 +149,73 @@ fn panel_opens_closes_and_opens_memos() {
         .unwrap()
         .value;
     assert_eq!(hits[0].id, seeded.id);
+
+    // 一覧の行には、名前と重ならない本文の冒頭が付く。
+    let all = store
+        .search("", &linote::core::TaskContext::detached())
+        .unwrap()
+        .value;
+    assert!(all.iter().any(|h| h.id == seeded.id && h.lead == "牛乳"));
+
+    // ダブルクリック（LBN_DBLCLK）で開いても、小窓は開いたまま。閉じる通知は来ない。
+    events.borrow_mut().clear();
+    opened.borrow_mut().clear();
+    panel.show();
+    assert!(pump(|| panel.is_visible()));
+    let t0 = Instant::now();
+    pump(|| t0.elapsed() > Duration::from_millis(300));
+    // SAFETY: 一覧のダブルクリックの代わりに WM_COMMAND（LBN_DBLCLK = 2）を小窓へ送る。
+    unsafe {
+        use windows::Win32::Foundation::{LPARAM, WPARAM};
+        use windows::Win32::UI::WindowsAndMessaging::{FindWindowExW, SendMessageW, WM_COMMAND};
+        let hwnd = FindWindowExW(None, None, w!("LinoteMemoPanel"), None).unwrap();
+        SendMessageW(
+            hwnd,
+            WM_COMMAND,
+            Some(WPARAM(102 | (2 << 16))),
+            Some(LPARAM(0)),
+        );
+    }
+    assert!(pump(|| !opened.borrow().is_empty()));
+    assert!(panel.is_visible(), "開いても小窓は残る");
+    assert!(!events.borrow().contains(&"closed".to_string()));
+
+    // 窓を狭くして（2 行表示）、広げて（右の本文）、また狭くしても落ちない。描き直しも通す。
+    // SAFETY: 試験用の操作（小窓の大きさを変える）。
+    unsafe {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            FindWindowExW, GetWindowRect, SetWindowPos, SWP_NOMOVE, SWP_NOZORDER,
+        };
+        let hwnd = FindWindowExW(None, None, w!("LinoteMemoPanel"), None).unwrap();
+        let mut r = windows::Win32::Foundation::RECT::default();
+        let _ = GetWindowRect(hwnd, &mut r);
+        let h = r.bottom - r.top;
+        for w in [520, 900, 520, 760, 520] {
+            let _ = SetWindowPos(hwnd, None, 0, 0, w, h, SWP_NOMOVE | SWP_NOZORDER);
+            let t0 = Instant::now();
+            pump(|| t0.elapsed() > Duration::from_millis(400));
+        }
+        let _ = SetWindowPos(hwnd, None, 0, 0, 760, h, SWP_NOMOVE | SWP_NOZORDER);
+        let t0 = Instant::now();
+        pump(|| t0.elapsed() > Duration::from_millis(400));
+    }
+
+    // 内容の表示・非表示は、設定の通知を出して切り替わる。
+    assert!(panel.show_content());
+    // SAFETY: 切り替えボタンのクリックの代わりに WM_COMMAND（ID 105）を送る。
+    unsafe {
+        use windows::Win32::Foundation::{LPARAM, WPARAM};
+        use windows::Win32::UI::WindowsAndMessaging::{FindWindowExW, SendMessageW, WM_COMMAND};
+        let hwnd = FindWindowExW(None, None, w!("LinoteMemoPanel"), None).unwrap();
+        SendMessageW(hwnd, WM_COMMAND, Some(WPARAM(105)), Some(LPARAM(0)));
+    }
+    assert!(!panel.show_content());
+    assert!(events.borrow().contains(&"toggled false".to_string()));
+    panel.set_show_content(true);
+    assert!(panel.show_content());
+    // 閉じるときは、位置と大きさが届く。
+    panel.hide();
+    assert!(pump(|| events.borrow().contains(&"geometry".to_string())));
 
     // SAFETY: 試験用ウィンドウの後始末。
     unsafe {

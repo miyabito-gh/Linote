@@ -54,12 +54,29 @@ impl App {
                 })));
             });
             let panel = MemoPanel::create(self.hwnd, store, &self.theme, self.dpi, on_event)?;
+            // 前回の見せ方と位置・大きさを戻す。
+            panel.set_show_content(self.settings.memo_panel.show_content);
+            if let Some(rect) = self.settings.memo_panel.rect {
+                panel.set_geometry(rect);
+            }
             self.memo_panel = Some(panel);
         }
+        self.sync_memo_panel_open_ids();
         if let Some(panel) = self.memo_panel {
             panel.toggle();
         }
         Ok(())
+    }
+
+    /// 小窓に、タブで開いているメモを伝える（一覧の行に印を付ける）。
+    pub(super) fn sync_memo_panel_open_ids(&self) {
+        let Some(panel) = self.memo_panel else { return };
+        let ids: std::collections::HashSet<MemoId> = self
+            .docs
+            .iter()
+            .filter_map(|d| d.memo.as_ref().map(|t| t.id().clone()))
+            .collect();
+        panel.set_open_ids(&ids);
     }
 
     /// 小窓が開いているか。
@@ -75,6 +92,23 @@ impl App {
                         &format!("メモを開けませんでした: {e}"),
                         MessageKind::Warning,
                     );
+                }
+                // 小窓を残して開いたとき（Enter・ダブルクリック）は、一覧を続けて使えるよう、
+                // 開いたタブに移ったあとで小窓を前面に戻す。
+                if let Some(panel) = self.memo_panel.filter(|p| p.is_visible()) {
+                    panel.activate_search();
+                }
+            }
+            PanelEvent::ContentToggled(show) => {
+                if self.settings.memo_panel.show_content != show {
+                    self.settings.memo_panel.show_content = show;
+                    self.persist_settings();
+                }
+            }
+            PanelEvent::Geometry(rect) => {
+                if self.settings.memo_panel.rect != Some(rect) {
+                    self.settings.memo_panel.rect = Some(rect);
+                    self.persist_settings();
                 }
             }
             PanelEvent::Delete { id, name } => self.delete_memo_confirmed(&id, &name),
@@ -157,6 +191,8 @@ impl App {
         )?;
         let i = self.index_of(id)?;
         self.docs[i].memo = Some(MemoTab::opened(&memo));
+        // メモのタブになった（一覧の「開いている」印を更新する）。
+        self.sync_memo_panel_open_ids();
         Ok(id)
     }
 

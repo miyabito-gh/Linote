@@ -19,6 +19,8 @@ pub struct MemoHit {
     pub name_match: bool,
     /// 本文の当たりの周辺（本文に当たったときだけ。制御文字は空白にする）。
     pub snippet: Option<String>,
+    /// 本文の冒頭の文（名前と重ならない部分。一覧の 2 行目に使う）。
+    pub lead: String,
 }
 
 /// 検索用にそろえる。全角 ASCII（U+FF01..U+FF5E）と全角空白を半角に、
@@ -69,6 +71,7 @@ pub(super) fn search(memos: &[Memo], query: &str, ctx: &TaskContext) -> Outcome<
             updated_ms: memo.updated_ms,
             name_match,
             snippet,
+            lead: super::lead_text(&memo.name, &memo.body),
         });
     }
     // 安定ソート: 元の順（更新の新しい順）を保ったまま、名前に当たったものを前へ。

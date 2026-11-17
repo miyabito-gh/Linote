@@ -539,6 +539,51 @@ impl GrepSettings {
     }
 }
 
+/// メモの一覧（小窓）の設定（`settings.json` の `memo_panel`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemoPanelSettings {
+    /// 各メモの内容を見せる（広い窓は右の本文、狭い窓は 2 行目の冒頭）。隠すと名前と日時だけ。
+    pub show_content: bool,
+    /// 前回の小窓の位置と大きさ（画面座標。`maximized` は使わない）。
+    pub rect: Option<WindowSettings>,
+}
+
+impl Default for MemoPanelSettings {
+    fn default() -> Self {
+        MemoPanelSettings {
+            show_content: true,
+            rect: None,
+        }
+    }
+}
+
+impl MemoPanelSettings {
+    fn from_value(v: &Value) -> Self {
+        let mut s = MemoPanelSettings::default();
+        if let Value::Object(map) = v {
+            if let Some(b) = map.get("show_content").and_then(Value::as_bool) {
+                s.show_content = b;
+            }
+            s.rect = WindowSettings::from_value(map);
+        }
+        s
+    }
+
+    fn to_value(self, base: Option<&Value>) -> Value {
+        let mut map = base.and_then(Value::as_object).cloned().unwrap_or_default();
+        map.insert("show_content".into(), self.show_content.into());
+        for k in ["x", "y", "width", "height", "maximized"] {
+            map.remove(k);
+        }
+        if let Some(r) = self.rect {
+            let mut r = r.to_value();
+            r.remove("maximized");
+            map.extend(r);
+        }
+        Value::Object(map)
+    }
+}
+
 /// 前回のウィンドウの位置と大きさ（画面座標。最大化していても通常状態の矩形を持つ）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WindowSettings {
@@ -721,6 +766,7 @@ pub struct SettingsChanges {
     pub grep: bool,
     pub search_history: bool,
     pub window: bool,
+    pub memo_panel: bool,
     pub mcp: bool,
     /// 知らない項目（`version` を含む）。
     pub other: bool,
@@ -786,6 +832,8 @@ pub struct Settings {
     pub save: SaveSettings,
     /// 前回のウィンドウの位置と大きさ。
     pub window: Option<WindowSettings>,
+    /// メモの一覧（小窓）の設定。
+    pub memo_panel: MemoPanelSettings,
     /// 検索・置換・Grep の履歴。
     pub search_history: SearchHistory,
     /// このプログラムが知らない項目。読み込んだまま書き戻す。
@@ -809,6 +857,7 @@ impl Default for Settings {
             new_file: NewFileSettings::default(),
             save: SaveSettings::default(),
             window: None,
+            memo_panel: MemoPanelSettings::default(),
             search_history: SearchHistory::default(),
             extra: Map::new(),
         }
@@ -933,6 +982,9 @@ impl Settings {
         if let Some(Value::Object(w)) = map.remove("window") {
             settings.window = WindowSettings::from_value(&w);
         }
+        if let Some(v) = map.remove("memo_panel") {
+            settings.memo_panel = MemoPanelSettings::from_value(&v);
+        }
         if let Some(h) = map.remove("search_history") {
             settings.search_history = SearchHistory::from_value(&h);
             // 壊れた値でも、知らない項目は書き戻しで保つ。
@@ -1011,6 +1063,8 @@ impl Settings {
             Some(w) => map.insert("window".into(), Value::Object(w.to_value())),
             None => map.remove("window"),
         };
+        let panel = self.memo_panel.to_value(map.get("memo_panel"));
+        map.insert("memo_panel".into(), panel);
         let history = self.search_history.to_value(map.get("search_history"));
         map.insert("search_history".into(), history);
         let mcp = map
@@ -1042,6 +1096,7 @@ impl Settings {
             grep: self.grep != other.grep,
             search_history: self.search_history != other.search_history,
             window: self.window != other.window,
+            memo_panel: self.memo_panel != other.memo_panel,
             mcp: self.mcp_enabled != other.mcp_enabled,
             other: self.extra != other.extra,
         }
@@ -1364,6 +1419,35 @@ mod tests {
         s.remove_recent("C:\\work\\11.txt");
         assert_eq!(s.recent_files[1], "C:\\work\\10.txt");
         assert_eq!(Settings::from_json(&s.to_json()).unwrap(), s);
+    }
+
+    #[test]
+    fn memo_panel_settings_round_trip_and_tolerate_bad_values() {
+        let d = Settings::default();
+        assert!(d.memo_panel.show_content && d.memo_panel.rect.is_none());
+        let mut s = Settings::default();
+        s.memo_panel.show_content = false;
+        s.memo_panel.rect = Some(WindowSettings {
+            x: 10,
+            y: 20,
+            width: 760,
+            height: 500,
+            maximized: false,
+        });
+        let back = Settings::from_json(&s.to_json()).unwrap();
+        assert_eq!(back.memo_panel, s.memo_panel);
+        assert!(s.diff(&d).memo_panel);
+        // 壊れた値は既定（内容を表示、位置なし）で読む。
+        for bad in [
+            r#"{"memo_panel":5}"#,
+            r#"{"memo_panel":{"show_content":"no","x":1,"y":2,"width":10,"height":5}}"#,
+        ] {
+            let b = Settings::from_json(bad).unwrap();
+            assert!(
+                b.memo_panel.show_content && b.memo_panel.rect.is_none(),
+                "{bad}"
+            );
+        }
     }
 
     #[test]

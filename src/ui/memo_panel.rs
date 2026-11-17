@@ -21,6 +21,7 @@
 //!
 //! キー操作: 検索欄で ↑↓ で一覧を選び、Enter で開く。Esc で閉じる。一覧のダブルクリックでも開く。
 
+use std::collections::HashSet;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -31,7 +32,7 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    SetFocus, VK_DELETE, VK_DOWN, VK_ESCAPE, VK_RETURN, VK_UP,
+    GetKeyState, SetFocus, VK_CONTROL, VK_DELETE, VK_DOWN, VK_ESCAPE, VK_F4, VK_RETURN, VK_UP,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CallWindowProcW, CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect,
@@ -41,16 +42,17 @@ use windows::Win32::UI::WindowsAndMessaging::{
     LBS_NOINTEGRALHEIGHT, LBS_NOTIFY, LB_ADDSTRING, LB_GETCURSEL, LB_RESETCONTENT, LB_SETCURSEL,
     MINMAXINFO, SWP_NOMOVE, SWP_NOZORDER, SW_HIDE, SW_SHOW, WM_ACTIVATE, WM_CHAR, WM_CLOSE,
     WM_COMMAND, WM_CREATE, WM_CTLCOLOREDIT, WM_CTLCOLORLISTBOX, WM_ERASEBKGND, WM_GETMINMAXINFO,
-    WM_KEYDOWN, WM_NCDESTROY, WM_SETFONT, WM_SIZE, WNDCLASSEXW, WNDPROC, WS_BORDER, WS_CAPTION,
-    WS_CHILD, WS_CLIPCHILDREN, WS_EX_CLIENTEDGE, WS_EX_TOOLWINDOW, WS_POPUP, WS_SYSMENU,
-    WS_TABSTOP, WS_THICKFRAME, WS_VISIBLE, WS_VSCROLL,
+    WM_KEYDOWN, WM_NCDESTROY, WM_SETFONT, WM_SIZE, WM_TIMER, WNDCLASSEXW, WNDPROC, WS_BORDER,
+    WS_CAPTION, WS_CHILD, WS_CLIPCHILDREN, WS_EX_CLIENTEDGE, WS_EX_TOOLWINDOW, WS_POPUP,
+    WS_SYSMENU, WS_TABSTOP, WS_THICKFRAME, WS_VISIBLE, WS_VSCROLL,
 };
 
+use crate::appdata::WindowSettings;
 use crate::core::{
     ui_channel, CancelToken, Completion, Error, MemoId, Result, TaskContext, UiReceiver, UiSender,
     UiWaker, WorkerPool,
 };
-use crate::memo::{Memo, MemoHit, MemoStore};
+use crate::memo::{fold_for_search, Memo, MemoHit, MemoStore};
 use crate::platform::system::{scale, set_dark_title_bar, to_wide};
 use crate::ui::theme::Theme;
 use crate::ui::window::{UiFont, WM_APP_FIRST_FREE};
@@ -70,6 +72,14 @@ const ID_SEARCH: usize = 101;
 const ID_LIST: usize = 102;
 const ID_NEW: usize = 103;
 const ID_DELETE: usize = 104;
+const ID_TOGGLE: usize = 105;
+/// 選択が替わってから、右の本文を読み込むまでの待ち（矢印で素早く動かしても重くしない）。
+const TIMER_PREVIEW_LOAD: usize = 1;
+const PREVIEW_LOAD_MS: u32 = 120;
+/// 右の本文に出す最大の文字数（それ以上は省略する）。
+const MAX_PREVIEW_CHARS: usize = 20_000;
+/// 右の本文の欄を出せる、一覧の幅（96 DPI の値）。これより狭いと 2 行表示にする。
+const PANE_MIN_INNER_DIP: i32 = 640;
 
 const EN_CHANGE: u32 = 0x0300;
 /// 検索結果の一覧に載せる最大件数。
@@ -83,6 +93,10 @@ pub enum PanelEvent {
     /// 選択中のメモの削除が求められた（確認と削除は `ui::app` が行い、終わったら
     /// [`MemoPanel::refresh`] で一覧を読み直す）。
     Delete { id: MemoId, name: String },
+    /// 内容の表示・非表示が切り替わった（設定に保存する）。
+    ContentToggled(bool),
+    /// 小窓を閉じるときの位置と大きさ（設定に保存する）。
+    Geometry(WindowSettings),
     /// 小窓が閉じた。本文にフォーカスを戻す。
     Closed,
     /// 一覧・読み込み・作成の失敗（状態表示などで利用者に知らせる）。
@@ -95,7 +109,10 @@ enum Msg {
         generation: u64,
         result: Result<(Vec<MemoHit>, Completion)>,
     },
-    Loaded(Result<Memo>),
+    /// メモを読んだ（`close` なら、開いたあと小窓を閉じる）。
+    Loaded { result: Result<Memo>, close: bool },
+    /// 右の本文に出すメモを読んだ。
+    Preview { seq: u64, result: Result<Memo> },
 }
 
 struct State {
@@ -104,6 +121,10 @@ struct State {
     list: HWND,
     button: HWND,
     delete_button: HWND,
+    /// 内容の表示・非表示を切り替えるボタン。
+    toggle: HWND,
+    /// 右の本文（読み取り専用）。
+    preview: HWND,
     /// 一覧が空のときに、一覧の代わりに出す案内。
     empty: HWND,
     store: MemoStore,
@@ -113,6 +134,18 @@ struct State {
     list_brush: HBRUSH,
     theme: Theme,
     hits: Vec<MemoHit>,
+    /// 内容を見せるか（見せるなら、広い窓は右の本文、狭い窓は 2 行目の冒頭）。
+    show_content: bool,
+    /// 右の本文の欄を出している（`show_content` かつ、窓が十分に広い）。
+    pane_visible: bool,
+    /// 一覧の行を 2 行にしている（`show_content` で、右の本文の欄を出せない狭い窓）。
+    two_line: bool,
+    /// タブで開いているメモ（行にしるしを付ける）。
+    open_ids: HashSet<MemoId>,
+    /// 検索語（そろえた形）。右の本文で最初の当たりを選ぶのに使う。
+    terms: Vec<String>,
+    /// 右の本文の読み込みの世代。
+    preview_seq: u64,
     generation: u64,
     cancel: Option<CancelToken>,
     tx: UiSender<Msg>,
@@ -179,8 +212,8 @@ impl MemoPanel {
                 WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME | WS_CLIPCHILDREN,
                 0,
                 0,
-                scale(420, dpi),
-                scale(480, dpi),
+                scale(760, dpi),
+                scale(500, dpi),
                 Some(owner),
                 None,
                 Some(instance.into()),
@@ -268,6 +301,78 @@ impl MemoPanel {
     /// 一覧を読み直す（削除の後など）。
     pub fn refresh(&self) {
         with_state(self.hwnd, |s| s.start_search());
+    }
+
+    /// 内容を見せるかを設定する（起動時や設定の再読み込みで使う。通知は出さない）。
+    pub fn set_show_content(&self, show: bool) {
+        with_state(self.hwnd, |s| s.apply_show_content(show));
+    }
+
+    /// 内容を見せているか。
+    pub fn show_content(&self) -> bool {
+        with_state(self.hwnd, |s| s.show_content).unwrap_or(true)
+    }
+
+    /// タブで開いているメモの一覧を渡す（行にしるしを付ける。変わったときだけ描き直す）。
+    pub fn set_open_ids(&self, ids: &HashSet<MemoId>) {
+        with_state(self.hwnd, |s| {
+            if s.open_ids != *ids {
+                s.open_ids = ids.clone();
+                s.repaint();
+            }
+        });
+    }
+
+    /// 前回の位置と大きさに戻す（画面からはみ出していれば収める）。
+    pub fn set_geometry(&self, rect: WindowSettings) {
+        use windows::Win32::Graphics::Gdi::{
+            GetMonitorInfoW, MonitorFromRect, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+        };
+        let r = RECT {
+            left: rect.x,
+            top: rect.y,
+            right: rect.x + rect.width,
+            bottom: rect.y + rect.height,
+        };
+        let mut info = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        // SAFETY: 構造体は呼び出しの間有効で、cbSize を設定している。
+        let work = unsafe {
+            let m = MonitorFromRect(&r, MONITOR_DEFAULTTONEAREST);
+            GetMonitorInfoW(m, &mut info).as_bool().then_some((
+                info.rcWork.left,
+                info.rcWork.top,
+                info.rcWork.right,
+                info.rcWork.bottom,
+            ))
+        };
+        let fitted = work.map_or(rect, |w| rect.fitted(w));
+        // SAFETY: 自分のウィンドウ。
+        unsafe {
+            let _ = SetWindowPos(
+                self.hwnd,
+                None,
+                fitted.x,
+                fitted.y,
+                fitted.width,
+                fitted.height,
+                SWP_NOZORDER,
+            );
+        }
+        self.ensure_minimum_size();
+    }
+
+    /// 前面に出して、検索欄にフォーカスを置く（メモを開いたあとも一覧を続けて使えるように）。
+    pub fn activate_search(&self) {
+        with_state(self.hwnd, |s| {
+            // SAFETY: 自分のウィンドウと子ウィンドウ。
+            unsafe {
+                let _ = windows::Win32::UI::WindowsAndMessaging::SetForegroundWindow(s.hwnd);
+                let _ = SetFocus(Some(s.edit));
+            }
+        });
     }
 
     /// 開いていれば閉じ、閉じていれば開く。
@@ -392,18 +497,30 @@ impl State {
         use windows::Win32::Graphics::Gdi::InvalidateRect;
         // SAFETY: 自分のウィンドウと子ウィンドウ。
         unsafe {
-            for h in [self.hwnd, self.edit, self.list, self.button] {
+            for h in [
+                self.hwnd,
+                self.edit,
+                self.list,
+                self.button,
+                self.toggle,
+                self.preview,
+            ] {
                 let _ = InvalidateRect(Some(h), None, true);
             }
         }
     }
 
-    /// 一覧の 1 行の高さ（名前と日時を 1 行に描く）。
+    /// 一覧の 1 行の高さ。1 行表示は名前と日時、2 行表示は名前の下に本文の冒頭を足す。
     fn item_height(&self) -> i32 {
-        self.font.measure_text("あAg", None).cy + scale(10, self.dpi)
+        let line = self.font.measure_text("あAg", None).cy;
+        if self.two_line {
+            line * 2 + scale(12, self.dpi)
+        } else {
+            line + scale(10, self.dpi)
+        }
     }
 
-    fn apply_font(&self) {
+    fn apply_item_height(&self) {
         // SAFETY: 自分のリストボックス（自前で描く固定高さの行）。
         unsafe {
             SendMessageW(
@@ -412,12 +529,20 @@ impl State {
                 WPARAM(0),
                 LPARAM(self.item_height() as isize),
             );
+            // 行の高さが替わったら、一覧全体を描き直す（古い行の絵を残さない）。
+            let _ = windows::Win32::Graphics::Gdi::InvalidateRect(Some(self.list), None, true);
         }
+    }
+
+    fn apply_font(&self) {
+        self.apply_item_height();
         for h in [
             self.edit,
             self.list,
             self.button,
             self.delete_button,
+            self.toggle,
+            self.preview,
             self.empty,
         ] {
             // SAFETY: 書体は State が保持する間有効。
@@ -434,7 +559,7 @@ impl State {
 
     fn minimum_outer_size(&self) -> (i32, i32) {
         use windows::Win32::UI::WindowsAndMessaging::{GetWindowTextLengthW, GetWindowTextW};
-        let button_width = [self.button, self.delete_button]
+        let button_width = [self.button, self.delete_button, self.toggle]
             .into_iter()
             .map(|h| {
                 let mut text = vec![0u16; unsafe { GetWindowTextLengthW(h) }.max(0) as usize + 1];
@@ -452,7 +577,7 @@ impl State {
             let _ = GetClientRect(self.hwnd, &mut client);
         }
         (
-            button_width * 2 + scale(24, self.dpi) + outer.right - outer.left - client.right
+            button_width * 3 + scale(40, self.dpi) + outer.right - outer.left - client.right
                 + client.left,
             self.font.measure_text("あAg", None).cy * 2 + scale(150, self.dpi) + outer.bottom
                 - outer.top
@@ -461,31 +586,72 @@ impl State {
         )
     }
 
-    fn layout(&self) {
+    /// 内容の見せ方を決める。広い窓は右に本文の欄、狭い窓は一覧の 2 行目、隠すときはどちらもなし。
+    /// 変わったら `true`（行の高さを直す）。
+    fn decide_mode(&mut self, inner: i32) -> bool {
+        let pane = self.show_content && inner >= scale(PANE_MIN_INNER_DIP, self.dpi);
+        let two_line = self.show_content && !pane;
+        let changed = pane != self.pane_visible || two_line != self.two_line;
+        self.pane_visible = pane;
+        self.two_line = two_line;
+        changed
+    }
+
+    fn layout(&mut self) {
         let mut rc = RECT::default();
         // SAFETY: 自分のウィンドウ。
         unsafe {
             let _ = GetClientRect(self.hwnd, &mut rc);
         }
+        let (w, h) = (rc.right - rc.left, rc.bottom - rc.top);
+        let inner = (w - 2 * scale(12, self.dpi)).max(0);
+        if self.decide_mode(inner) {
+            self.apply_item_height();
+            if self.pane_visible {
+                self.schedule_preview();
+            } else {
+                self.clear_preview();
+            }
+        }
         let px = |n| scale(n, self.dpi);
         let (m, gap) = (px(12), px(8));
         let row = self.font.measure_text("あAg", None).cy + px(10);
-        let (w, h) = (rc.right - rc.left, rc.bottom - rc.top);
-        let inner = (w - 2 * m).max(0);
         let button_w =
             |b: HWND| (self.font.measure_text(&window_text(b), None).cx + px(28)).max(px(88));
         let list_y = m + row + gap;
         let button_h = row + px(2);
         let list_h = (h - list_y - gap - button_h - m).max(0);
         let y = list_y + list_h + gap;
+        // 右に本文の欄を出すときは、一覧を 4 割（最小 240 DIP）にする。
+        let list_w = if self.pane_visible {
+            (inner * 2 / 5).clamp(px(240), (inner - px(280)).max(px(240)))
+        } else {
+            inner
+        };
+        let pane_x = m + list_w + gap;
+        let pane_w = (inner - list_w - gap).max(0);
         // SAFETY: 自分の子ウィンドウ。
         unsafe {
             let _ = MoveWindow(self.edit, m, m, inner, row, true);
-            let _ = MoveWindow(self.list, m, list_y, inner, list_h, true);
-            let _ = MoveWindow(self.empty, m, list_y + px(8), inner, list_h - px(8), true);
-            // 主な操作（新規メモ）は右、削除は左に離して置く。
+            let _ = MoveWindow(self.list, m, list_y, list_w, list_h, true);
+            let _ = MoveWindow(self.empty, m, list_y + px(8), list_w, list_h - px(8), true);
+            let _ = MoveWindow(self.preview, pane_x, list_y, pane_w, list_h, true);
+            let _ = ShowWindow(
+                self.preview,
+                if self.pane_visible { SW_SHOW } else { SW_HIDE },
+            );
+            // 主な操作（新規メモ）は右、その左に内容の切り替え、削除は左に離して置く。
             let new_w = button_w(self.button);
             let _ = MoveWindow(self.button, m + inner - new_w, y, new_w, button_h, true);
+            let toggle_w = button_w(self.toggle);
+            let _ = MoveWindow(
+                self.toggle,
+                m + inner - new_w - gap - toggle_w,
+                y,
+                toggle_w,
+                button_h,
+                true,
+            );
             let _ = MoveWindow(
                 self.delete_button,
                 m,
@@ -519,6 +685,10 @@ impl State {
         self.cancel = Some(cancel.clone());
         let store = self.store.clone();
         let query = self.query();
+        self.terms = fold_for_search(&query)
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect();
         let tx = self.tx.clone();
         WorkerPool::global().spawn(move || {
             let ctx = TaskContext::detached().with_limits(crate::core::Limits::items(MAX_RESULTS));
@@ -545,6 +715,7 @@ impl State {
             let next = (cur + delta).clamp(0, n - 1);
             SendMessageW(self.list, LB_SETCURSEL, WPARAM(next as usize), LPARAM(0));
         }
+        self.schedule_preview();
     }
 
     fn show_hits(&mut self, hits: Vec<MemoHit>) {
@@ -570,6 +741,7 @@ impl State {
         }
         self.hits = hits;
         self.update_empty();
+        self.schedule_preview();
     }
 
     /// 一覧が空なら、一覧の代わりに案内を出す。削除は選択があるときだけ。
@@ -618,31 +790,73 @@ impl State {
                 .font
                 .measure_text(&format_updated(hit.updated_ms), None)
                 .cx;
-            rc.left += px(6);
+            // タブで開いているメモは、左端にアクセント色の細い線（タブの選択の線と同じ色）。
+            if self.open_ids.contains(&hit.id) {
+                let bar = RECT {
+                    left: rc.left,
+                    top: rc.top + px(4),
+                    right: rc.left + px(3).max(2),
+                    bottom: rc.bottom - px(4),
+                };
+                let brush = CreateSolidBrush(COLORREF(t.ui.accent.colorref()));
+                FillRect(d.hDC, &bar, brush);
+                let _ = DeleteObject(brush.into());
+            }
+            rc.left += px(8);
             rc.right -= px(6);
-            let mut date_rc = rc;
+            // 2 行表示のときは、上の行に名前と日時、下の行に本文の冒頭（薄い色）。
+            let line_h = self.font.measure_text("あAg", None).cy;
+            let first = if self.two_line {
+                RECT {
+                    top: rc.top + px(4),
+                    bottom: rc.top + px(4) + line_h,
+                    ..rc
+                }
+            } else {
+                rc
+            };
+            let mut date_rc = first;
             SetTextColor(d.hDC, COLORREF(t.ui.status_dim.colorref()));
             let mut date_text = date[..date.len() - 1].to_vec();
-            DrawTextW(
+            draw_text(
                 d.hDC,
                 &mut date_text,
                 &mut date_rc,
                 DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
             );
-            let mut name_rc = rc;
+            let mut name_rc = first;
             name_rc.right = (rc.right - date_w - px(12)).max(rc.left);
-            let label = match (&hit.snippet, hit.name_match) {
-                (Some(snippet), false) => format!("{}  —  {}", hit.name, snippet),
+            // 2 行表示では、名前の行に抜粋を足さない（下の行に出す）。
+            let label = match (&hit.snippet, hit.name_match, self.two_line) {
+                (Some(snippet), false, false) => format!("{}  —  {}", hit.name, snippet),
                 _ => hit.name.clone(),
             };
             let mut text: Vec<u16> = label.encode_utf16().collect();
             SetTextColor(d.hDC, COLORREF(t.editor.fg.colorref()));
-            DrawTextW(
+            draw_text(
                 d.hDC,
                 &mut text,
                 &mut name_rc,
                 DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS,
             );
+            // 空の文字列は渡さない（本文が空のメモ。DrawTextW に空の領域を渡すと落ちる）。
+            let sub = hit.snippet.as_deref().unwrap_or(&hit.lead);
+            if self.two_line && !sub.is_empty() {
+                // 検索で本文に当たったときはその周辺、そうでなければ冒頭の文。
+                let mut sub_rc = RECT {
+                    top: first.bottom + px(2),
+                    bottom: first.bottom + px(2) + line_h,
+                    ..rc
+                };
+                let mut sub_text: Vec<u16> = sub.encode_utf16().collect();
+                SetTextColor(d.hDC, COLORREF(t.ui.status_dim.colorref()));
+                draw_text(
+                    d.hDC,
+                    &mut sub_text,
+                    &mut sub_rc,
+                    DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS,
+                );
+            }
             SelectObject(d.hDC, old_font);
             if d.itemState.0 & ODS_FOCUS.0 != 0 {
                 let _ = DrawFocusRect(d.hDC, &d.rcItem);
@@ -654,12 +868,44 @@ impl State {
         (self.on_event)(event);
     }
 
-    /// 選択中のメモを作業スレッドで読み、届いたら [`PanelEvent::Open`]。
-    fn open_selected(&self) {
+    /// 小窓を隠す（破棄しない）。位置と大きさ、閉じたことを通知する。
+    fn close_panel(&mut self) {
+        // SAFETY: 自分のウィンドウ。
+        unsafe {
+            let _ = windows::Win32::UI::WindowsAndMessaging::KillTimer(
+                Some(self.hwnd),
+                TIMER_PREVIEW_LOAD,
+            );
+        }
+        let was_visible = unsafe { IsWindowVisible(self.hwnd).as_bool() };
+        let mut r = RECT::default();
+        // SAFETY: 自分のウィンドウ。
+        let have_rect = unsafe {
+            let _ = ShowWindow(self.hwnd, SW_HIDE);
+            GetWindowRect(self.hwnd, &mut r).is_ok()
+        };
+        if let Some(c) = self.cancel.take() {
+            c.cancel();
+        }
+        if was_visible && have_rect {
+            self.emit(PanelEvent::Geometry(WindowSettings {
+                x: r.left,
+                y: r.top,
+                width: r.right - r.left,
+                height: r.bottom - r.top,
+                maximized: false,
+            }));
+        }
+        self.emit(PanelEvent::Closed);
+    }
+
+    /// 選択中のメモを作業スレッドで読み、届いたら [`PanelEvent::Open`]。`close` なら、開いたあと
+    /// 小窓を閉じる（Ctrl+Enter）。そうでなければ小窓を残し、続けて別のメモを開けるようにする。
+    fn open_selected(&self, close: bool) {
         let Some(id) = self.selected().map(|h| h.id.clone()) else {
             return;
         };
-        self.load(id);
+        self.load(id, close);
     }
 
     /// 選択中のメモの削除を求める。
@@ -670,12 +916,150 @@ impl State {
         self.emit(PanelEvent::Delete { id, name });
     }
 
-    fn load(&self, id: MemoId) {
+    fn load(&self, id: MemoId, close: bool) {
         let store = self.store.clone();
         let tx = self.tx.clone();
         WorkerPool::global().spawn(move || {
-            tx.send(Msg::Loaded(store.load(&id)));
+            tx.send(Msg::Loaded {
+                result: store.load(&id),
+                close,
+            });
         });
+    }
+
+    // ---------------------------------------------------------------- 内容の見せ方
+
+    /// 内容を見せるかを替える（利用者の操作。保存のために通知する）。
+    fn toggle_content(&mut self) {
+        let show = !self.show_content;
+        self.apply_show_content(show);
+        self.emit(PanelEvent::ContentToggled(show));
+    }
+
+    /// 内容の表示・非表示を適用する（ボタンの押された状態、行の高さ、右の本文の欄）。ボタンの文字は
+    /// 「内容を表示」のままで、表示中は押された（くぼんだ）状態にする。
+    fn apply_show_content(&mut self, show: bool) {
+        self.show_content = show;
+        // SAFETY: 自分のボタン。
+        unsafe {
+            SendMessageW(
+                self.toggle,
+                BM_SETCHECK,
+                WPARAM(usize::from(show)),
+                LPARAM(0),
+            );
+        }
+        // 行の高さと右の本文の欄は、配置の計算で決まる。
+        let mut rc = RECT::default();
+        // SAFETY: 自分のウィンドウ。
+        unsafe {
+            let _ = GetClientRect(self.hwnd, &mut rc);
+        }
+        let inner = (rc.right - rc.left - 2 * scale(12, self.dpi)).max(0);
+        self.decide_mode(inner);
+        self.apply_item_height();
+        self.layout();
+        if self.pane_visible {
+            self.schedule_preview();
+        } else {
+            self.clear_preview();
+        }
+        self.repaint();
+    }
+
+    /// 右の本文を、短い待ちのあとに読み込む（矢印で動かしている間は読み込まない）。
+    fn schedule_preview(&self) {
+        if !self.pane_visible {
+            return;
+        }
+        // SAFETY: 自分のウィンドウのタイマー（同じ ID なら置き換わる）。
+        unsafe {
+            let _ = windows::Win32::UI::WindowsAndMessaging::SetTimer(
+                Some(self.hwnd),
+                TIMER_PREVIEW_LOAD,
+                PREVIEW_LOAD_MS,
+                None,
+            );
+        }
+    }
+
+    /// 右の本文を空にする（隠したとき、一覧が空のとき）。
+    fn clear_preview(&self) {
+        // SAFETY: 自分の子ウィンドウ。
+        unsafe {
+            let _ = windows::Win32::UI::WindowsAndMessaging::KillTimer(
+                Some(self.hwnd),
+                TIMER_PREVIEW_LOAD,
+            );
+            let _ = SetWindowTextW(self.preview, w!(""));
+        }
+    }
+
+    /// タイマー: 選択中のメモの本文を作業スレッドで読む。
+    fn load_preview(&mut self) {
+        // SAFETY: 自分のウィンドウのタイマー。
+        unsafe {
+            let _ = windows::Win32::UI::WindowsAndMessaging::KillTimer(
+                Some(self.hwnd),
+                TIMER_PREVIEW_LOAD,
+            );
+        }
+        let Some(id) = self.selected().map(|h| h.id.clone()) else {
+            self.clear_preview();
+            return;
+        };
+        if !self.pane_visible {
+            return;
+        }
+        self.preview_seq += 1;
+        let seq = self.preview_seq;
+        let store = self.store.clone();
+        let tx = self.tx.clone();
+        WorkerPool::global().spawn(move || {
+            tx.send(Msg::Preview {
+                seq,
+                result: store.load(&id),
+            });
+        });
+    }
+
+    /// 読んだメモの本文を右の欄に出す（長ければ省略）。検索語があれば、最初の当たりを選んで
+    /// そこまでスクロールする。
+    fn show_preview(&self, memo: &Memo) {
+        let mut body: String = memo.body.chars().take(MAX_PREVIEW_CHARS).collect();
+        if memo.body.chars().nth(MAX_PREVIEW_CHARS).is_some() {
+            body.push_str("\n…（以下省略）");
+        }
+        // 編集欄の改行は CR LF。
+        let text = body.replace("\r\n", "\n").replace('\n', "\r\n");
+        let wide = to_wide(&text);
+        // SAFETY: 自分の子ウィンドウ。文字列は NUL 終端でコピーされる。
+        unsafe {
+            let _ = SetWindowTextW(self.preview, PCWSTR(wide.as_ptr()));
+        }
+        let (start, end) = self.first_match_range(&text).unwrap_or((0, 0));
+        // SAFETY: 自分の子ウィンドウ（読み取り専用の編集欄）。
+        unsafe {
+            SendMessageW(self.preview, EM_SETSEL, WPARAM(start), LPARAM(end as isize));
+            SendMessageW(self.preview, EM_SCROLLCARET, WPARAM(0), LPARAM(0));
+        }
+    }
+
+    /// 検索語の最初の当たり（UTF-16 の位置の範囲）。そろえた形（全角・半角、ひらがな・カタカナ、
+    /// 大小）で探す。そろえても文字数は変わらないので、位置はそのまま使える。
+    fn first_match_range(&self, text: &str) -> Option<(usize, usize)> {
+        if self.terms.is_empty() {
+            return None;
+        }
+        let folded = fold_for_search(text);
+        let (pos, term) = self
+            .terms
+            .iter()
+            .filter_map(|t| folded.find(t.as_str()).map(|p| (p, t)))
+            .min_by_key(|(p, _)| *p)?;
+        let before = folded[..pos].encode_utf16().count();
+        let len = term.encode_utf16().count();
+        Some((before, before + len))
     }
 
     /// 新しいメモを作って開く。検索欄に文字があればそれを名前にする。
@@ -689,7 +1073,11 @@ impl State {
         let store = self.store.clone();
         let tx = self.tx.clone();
         WorkerPool::global().spawn(move || {
-            tx.send(Msg::Loaded(store.create(&name, "")));
+            // 新しいメモは、そのまま書き始められるよう小窓を閉じる。
+            tx.send(Msg::Loaded {
+                result: store.create(&name, ""),
+                close: true,
+            });
         });
     }
 
@@ -707,15 +1095,31 @@ impl State {
                         Err(e) => self.emit(PanelEvent::Failed(e)),
                     }
                 }
-                Msg::Loaded(Ok(memo)) => {
+                Msg::Loaded {
+                    result: Ok(memo),
+                    close,
+                } => {
                     self.emit(PanelEvent::Open(memo));
-                    // SAFETY: 自分のウィンドウを隠して Closed を通知する。
-                    unsafe {
-                        let _ = ShowWindow(self.hwnd, SW_HIDE);
+                    if close {
+                        self.close_panel();
                     }
-                    self.emit(PanelEvent::Closed);
                 }
-                Msg::Loaded(Err(e)) => self.emit(PanelEvent::Failed(e)),
+                Msg::Loaded { result: Err(e), .. } => self.emit(PanelEvent::Failed(e)),
+                Msg::Preview { seq, result } => {
+                    // 選択が替わって古くなった結果は捨てる。
+                    if seq != self.preview_seq || !self.pane_visible {
+                        continue;
+                    }
+                    match result {
+                        Ok(memo) => {
+                            if self.selected().is_some_and(|h| h.id == memo.id) {
+                                self.show_preview(&memo);
+                            }
+                        }
+                        // 読めなかった（削除されたなど）。欄は空にして、通知はしない。
+                        Err(_) => self.clear_preview(),
+                    }
+                }
             }
         }
     }
@@ -796,6 +1200,24 @@ extern "system" fn panel_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPAR
                 0,
                 ID_DELETE,
             );
+            let toggle = child(
+                hwnd,
+                w!("BUTTON"),
+                w!("内容を表示"),
+                // 押したままになるボタン（表示中は押された見た目。文字は変えない）。
+                WS_TABSTOP.0 | BS_CHECKBOX_ | BS_PUSHLIKE_,
+                0,
+                ID_TOGGLE,
+            );
+            // 右の本文: 読み取り専用の複数行の編集欄（選択して写せる。検索の当たりは選択で示す）。
+            let preview = child(
+                hwnd,
+                w!("EDIT"),
+                w!(""),
+                WS_VSCROLL.0 | ES_MULTILINE_ | ES_AUTOVSCROLL_ | ES_READONLY_ | ES_NOHIDESEL_,
+                WS_EX_CLIENTEDGE.0,
+                0,
+            );
             let (tx, rx) = ui_channel(Arc::new(PostWaker(hwnd.0 as isize)));
             let mut state = Box::new(State {
                 hwnd,
@@ -803,6 +1225,8 @@ extern "system" fn panel_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPAR
                 list,
                 button,
                 delete_button,
+                toggle,
+                preview,
                 empty,
                 store,
                 font: UiFont::for_dpi(dpi),
@@ -811,6 +1235,12 @@ extern "system" fn panel_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPAR
                 list_brush: HBRUSH::default(),
                 theme,
                 hits: Vec::new(),
+                show_content: true,
+                pane_visible: false,
+                two_line: false,
+                open_ids: HashSet::new(),
+                terms: Vec::new(),
+                preview_seq: 0,
                 generation: 0,
                 cancel: None,
                 tx,
@@ -821,6 +1251,11 @@ extern "system" fn panel_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPAR
             });
             state.rebuild_brushes();
             state.apply_font();
+            // 既定は「内容を表示」（押された状態）。
+            // SAFETY: 自分のボタン。
+            unsafe {
+                SendMessageW(toggle, BM_SETCHECK, WPARAM(1), LPARAM(0));
+            }
             // SAFETY: 元の処理を控えて、キー操作を受ける処理に差し替える。
             unsafe {
                 let old =
@@ -876,7 +1311,10 @@ extern "system" fn panel_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPAR
         WM_CTLCOLOREDIT | WM_CTLCOLORLISTBOX | WM_CTLCOLORSTATIC_ => {
             let brush = with_state(hwnd, |s| {
                 let hdc = HDC(wparam.0 as *mut _);
-                let fg = if msg == WM_CTLCOLORSTATIC_ {
+                // 一覧が空のときの案内（STATIC）は薄い色。右の本文（読み取り専用の編集欄も
+                // STATIC として届く）は本文の色。
+                let is_preview = lparam.0 == s.preview.0 as isize;
+                let fg = if msg == WM_CTLCOLORSTATIC_ && !is_preview {
                     s.theme.ui.status_dim
                 } else {
                     s.theme.editor.fg
@@ -899,9 +1337,11 @@ extern "system" fn panel_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPAR
             let code = ((wparam.0 >> 16) & 0xFFFF) as u32;
             with_state(hwnd, |s| match (id, code) {
                 (ID_SEARCH, EN_CHANGE) => s.start_search(),
-                (ID_LIST, LBN_DBLCLK) => s.open_selected(),
+                (ID_LIST, LBN_SELCHANGE_) => s.schedule_preview(),
+                (ID_LIST, LBN_DBLCLK) => s.open_selected(false),
                 (ID_NEW, BN_CLICKED) => s.create_new(),
                 (ID_DELETE, BN_CLICKED) => s.delete_selected(),
+                (ID_TOGGLE, BN_CLICKED) => s.toggle_content(),
                 _ => {}
             });
             LRESULT(0)
@@ -924,16 +1364,11 @@ extern "system" fn panel_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPAR
         }
         WM_CLOSE => {
             // 破棄せず隠す（次に開くときに一覧を読み直す）。
-            // SAFETY: 自分のウィンドウ。
-            unsafe {
-                let _ = ShowWindow(hwnd, SW_HIDE);
-            }
-            with_state(hwnd, |s| {
-                if let Some(c) = s.cancel.take() {
-                    c.cancel();
-                }
-                s.emit(PanelEvent::Closed);
-            });
+            with_state(hwnd, |s| s.close_panel());
+            LRESULT(0)
+        }
+        WM_TIMER if wparam.0 == TIMER_PREVIEW_LOAD => {
+            with_state(hwnd, |s| s.load_preview());
             LRESULT(0)
         }
         WM_NCDESTROY => {
@@ -966,7 +1401,14 @@ extern "system" fn key_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
             true
         }
         WM_KEYDOWN if key == VK_RETURN.0 => {
-            with_state(parent, |s| s.open_selected());
+            // Enter: 開いても小窓は残す（続けて別のメモを開ける）。Ctrl+Enter: 開いて閉じる。
+            // SAFETY: キーの状態を読むだけ。
+            let ctrl = unsafe { GetKeyState(i32::from(VK_CONTROL.0)) } < 0;
+            with_state(parent, |s| s.open_selected(ctrl));
+            true
+        }
+        WM_KEYDOWN if key == VK_F4.0 => {
+            with_state(parent, |s| s.toggle_content());
             true
         }
         WM_KEYDOWN if (key == VK_DOWN.0 || key == VK_UP.0) && is_edit(parent, hwnd) => {
@@ -1008,6 +1450,16 @@ unsafe fn SendMessageW(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
 }
 
 const EM_SETCUEBANNER: u32 = 0x1501;
+const EM_SETSEL: u32 = 0x00B1;
+const EM_SCROLLCARET: u32 = 0x00B7;
+const LBN_SELCHANGE_: u32 = 1;
+const BM_SETCHECK: u32 = 0x00F1;
+const BS_CHECKBOX_: u32 = 0x0002;
+const BS_PUSHLIKE_: u32 = 0x1000;
+const ES_MULTILINE_: u32 = 0x0004;
+const ES_AUTOVSCROLL_: u32 = 0x0040;
+const ES_NOHIDESEL_: u32 = 0x0100;
+const ES_READONLY_: u32 = 0x0800;
 const WM_CTLCOLORSTATIC_: u32 = 0x0138;
 const LBS_OWNERDRAWFIXED: i32 = 0x0010;
 const LBS_HASSTRINGS: i32 = 0x0040;
@@ -1111,5 +1563,18 @@ mod date_tests {
         assert_eq!(format_relative(t, Some((2026, 12, 1, 0, 0))), "11/14");
         assert_eq!(format_relative(t, Some((2027, 1, 1, 0, 0))), "2026/11/14");
         assert_eq!(format_relative(t, None), "2026/11/14");
+    }
+}
+
+/// `DrawTextW` の包み。空の文字列は描かない（空の領域を渡すと落ちるため。本文が空のメモの
+/// 2 行目、日時が取れなかったときなど）。
+unsafe fn draw_text(
+    hdc: HDC,
+    text: &mut [u16],
+    rc: &mut RECT,
+    format: windows::Win32::Graphics::Gdi::DRAW_TEXT_FORMAT,
+) {
+    if !text.is_empty() {
+        DrawTextW(hdc, text, rc, format);
     }
 }

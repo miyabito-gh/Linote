@@ -35,7 +35,7 @@ pub fn derive_name(body: &str) -> String {
 }
 
 /// 行頭の Markdown の記号（見出し・引用・箇条書き・チェックリスト・番号）を外す。
-fn strip_markers(line: &str) -> String {
+pub(super) fn strip_markers(line: &str) -> String {
     let mut s = line.trim();
     if s.starts_with("```") || s.starts_with("~~~") {
         return String::new();
@@ -102,7 +102,7 @@ fn first_sentence(s: &str) -> &str {
 }
 
 /// 制御文字を空白にして、連続する空白を 1 つにまとめる。
-fn tidy(s: &str) -> String {
+pub(super) fn tidy(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut space = true;
     for c in s.chars() {

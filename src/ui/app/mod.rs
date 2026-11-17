@@ -1442,6 +1442,7 @@ impl App {
             self.relayout_tabs();
             self.invalidate(self.layout.tabs);
         }
+        self.sync_memo_panel_open_ids();
     }
 
     fn relayout_tabs(&mut self) {
