@@ -27,6 +27,13 @@ fn main() {
         .include(sci.join("win32"))
         .include(lex.join("include"))
         .include(lex.join("lexlib"));
+    // GCC/Clang 系: 同梱の Scintilla/Lexilla は <cstdint> を include せず INT32_MAX / uint8_t を使う
+    // ファイルがある（CellBuffer.cxx など）。古い libstdc++ は他のヘッダー経由で暗黙に取り込んでいたが、
+    // GCC 15 系（MSYS2 の mingw64 など）では取り込まれずコンパイルエラーになる。
+    // ベンダ同梱コードを書き換えずに済むよう、強制 include で補う（MSVC は対象外）。
+    if !b.get_compiler().is_like_msvc() {
+        b.flag("-include").flag("cstdint");
+    }
     for dir in [
         sci.join("src"),
         sci.join("win32"),
