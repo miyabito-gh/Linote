@@ -192,7 +192,7 @@ fn reload(ctx: &Ctx) -> Check {
     step(|app| -> Check {
         check!(
             app.status_message()
-                .is_some_and(|m| m.contains("再読み込みできません")),
+                .is_some_and(|m| m.contains("まだファイルになっていない文書は開き直せません")),
             "案内 {:?}",
             app.status_message()
         );

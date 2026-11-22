@@ -30,6 +30,8 @@ pub enum DocumentKind {
     File,
     /// 巨大ファイルの読み取り専用モード（UTF-8）。編集・保存・Undo はできない。
     LargeFile,
+    /// 外部で変更されたファイルを確認するための、保存先を持たない読み取り専用の控え。
+    SavedCopy(DocumentId),
     /// 新規作成した未保存の文書。保存するとパスが決まり [`File`](Self::File) になる。
     Untitled,
     /// 一時メモ。メモの保存領域に自動保存される。
@@ -47,6 +49,7 @@ impl DocumentKind {
         match self {
             DocumentKind::File => editing.with(Save).with(Recover),
             DocumentKind::LargeFile => Capabilities::NONE,
+            DocumentKind::SavedCopy(_) => Capabilities::of(&[Highlight, Wrap, Preview, Print]),
             DocumentKind::Untitled | DocumentKind::Clipboard => editing.with(Recover),
             DocumentKind::Memo(_) => editing.with(AutoSave),
         }
@@ -57,6 +60,7 @@ impl DocumentKind {
         match self {
             DocumentKind::File => "file",
             DocumentKind::LargeFile => "large_file",
+            DocumentKind::SavedCopy(_) => "saved_copy",
             DocumentKind::Untitled => "untitled",
             DocumentKind::Memo(_) => "memo",
             DocumentKind::Clipboard => "clipboard",
@@ -207,6 +211,15 @@ impl DocumentState {
         state.path = Some(path);
         state.saved_version = Some(Version::INITIAL);
         state.disk = Some(disk);
+        state
+    }
+
+    /// ファイルに保存されている内容を別タブで確認するための控え。
+    pub fn saved_copy(source: DocumentId, format: TextFormat, disk: FileStamp) -> Self {
+        let mut state = Self::new(DocumentKind::SavedCopy(source), format);
+        state.saved_version = Some(Version::INITIAL);
+        state.disk = Some(disk);
+        state.read_only = true;
         state
     }
 

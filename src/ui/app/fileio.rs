@@ -24,6 +24,7 @@ use crate::file::{
 };
 use crate::text::tidy::TidyOptions;
 use crate::text::{Confidence, Encoding, OnUnmappable};
+use crate::ui::dialogs::SaveConflictChoice;
 use crate::ui::editor::{DocLoader, Language};
 use crate::ui::statusbar::MessageKind;
 
@@ -133,6 +134,8 @@ struct OpenRequest {
     force_bom: bool,
     /// 外部変更による自動読み直し。同じ文書 ID・タブ位置に反映する。
     automatic: bool,
+    /// 保存されている内容を、元の編集タブを残して表示する。
+    saved_copy_of: Option<DocumentId>,
 }
 
 /// 保存先。
@@ -159,6 +162,8 @@ pub(super) struct SaveOpts {
     pub after: After,
     /// 変換できない文字を `?` に置き換えて保存してよいと確認済み。
     pub replace_unmappable: bool,
+    /// 競合から別名保存するとき、保存先を選んだ直後のファイルの状態。
+    conflict_expect: Option<file::DiskExpectation>,
 }
 
 impl SaveOpts {
@@ -166,8 +171,35 @@ impl SaveOpts {
         SaveOpts {
             after,
             replace_unmappable: false,
+            conflict_expect: None,
         }
     }
+}
+
+/// 保存に失敗した文書に残す案内。再試行には現在の本文と最新の保存先の確認を使う。
+pub(super) struct FailedSave {
+    message: String,
+    save_as: bool,
+}
+
+/// 外部変更の解決として別名保存するときは、元ファイルの別表記・別リンクも拒む。
+fn conflict_save_expectation(original: &Path, destination: &Path) -> Result<file::DiskExpectation> {
+    let destination_stamp = file::FileStamp::read(destination)?;
+    let destination_id = destination_stamp.and_then(|stamp| stamp.id);
+    let same_path = super::settingsops::same_path(original, destination);
+    let same_id = match destination_id {
+        Some(destination) => {
+            file::FileStamp::read(original)?.and_then(|stamp| stamp.id) == Some(destination)
+        }
+        None => false,
+    };
+    if same_path || same_id {
+        return Err(Error::invalid_argument(
+            "path",
+            "元のファイルへの上書きはできません。別の保存先を選んでください",
+        ));
+    }
+    Ok(file::DiskExpectation::from_stamp(destination_stamp))
 }
 
 impl App {
@@ -299,7 +331,7 @@ impl App {
         if !self.opening.insert(path.clone()) {
             return Ok(());
         }
-        let result = self.start_read(&path, reopen, false);
+        let result = self.start_read(&path, reopen, false, None);
         if result.is_err() {
             self.opening.remove(&path);
         }
@@ -311,20 +343,27 @@ impl App {
         path: &Path,
         reopen: Option<(DocStamp, Option<Encoding>, bool)>,
         automatic: bool,
+        saved_copy_of: Option<DocumentId>,
     ) -> Result<()> {
         // 起動オプションの文字コード（`-e`）。開き直しの指定があればそちらを使う。
-        let launch_encoding = self.pending_encodings.remove(path);
+        let launch_encoding = if saved_copy_of.is_none() {
+            self.pending_encodings.remove(path)
+        } else {
+            None
+        };
         let meta = std::fs::metadata(path).map_err(|e| Error::io("読み込み", path, e))?;
         let thresholds = self.large_thresholds;
         let max = thresholds.max_bytes;
         let too_large = large_mode_reason(&FileProfile::of_size(meta.len()), &thresholds).is_some();
         if too_large {
-            if reopen.is_some() {
+            if reopen.is_some() || saved_copy_of.is_some() {
+                let action = if saved_copy_of.is_some() {
+                    "保存されている内容を別タブで確認できる"
+                } else {
+                    "開き直せる"
+                };
                 return Err(Error::LimitExceeded {
-                    what: format!(
-                        "文字コードを指定して開き直せるファイルの大きさ（{} MiB）",
-                        max / (1024 * 1024)
-                    ),
+                    what: format!("{action}ファイルの大きさ（{} MiB）", max / (1024 * 1024)),
                     limit: max,
                 });
             }
@@ -345,6 +384,7 @@ impl App {
             reopen_of,
             force_bom,
             automatic,
+            saved_copy_of,
         };
         let reopen_of = request.reopen_of;
         let sender = self.sender();
@@ -392,6 +432,13 @@ impl App {
         request: OpenRequest,
         result: Result<(LoadedText, DocLoader, Option<LargeModeReason>)>,
     ) {
+        if let Some(source) = request.saved_copy_of {
+            self.opening_saved_copies.remove(&source);
+            if let Err(e) = self.finish_saved_copy(source, &request.path, result) {
+                self.report_failure("保存されている内容を開けませんでした", &e);
+            }
+            return;
+        }
         self.opening.remove(&request.path);
         if request.automatic {
             self.finish_automatic_reload(request, result);
@@ -492,6 +539,94 @@ impl App {
         }
     }
 
+    /// 外部で変わった内容を確認できる通常ファイルか。
+    pub(super) fn can_open_saved_copy(&self, id: DocumentId) -> bool {
+        self.state(id).is_some_and(|state| {
+            matches!(state.kind(), DocumentKind::File)
+                && state.has_external_change()
+                && state.path().is_some()
+        })
+    }
+
+    /// 編集中の文書に触れず、保存されている内容を非同期で読み込む。
+    pub(super) fn open_saved_copy(&mut self, id: DocumentId) -> Result<()> {
+        if !self.can_open_saved_copy(id) {
+            return Err(Error::unsupported(
+                "外部で変更されたファイルを開いてください",
+            ));
+        }
+        let path = self.path_of(id)?;
+        if !self.opening_saved_copies.insert(id) {
+            return Err(Error::Busy {
+                what: "ファイルを読み込んでいます".into(),
+            });
+        }
+        let result = self.start_read(&path, None, false, Some(id));
+        if result.is_err() {
+            self.opening_saved_copies.remove(&id);
+        }
+        result
+    }
+
+    fn finish_saved_copy(
+        &mut self,
+        source: DocumentId,
+        path: &Path,
+        result: Result<(LoadedText, DocLoader, Option<LargeModeReason>)>,
+    ) -> Result<()> {
+        // 待っている間に元の文書を閉じたり、別の名前で保存したりした場合は開かない。
+        if self.state(source).and_then(DocumentState::path) != Some(path) {
+            return Ok(());
+        }
+        let (loaded, loader, big) = result?;
+        if big.is_some() {
+            return Err(Error::unsupported(
+                "巨大ファイルの内容は別タブで確認できません",
+            ));
+        }
+        let previous = self
+            .docs
+            .iter()
+            .find(|d| matches!(d.state.kind(), DocumentKind::SavedCopy(id) if *id == source));
+        if let Some(doc) = previous {
+            if doc
+                .state
+                .disk_stamp()
+                .is_some_and(|stamp| stamp.matches(&loaded.stamp))
+            {
+                return self.activate(doc.id());
+            }
+        }
+        let previous = previous.map(|doc| doc.id());
+        let state = DocumentState::saved_copy(source, loaded.format, loaded.stamp);
+        let title = format!("保存済み: {}", file_title(path));
+        self.add_loaded(
+            state,
+            loader.finish()?,
+            title,
+            Language::from_path(path),
+            true,
+        )?;
+        if let Some(previous) = previous {
+            self.close_document_quietly(previous)?;
+        }
+        if loaded.is_lossy() {
+            self.set_status(
+                "読み取れない文字を「�」に置き換えて表示しています",
+                MessageKind::Warning,
+            );
+        } else if loaded.detection.confidence == Confidence::Low {
+            self.set_status(
+                &format!(
+                    "文字コードを自動判定できませんでした（{} として表示）",
+                    loaded.format.encoding.label()
+                ),
+                MessageKind::Warning,
+            );
+        }
+        Ok(())
+    }
+
     /// 自動の読み直しは同じ文書を置き換える。タブ順とアクティブな文書を変えず、
     /// 読み込み中の編集・保存・閉鎖があれば結果を破棄する。
     fn finish_automatic_reload(
@@ -507,14 +642,14 @@ impl App {
         let Some(state) = self.state(id) else { return };
         if !self.is_current(stamp) || state.is_dirty() {
             let _ = self.update_state(id, |s| s.record_external_change());
-            self.set_status("読み直している間に文書が変更されたため、自動の読み直しを中止しました。上書きせず、名前を付けて保存してください", MessageKind::Warning);
+            self.set_status("編集中の変更を残すため、ファイルの変更の自動反映を中止しました。「名前を付けて保存」で別のファイルに保存できます", MessageKind::Warning);
             return;
         }
         let (loaded, loader, _) = match result {
             Ok(value) => value,
             Err(e) => {
                 self.report_failure(
-                    "ディスクから自動で読み直せませんでした（編集中の本文は保っています）",
+                    "ファイルの変更を自動で反映できませんでした（編集中の内容は残っています）",
                     &e,
                 );
                 return;
@@ -544,7 +679,7 @@ impl App {
         let doc = match loader.finish() {
             Ok(doc) => doc,
             Err(e) => {
-                self.report_failure("編集欄に読み直せませんでした", &e);
+                self.report_failure("ファイルの変更を自動で反映できませんでした", &e);
                 return;
             }
         };
@@ -555,7 +690,7 @@ impl App {
             Ok(aux) => aux,
             Err(e) => {
                 self.editor.release_document(doc);
-                self.report_failure("編集欄に読み直せませんでした", &e);
+                self.report_failure("ファイルの変更を自動で反映できませんでした", &e);
                 return;
             }
         };
@@ -611,7 +746,7 @@ impl App {
         self.update_find_context();
         self.preview_note_change(id);
         self.set_status(
-            &format!("「{}」をディスクから読み直しました", self.docs[i].title),
+            &format!("「{}」にファイルの変更を反映しました", self.docs[i].title),
             MessageKind::Info,
         );
     }
@@ -640,10 +775,12 @@ impl App {
         if dirty {
             let owner = self.hwnd;
             let prompts = self.prompts.clone();
-            let ok = prompts.confirm(
+            let title = super::fileops::shorten_path(&title, 72);
+            let ok = prompts.confirm_themed(
                 owner,
                 "Linote",
                 &format!("「{title}」の未保存の変更は、開き直すと失われます。\n開き直しますか？"),
+                &self.theme,
             );
             if !ok {
                 return Ok(());
@@ -654,33 +791,35 @@ impl App {
         self.open_inner(&path, Some((stamp, Some(encoding), bom)))
     }
 
-    /// ディスクから読み直す（文字コードは自動判定）。未保存の変更があれば確認する
-    /// （破棄される）。外部変更の検知後に、変更を取り込む手段にもなる。
+    /// ファイルを保存されている内容で開き直す（文字コードは自動判定）。
+    /// 未保存の変更があれば破棄を確認する。外部変更の検知後にも使える。
     pub fn reload_from_disk(&mut self, id: DocumentId) -> Result<()> {
         let i = self.index_of(id)?;
         let (path, dirty, title) = {
             let d = &self.docs[i];
             let Some(path) = d.state.path().map(Path::to_path_buf) else {
                 return Err(Error::unsupported(
-                    "まだファイルになっていない文書は再読み込みできません",
+                    "まだファイルになっていない文書は開き直せません",
                 ));
             };
             (path, d.state.is_dirty(), d.title.clone())
         };
         if !matches!(self.docs[i].state.kind(), DocumentKind::File) {
             return Err(Error::unsupported(
-                "ファイルではない文書（メモ・巨大ファイルなど）は再読み込みできません",
+                "メモや巨大ファイルでは「ファイルを開き直す」を使えません",
             ));
         }
         if dirty {
             let owner = self.hwnd;
             let prompts = self.prompts.clone();
-            let ok = prompts.confirm(
+            let title = super::fileops::shorten_path(&title, 72);
+            let ok = prompts.confirm_themed(
                 owner,
                 "Linote",
                 &format!(
-                    "「{title}」の未保存の変更は、ディスクから再読み込みすると失われます。\n再読み込みしますか？"
+                    "「{title}」を保存されている内容で開き直しますか？\n未保存の変更は失われます。"
                 ),
+                &self.theme,
             );
             if !ok {
                 return Ok(());
@@ -721,26 +860,24 @@ impl App {
                 let bom = d.state.format.bom;
                 let _ = self.update_state(id, |s| s.record_external_change());
                 if automatic && self.opening.insert(path.clone()) {
-                    match self.start_read(&path, Some((stamp, Some(encoding), bom)), true) {
+                    match self.start_read(&path, Some((stamp, Some(encoding), bom)), true, None) {
                         Ok(()) => return true,
                         Err(e) => {
                             self.opening.remove(&path);
-                            self.report_failure("ディスクから自動で読み直せませんでした", &e);
+                            self.report_failure("ファイルの変更を自動で反映できませんでした", &e);
                             return true;
                         }
                     }
                 }
-                let what = match change {
-                    ExternalChange::Removed => "削除または移動されました",
-                    _ => "ほかのプログラムで変更されました",
-                };
-                self.set_status(
-                    &format!(
-                        "「{title}」が{what}。上書きせず、「名前を付けて保存」で別に保存してください\
-                         （「文字コードを指定して開き直す」で読み直すこともできます）"
+                let guidance = match change {
+                    ExternalChange::Removed => format!(
+                        "「{title}」が削除または移動されました。「名前を付けて保存」で別のファイルに保存できます"
                     ),
-                    MessageKind::Warning,
-                );
+                    _ => format!(
+                        "「{title}」が外部で変更されました。ファイルメニューで別名保存または保存済みの内容を確認できます"
+                    ),
+                };
+                self.set_status(&guidance, MessageKind::Warning);
                 true
             }
             _ => false,
@@ -750,25 +887,69 @@ impl App {
     /// 外部変更を知らせ、別名での保存を勧める。
     fn external_change_guidance(&mut self, id: DocumentId, after: After) {
         let Ok(i) = self.index_of(id) else { return };
-        let title = self.docs[i].title.clone();
+        let title = super::fileops::shorten_path(&self.docs[i].title, 72);
         let owner = self.hwnd;
         let prompts = self.prompts.clone();
-        let ok = prompts.confirm(
-            owner,
-            "Linote - ファイルが変更されています",
-            &format!(
-                "「{title}」は、開いた後にほかのプログラムで変更（または削除）されました。\n\
-                 上書きすると、その変更を失うおそれがあります。\n\n別の名前で保存しますか？"
-            ),
-        );
-        if ok {
-            if let Err(e) = self.save_as_flow(id, after) {
-                self.report_failure("保存できませんでした", &e);
-            }
+        let can_preview = self.docs[i].state.path().is_some_and(Path::is_file);
+        let result = match prompts.save_conflict_choice(owner, &title, can_preview, &self.theme) {
+            SaveConflictChoice::SaveAs => self.save_as_flow(id, after),
+            SaveConflictChoice::OpenSavedCopy => self.open_saved_copy(id),
+            SaveConflictChoice::Cancel => Ok(()),
+        };
+        if let Err(e) = result {
+            self.report_failure("ファイルの操作ができませんでした", &e);
         }
     }
 
     // ---------------------------------------------------------------- 保存
+
+    pub(super) fn persistent_save_status(&self) -> Option<(String, MessageKind)> {
+        let failed = self.save_failures.get(&self.active_id()?)?;
+        Some((failed.message.clone(), MessageKind::Warning))
+    }
+
+    pub(super) fn can_retry_failed_save(&self) -> bool {
+        self.active_id().is_some_and(|id| {
+            self.save_failures.contains_key(&id) && self.document(id).is_some_and(|doc| !doc.saving)
+        })
+    }
+
+    /// 現在の本文を保存する。別名保存だった場合は、保存先と上書きの承認を取り直す。
+    pub(super) fn retry_failed_save(&mut self) -> Result<()> {
+        let Some(id) = self.active_id().filter(|_| self.can_retry_failed_save()) else {
+            return Err(Error::unsupported("再試行できる保存はありません"));
+        };
+        if self.save_failures[&id].save_as {
+            self.save_as_flow(id, After::Nothing)
+        } else {
+            self.save_document(id, SaveDest::Current, SaveOpts::new(After::Nothing))
+        }
+    }
+
+    fn remember_failed_save(&mut self, id: DocumentId, name: &str, dest: &SaveDest, e: &Error) {
+        if matches!(e, Error::Cancelled) {
+            return;
+        }
+        if self.document(id).is_none() {
+            self.report_failure(&format!("「{name}」を保存できませんでした"), e);
+            return;
+        }
+        let message = format!(
+            "「{name}」を保存できませんでした。「ファイル > 保存を再試行」からやり直せます: {}",
+            describe_error(e)
+        );
+        self.save_failures.insert(
+            id,
+            FailedSave {
+                message,
+                save_as: matches!(dest, SaveDest::As(_)),
+            },
+        );
+        if self.active_id() == Some(id) {
+            self.status_temporary = false;
+        }
+        self.refresh_persistent_status();
+    }
 
     /// 上書き保存、またはまだファイルでない文書なら名前を付けて保存する。
     pub(super) fn save_then(&mut self, id: DocumentId, after: After) {
@@ -813,6 +994,15 @@ impl App {
     pub(super) fn save_as_flow_asked(&mut self, id: DocumentId, after: After) -> Result<bool> {
         let i = self.index_of(id)?;
         let suggested = match self.docs[i].state.path() {
+            Some(p) if self.docs[i].state.has_external_change() => {
+                let mut name = p.file_stem().unwrap_or_default().to_os_string();
+                name.push(" (コピー)");
+                if let Some(ext) = p.extension() {
+                    name.push(".");
+                    name.push(ext);
+                }
+                name.to_string_lossy().into_owned()
+            }
             Some(p) => file_title(p),
             None => {
                 let t = &self.docs[i].title;
@@ -843,7 +1033,7 @@ impl App {
         &mut self,
         id: DocumentId,
         dest: SaveDest,
-        opts: SaveOpts,
+        mut opts: SaveOpts,
     ) -> Result<()> {
         self.sync();
         let i = self.index_of(id)?;
@@ -852,6 +1042,12 @@ impl App {
             return Ok(());
         }
         let is_memo = matches!(self.docs[i].state.kind(), DocumentKind::Memo(_));
+        let changed_source = match &dest {
+            SaveDest::As(_) if self.docs[i].state.has_external_change() => {
+                self.docs[i].state.path().map(Path::to_path_buf)
+            }
+            _ => None,
+        };
         let (path, expect) = match &dest {
             SaveDest::Current => {
                 if self.docs[i].state.has_external_change() {
@@ -874,8 +1070,20 @@ impl App {
             }
             SaveDest::As(path) => {
                 self.docs[i].state.require(Capability::SaveAs)?;
-                // 保存先の選択（上書きの確認を済ませたもの）なので、状態は問わない。
-                (path.clone(), file::DiskExpectation::Any)
+                if opts.conflict_expect.is_none() && changed_source.is_some() {
+                    let stamp = match file::FileStamp::read(path) {
+                        Ok(stamp) => stamp,
+                        Err(e) => {
+                            self.remember_failed_save(id, &file_title(path), &dest, &e);
+                            return Ok(());
+                        }
+                    };
+                    opts.conflict_expect = Some(file::DiskExpectation::from_stamp(stamp));
+                }
+                (
+                    path.clone(),
+                    opts.conflict_expect.unwrap_or(file::DiskExpectation::Any),
+                )
             }
         };
         if self.docs[i].lossy {
@@ -911,17 +1119,24 @@ impl App {
         };
         WorkerPool::global().spawn(move || {
             let ctx = TaskContext::detached();
-            let result = file::save_text(
-                &SaveRequest {
-                    path: &path,
-                    text: &text,
-                    format,
-                    doc: stamp,
-                    expect,
-                    on_unmappable,
-                },
-                &ctx,
-            );
+            let result = changed_source
+                .as_deref()
+                .map_or(Ok(()), |source| {
+                    conflict_save_expectation(source, &path).map(|_| ())
+                })
+                .and_then(|()| {
+                    file::save_text(
+                        &SaveRequest {
+                            path: &path,
+                            text: &text,
+                            format,
+                            doc: stamp,
+                            expect,
+                            on_unmappable,
+                        },
+                        &ctx,
+                    )
+                });
             sender.send(UiMessage::Run(Box::new(move |app| {
                 app.finish_save(id, path, dest_again, export, opts, format, result)
             })));
@@ -972,6 +1187,9 @@ impl App {
         let name = file_title(&path);
         match result {
             Ok(SaveOutcome::Saved(saved)) => {
+                if self.save_failures.remove(&id).is_some() {
+                    self.refresh_persistent_status();
+                }
                 if export {
                     self.set_status(&format!("書き出しました: {name}"), MessageKind::Info);
                     return;
@@ -1032,14 +1250,14 @@ impl App {
                     );
                 }
             }
-            Err(Error::ExternalChange { .. }) => {
+            Err(Error::ExternalChange { .. }) if matches!(dest, SaveDest::Current) => {
                 if exists {
                     let _ = self.update_state(id, |s| s.record_external_change());
                     self.external_change_guidance(id, opts.after);
                 }
             }
             Err(e) => {
-                self.report_failure(&format!("「{name}」を保存できませんでした"), &e);
+                self.remember_failed_save(id, &name, &dest, &e);
             }
         }
     }
@@ -1064,7 +1282,20 @@ pub(super) fn confirm_close(app: &mut App, id: DocumentId) -> bool {
     };
     match closing::plan(d.state.kind(), d.state.is_dirty()) {
         ClosePlan::Close => true,
-        ClosePlan::SaveMemoThenClose => app.save_memo_now(id),
+        ClosePlan::SaveMemoThenClose => {
+            let original = d.memo.as_ref().map(|memo| memo.id().clone());
+            if !app.save_memo_now(id) {
+                return false;
+            }
+            if let Some(doc) = app.document(id) {
+                let saved = doc.memo.as_ref().map(|memo| memo.id());
+                if saved != original.as_ref() {
+                    let message = format!("競合があったため「{}」に保存しました", doc.title);
+                    app.set_status(&message, MessageKind::Warning);
+                }
+            }
+            true
+        }
         ClosePlan::Ask => {
             let title = d.title.clone();
             let owner = app.hwnd;

@@ -211,13 +211,15 @@ fn checks_basic(app: &mut App) -> Check {
     app.settings.recent_files = vec!["C:\\work\\a.txt".into(), "C:\\work\\b.txt".into()];
     app.paint_for_test();
     check!(
-        app.empty_links.len() == 2,
-        "案内の最近使ったファイル {}",
+        app.empty_links.len() == 4,
+        "新規・開く・最近使ったファイルの案内 {}",
         app.empty_links.len()
     );
     app.settings.recent_files.clear();
-    // 新規（file.new）で文書ができ、編集欄が現れる。
-    app.execute(&Invocation::user(FILE_NEW.id)).map_err(e2s)?;
+    // 空画面の「新規」から文書ができ、編集欄が現れる。
+    let (rect, action) = app.empty_links[0];
+    check!(action == super::emptyview::EmptyAction::New, "新規の案内");
+    app.on_left_down(rect.left, rect.top);
     check!(app.documents().len() == 1, "新規で文書ができる");
     check!(editor_visible(app), "文書があれば編集欄を出す");
     let first = app.active_id().ok_or("アクティブな文書がない")?;
@@ -267,6 +269,32 @@ fn checks_basic(app: &mut App) -> Check {
     check!(app.active_id() == Some(second), "新しいタブがアクティブ");
     check!(app.documents().len() == 2, "タブの数");
     check!(app.tabs.items().len() == 2, "タブバーの項目の数");
+    let mut narrow_tabs = crate::ui::tabs::TabBar::new();
+    narrow_tabs.set_items(app.tabs.items().to_vec(), Some(1));
+    let bar = windows::Win32::Foundation::RECT {
+        right: 150,
+        bottom: 26,
+        ..Default::default()
+    };
+    narrow_tabs.relayout(bar, 96, &|_| 40);
+    let list = narrow_tabs
+        .list_button_rect()
+        .ok_or("隠れたタブの一覧ボタンがない")?;
+    check!(
+        narrow_tabs.tab_rect(1).is_some()
+            && narrow_tabs.new_button_rect().right <= list.left
+            && narrow_tabs.hit_test(list.left, list.top) == Some(crate::ui::tabs::TabHit::List),
+        "狭いタブバーで選択中のタブ、新規、一覧が重ならない"
+    );
+    narrow_tabs.relayout(
+        windows::Win32::Foundation::RECT { right: 300, ..bar },
+        96,
+        &|_| 40,
+    );
+    check!(
+        narrow_tabs.list_button_rect().is_none(),
+        "全タブが収まると一覧ボタンを隠す"
+    );
     // クリップボード由来は作成直後から未保存。読み込みでは版は進まない。
     let st = app.state(second).unwrap();
     check!(st.is_dirty(), "クリップボード由来は未保存");
