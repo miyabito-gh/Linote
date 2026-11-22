@@ -13,7 +13,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use windows::Win32::Foundation::{POINT, RECT};
+use windows::Win32::Foundation::{LPARAM, POINT, RECT};
 use windows::Win32::Graphics::Gdi::{
     GetMonitorInfoW, MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTONEAREST,
 };
@@ -121,6 +121,7 @@ impl App {
         };
         let id = doc.id();
         let has_path = doc.state.path().is_some();
+        let can_move = !matches!(doc.state.kind(), DocumentKind::SavedCopy(_));
         let count = self.docs.len();
         let _ = self.activate(id);
         // SAFETY: 作ったポップアップメニューを、このウィンドウの上で出して破棄する。
@@ -133,7 +134,9 @@ impl App {
                     }
                     Some((command, label)) => {
                         let wide: Vec<u16> = label.encode_utf16().chain(Some(0)).collect();
-                        let flags = if tab_menu_enabled(command, index, count, has_path) {
+                        let usable = tab_menu_enabled(command, index, count, has_path)
+                            && (can_move || *command != "file.move_to_new_window");
+                        let flags = if usable {
                             MF_STRING
                         } else {
                             MF_STRING | MF_GRAYED
@@ -170,8 +173,27 @@ impl App {
 
     /// 本文の右クリックメニュー（Scintilla 既定の英語のメニューの代わり）。項目はメニューバーと
     /// 同じコマンドで、キーの割り当てを右に表示する。使えない項目は灰色。
-    pub(super) fn show_editor_menu(&mut self) {
+    pub(super) fn show_editor_menu(&mut self, lparam: LPARAM) {
         let registry = self.registry();
+        let p = if lparam.0 as u32 == u32::MAX {
+            let caret = self
+                .active
+                .filter(|&i| matches!(self.docs[i].view(), super::DocView::Scintilla(_)))
+                .and_then(|_| self.editor.caret_menu_anchor());
+            caret.unwrap_or_else(|| {
+                let mut cursor = POINT::default();
+                // SAFETY: 巨大ファイルのビューなど、通常のキャレットがないときの表示位置。
+                unsafe {
+                    let _ = GetCursorPos(&mut cursor);
+                }
+                cursor
+            })
+        } else {
+            POINT {
+                x: (lparam.0 & 0xffff) as i16 as i32,
+                y: ((lparam.0 >> 16) & 0xffff) as i16 as i32,
+            }
+        };
         // SAFETY: 作ったポップアップメニューを、このウィンドウの上で出して破棄する。
         let chosen = unsafe {
             let Ok(menu) = CreatePopupMenu() else { return };
@@ -203,8 +225,6 @@ impl App {
                     }
                 }
             }
-            let mut p = POINT::default();
-            let _ = GetCursorPos(&mut p);
             let paint_state = crate::ui::menu::drawing::popup(menu);
             let r = TrackPopupMenu(
                 menu,
@@ -259,6 +279,9 @@ impl App {
                 let path = self.path_of(id)?;
                 Ok(HandoffDoc::File { path })
             }
+            DocumentKind::SavedCopy(_) => Err(Error::unsupported(
+                "保存済みの内容を確認するタブは別ウィンドウへ移せません",
+            )),
             DocumentKind::File | DocumentKind::Untitled | DocumentKind::Clipboard => {
                 let state = &self.docs[i].state;
                 let dirty = state.is_dirty();

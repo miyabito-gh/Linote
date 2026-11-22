@@ -111,7 +111,7 @@ pub(super) struct ReloadOutcome {
 }
 
 /// 同じファイルか（Windows のパスは大文字小文字を区別しない）。
-fn same_path(a: &Path, b: &Path) -> bool {
+pub(super) fn same_path(a: &Path, b: &Path) -> bool {
     if a == b {
         return true;
     }
@@ -282,6 +282,9 @@ impl App {
         }
         if changes.grep {
             self.sync_grep_settings();
+        }
+        if changes.preview {
+            self.preview_settings_changed();
         }
         if changes.recent_files_max {
             self.settings.truncate_recent_files();

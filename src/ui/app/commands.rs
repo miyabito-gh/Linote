@@ -7,7 +7,7 @@
 use std::path::Path;
 
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
-use windows::Win32::UI::WindowsAndMessaging::{HMENU, MSG, WM_KEYDOWN, WM_SYSKEYDOWN};
+use windows::Win32::UI::WindowsAndMessaging::{HMENU, MSG, WM_CHAR, WM_KEYDOWN, WM_SYSKEYDOWN};
 
 use crate::appdata::ThemeMode;
 use crate::command::{
@@ -111,8 +111,46 @@ pub const FILE_CLEAR_RECENT: CommandDef = CommandDef::new(
 
 pub const FILE_RELOAD: CommandDef = CommandDef::new(
     CommandId::new("file.reload"),
-    "ディスクから再読み込み",
-    "ファイルをディスクから読み直す（文字コードは自動判定）。未保存の変更があれば確認する。",
+    "ファイルを開き直す",
+    "ファイルに保存されている内容を開き直す（文字コードは自動判定）。未保存の変更があれば、破棄してよいか確認する。",
+)
+.target(TargetKind::Document);
+
+const OPEN_SAVED_COPY: CommandDef = CommandDef::new(
+    CommandId::new("file.open_saved_copy"),
+    "保存されている内容を別タブで開く",
+    "外部で変更されたファイルを読み取り専用で開く。元のタブの編集は残る。",
+)
+.target(TargetKind::Document);
+
+const RETRY_SAVE: CommandDef = CommandDef::new(
+    CommandId::new("file.retry_save"),
+    "保存を再試行",
+    "保存に失敗した文書の現在の内容で保存をやり直す。",
+);
+
+const RESTORE_DOCUMENTS: CommandDef = CommandDef::new(
+    CommandId::new("file.restore_documents"),
+    "復元できる文書…",
+    "前回の終了時に残った編集内容を確認し、復元する。",
+);
+
+const RETRY_RECOVERY: CommandDef = CommandDef::new(
+    CommandId::new("file.retry_recovery"),
+    "復元データの保存を再試行",
+    "書き込めなかった自動復元データの保存をやり直す。",
+);
+
+const LIST_TABS: CommandDef = CommandDef::new(
+    CommandId::new("view.tab_list"),
+    "タブ一覧…",
+    "開いているタブの一覧から切り替える。",
+);
+
+const OPEN_ORIGINAL_MEMO: CommandDef = CommandDef::new(
+    CommandId::new("memo.open_original"),
+    "競合前のメモを開く",
+    "編集中の内容を保存した競合メモを残したまま、元のメモを開く。",
 )
 .target(TargetKind::Document);
 
@@ -293,7 +331,7 @@ pub const SEARCH_REPLACE: CommandDef = CommandDef::new(
     "置換...",
     "検索・置換・Grep の小窓を開く（置換欄を使う）。巨大ファイルでは置換は使えない。",
 )
-.default_key("Ctrl+H");
+.default_key("Ctrl+R");
 
 pub const SEARCH_FIND_NEXT: CommandDef = CommandDef::new(
     CommandId::new("search.find_next"),
@@ -328,13 +366,14 @@ pub const VIEW_PREVIEW_PANE: CommandDef = CommandDef::new(
     "Markdown プレビュー（右ペイン）",
     "アクティブな文書（無題・任意の拡張子・メモを含む。巨大ファイルを除く）を Markdown として右ペインにプレビューする（開いていれば閉じる）。初めて使うときに WebView2 を初期化する。",
 )
-.default_key("Ctrl+Shift+P");
+.default_key("Ctrl+Shift+V");
 
 pub const VIEW_PREVIEW_WINDOW: CommandDef = CommandDef::new(
     CommandId::new("view.preview_window"),
     "Markdown プレビュー（別ウィンドウ）",
     "アクティブな文書（巨大ファイルを除く）を Markdown として別ウィンドウにプレビューする（開いていれば閉じる）。",
-);
+)
+.default_key("Ctrl+Shift+H");
 
 pub const MEMO_OPEN_PANEL: CommandDef = CommandDef::new(
     CommandId::new("memo.open_panel"),
@@ -359,6 +398,11 @@ pub const CLIPBOARD_NEW_TAB: CommandDef = CommandDef::new(
 )
 .result("{\"document\": 文書 ID または null}")
 .default_key(DEFAULT_CLIPBOARD_CHORD);
+
+/// 本文に入れてはいけない制御文字か（Backspace、Tab、LF、CR、Esc は通常の入力）。
+fn is_stray_control_char(ch: usize) -> bool {
+    ch < 0x20 && !matches!(ch, 0x08 | 0x09 | 0x0A | 0x0D | 0x1B)
+}
 
 fn string_arg(call: &crate::command::Call<'_>, name: &str) -> Option<String> {
     call.opt_str(name).map(str::to_owned)
@@ -426,6 +470,30 @@ pub fn register(registry: &mut Registry<App>) -> Result<()> {
     })?;
     registry.register(FILE_RELOAD, |app, call| {
         app.reload_from_disk(call.document()?)?;
+        Ok(Value::Null)
+    })?;
+    registry.register(OPEN_SAVED_COPY, |app, call| {
+        app.open_saved_copy(call.document()?)?;
+        Ok(Value::Null)
+    })?;
+    registry.register(RETRY_SAVE, |app, _| {
+        app.retry_failed_save()?;
+        Ok(Value::Null)
+    })?;
+    registry.register(RESTORE_DOCUMENTS, |app, _| {
+        app.open_recovery_candidates();
+        Ok(Value::Null)
+    })?;
+    registry.register(RETRY_RECOVERY, |app, _| {
+        app.retry_recovery_writes();
+        Ok(Value::Null)
+    })?;
+    registry.register(LIST_TABS, |app, _| {
+        app.show_tab_list();
+        Ok(Value::Null)
+    })?;
+    registry.register(OPEN_ORIGINAL_MEMO, |app, call| {
+        app.open_original_memo(call.document()?)?;
         Ok(Value::Null)
     })?;
     registry.register(FILE_CLOSE_ALL, |app, _| {
@@ -845,6 +913,12 @@ impl App {
                 return true;
             }
         }
+        // 割り当てのない Ctrl＋英字は、Scintilla が制御文字（Ctrl+R なら DC2）を本文に
+        // 入れてしまう。Backspace・Tab・改行・Esc 以外の制御文字の入力は捨てる。
+        if msg.message == WM_CHAR && is_our_editor(msg.hwnd) && is_stray_control_char(msg.wParam.0)
+        {
+            return true;
+        }
         if msg.message != WM_KEYDOWN && msg.message != WM_SYSKEYDOWN {
             return false;
         }
@@ -930,6 +1004,19 @@ impl App {
             if entry.command.as_str() == "file.reopen_closed" {
                 return !self.closed_tabs_is_empty();
             }
+            match entry.command {
+                id if id == OPEN_SAVED_COPY.id => {
+                    return self.active_id().is_some_and(|id| self.can_open_saved_copy(id));
+                }
+                id if id == RETRY_SAVE.id => return self.can_retry_failed_save(),
+                id if id == RESTORE_DOCUMENTS.id => return self.can_open_recovery_candidates(),
+                id if id == RETRY_RECOVERY.id => return self.has_recovery_failures(),
+                id if id == LIST_TABS.id => return self.docs.len() > 1,
+                id if id == OPEN_ORIGINAL_MEMO.id => {
+                    return self.active_id().is_some_and(|id| self.can_open_original_memo(id));
+                }
+                _ => {}
+            }
             registry
                 .check_available(self, &Invocation::user(entry.command))
                 .is_ok()
@@ -969,5 +1056,22 @@ impl App {
     /// `WM_COMMAND`（メニュー由来のもの）か。
     pub(super) fn is_menu_command(wparam: WPARAM, lparam: LPARAM) -> bool {
         (wparam.0 >> 16) & 0xFFFF == 0 && lparam.0 == 0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_stray_control_char;
+
+    #[test]
+    fn only_stray_control_chars_are_dropped() {
+        // Ctrl+R（DC2）、Ctrl+V（SYN）、Ctrl+Space（NUL）は捨てる。
+        for ch in [0x00, 0x12, 0x16, 0x1F] {
+            assert!(is_stray_control_char(ch), "{ch:#x}");
+        }
+        // Backspace・Tab・LF・CR・Esc と、通常の文字は通す。
+        for ch in [0x08, 0x09, 0x0A, 0x0D, 0x1B, 0x20, 0x61, 0x3042] {
+            assert!(!is_stray_control_char(ch), "{ch:#x}");
+        }
     }
 }

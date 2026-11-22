@@ -111,6 +111,8 @@ pub enum TabHit {
     Empty,
     /// 新しいタブのボタン（＋）。
     New,
+    /// 見えないタブがある場合に表示する一覧ボタン。
+    List,
 }
 
 /// 各タブの横の位置（`None` は、あふれて見えないタブ）。
@@ -243,10 +245,15 @@ impl TabBar {
                 m.natural_width(measure(&t.title) + extra)
             })
             .collect();
-        // 右に「＋」の場所を空けて並べる。
+        // 「＋」と、あふれるときだけ一覧ボタンの場所を空ける。
+        let width = bar.right - bar.left;
+        let available = width - self.new_button_width();
+        let list_width = self.list_button_width();
+        let overflow = natural.len() > (available / m.min_width.max(1)).max(1) as usize;
+        let reserved = if overflow { list_width } else { 0 };
         self.positions = layout(
             &natural,
-            (bar.right - bar.left - self.new_button_width()).max(0),
+            (available - reserved).max(0),
             &m,
             self.active,
             &mut self.scroll,
@@ -285,7 +292,13 @@ impl TabBar {
         if w == 0 {
             return RECT::default();
         }
-        let left = right_of_tabs.min(self.bar.right - w).max(self.bar.left);
+        let end = self.bar.right
+            - if self.has_hidden_tabs() {
+                self.list_button_width()
+            } else {
+                0
+            };
+        let left = right_of_tabs.min(end - w).max(self.bar.left);
         let inset = crate::platform::system::scale(4, self.dpi);
         RECT {
             left: left + inset,
@@ -293,6 +306,34 @@ impl TabBar {
             top: self.bar.top + inset,
             bottom: self.bar.bottom - inset - 1,
         }
+    }
+
+    fn has_hidden_tabs(&self) -> bool {
+        self.positions.first().is_some_and(Option::is_none)
+            || self.positions.last().is_some_and(Option::is_none)
+    }
+
+    fn list_button_width(&self) -> i32 {
+        let width = crate::platform::system::scale(36, self.dpi);
+        if self.bar.right - self.bar.left < width * 2 {
+            0
+        } else {
+            width
+        }
+    }
+
+    pub fn list_button_rect(&self) -> Option<RECT> {
+        let width = self.list_button_width();
+        if width == 0 || !self.has_hidden_tabs() {
+            return None;
+        }
+        let inset = crate::platform::system::scale(4, self.dpi);
+        Some(RECT {
+            left: self.bar.right - width + inset,
+            right: self.bar.right - inset,
+            top: self.bar.top + inset,
+            bottom: self.bar.bottom - inset - 1,
+        })
     }
 
     fn close_rect(&self, tab: &RECT) -> RECT {
@@ -326,6 +367,12 @@ impl TabBar {
         let new_button = self.new_button_rect();
         if new_button.right > new_button.left && crate::ui::window::contains(&new_button, x, y) {
             return Some(TabHit::New);
+        }
+        if self
+            .list_button_rect()
+            .is_some_and(|rect| crate::ui::window::contains(&rect, x, y))
+        {
+            return Some(TabHit::List);
         }
         for i in 0..self.items.len() {
             if let Some(r) = self.tab_rect(i) {
@@ -396,6 +443,26 @@ impl TabBar {
             },
             ui.tab_separator,
         );
+        if let Some(rect) = self.list_button_rect() {
+            let b = offset(rect);
+            if self.hover == Some(TabHit::List) {
+                c.fill(&b, ui.tab_hover_bg);
+            }
+            let (cx, cy) = ((b.left + b.right) / 2, (b.top + b.bottom) / 2);
+            let step = c.px(1).max(1);
+            for row in 0..5 {
+                let half = (4 - row) * step;
+                c.fill(
+                    &RECT {
+                        left: cx - half,
+                        right: cx + half + step,
+                        top: cy + (row - 2) * step,
+                        bottom: cy + (row - 1) * step,
+                    },
+                    ui.tab_fg,
+                );
+            }
+        }
         // 「＋」のボタン（ふだんは記号だけ、マウスが乗ると背景）。
         if self.new_button_width() > 0 {
             let b = offset(self.new_button_rect());

@@ -146,6 +146,90 @@ pub fn scroll_restore_script(pos: ScrollPos) -> Option<String> {
     Some(format!("window.scrollTo({:.1}, {:.1})", pos.x, pos.y))
 }
 
+/// 同じ文書の更新を、読み込み直さずにその場で差し替えるスクリプト（`ExecuteScript` で実行する）。
+///
+/// `NavigateToString` で読み込み直すと、毎回いったん空白になってから先頭に描かれ、位置を戻すので
+/// 入力のたびにちらつく。ここでは新しい HTML を `DOMParser` で読み、`<head>` と `<body>` を
+/// 入れ替えて、元のスクロール位置に戻す（同じスクリプトの中なので途中の状態は描かれない）。
+///
+/// 文書の内容は JSON の文字列リテラルとしてだけ渡す（コードとしては評価しない）。`DOMParser` で
+/// 作った要素の `<script>` は動かず、元の文書の CSP（`script-src 'none'`）と
+/// `IsScriptEnabled(false)` もそのまま効く。成功すれば `"ok"` を返す。
+pub fn patch_script(html: &str) -> Option<String> {
+    let literal = serde_json::to_string(html).ok()?;
+    Some(format!(
+        "(function(h){{try{{var x=window.scrollX,y=window.scrollY;\
+         var d=new DOMParser().parseFromString(h,'text/html');\
+         if(!d.head||!d.body||!document.head||!document.body)return 'no';\
+         document.head.replaceWith(document.adoptNode(d.head));\
+         document.body.replaceWith(document.adoptNode(d.body));\
+         window.scrollTo(x,y);return 'ok';}}catch(e){{return 'no';}}}})({literal})"
+    ))
+}
+
+/// 元の行（0 始まり）に対応する位置までスクロールするスクリプト（編集位置への追従）。
+///
+/// 目印（`.src-line`、[`crate::markdown::RenderOptions::source_lines`]）のうち `data-line` が
+/// `line` 以下の最後のものを先頭に出す。なければ文書の先頭。固定の文字列に整数だけを入れる。
+pub fn scroll_to_line_script(line: u32) -> String {
+    format!(
+        "(function(n){{var a=document.querySelectorAll('.src-line'),t=null;         for(var i=0;i<a.length;i++){{if(+a[i].getAttribute('data-line')<=n)t=a[i];else break;}}         if(t)t.scrollIntoView({{block:'start'}});else window.scrollTo(0,0);}})({line})"
+    )
+}
+
+/// [`patch_script`] の結果（JSON）が成功か。
+pub fn patch_succeeded(json: &str) -> bool {
+    json.trim() == "\"ok\""
+}
+
+/// プレビューの上で押されたキーのうち、ブラウザーの機能として働かせないものか
+/// （`AcceleratorKeyPressed` で `Handled` にして止める）。
+///
+/// ページ内検索（Ctrl+F、F3、Ctrl+G）を使えるようにブラウザーのショートカットを有効にするので、
+/// 再読み込み・印刷・保存・ソース表示・開発者ツール・戻る/進む・キャレットブラウズなどは
+/// ここで止める。Ctrl を押しながらのキーは、検索とコピー・全選択と移動だけを通す。
+pub fn blocks_browser_key(vk: u32, ctrl: bool, alt: bool) -> bool {
+    const VK_LEFT: u32 = 0x25;
+    const VK_RIGHT: u32 = 0x27;
+    const VK_HOME: u32 = 0x24;
+    const VK_F5: u32 = 0x74;
+    const VK_F7: u32 = 0x76;
+    const VK_F12: u32 = 0x7B;
+    // VK_BROWSER_BACK ..= VK_BROWSER_HOME
+    if (0xA6..=0xAC).contains(&vk) {
+        return true;
+    }
+    if matches!(vk, VK_F5 | VK_F7 | VK_F12) {
+        return true;
+    }
+    if alt && !ctrl {
+        // 戻る・進む・ホーム。Alt+F4 などは通す（ウィンドウの操作）。
+        return matches!(vk, VK_LEFT | VK_RIGHT | VK_HOME);
+    }
+    if ctrl {
+        const ALLOW: &[u32] = &[
+            b'F' as u32, // 検索
+            b'G' as u32, // 次を検索（Shift で前）
+            b'C' as u32, // コピー
+            b'A' as u32, // 全選択
+            0x2D,        // Insert（Ctrl+Insert のコピー）
+            0x21,        // PageUp
+            0x22,        // PageDown
+            0x23,        // End
+            VK_HOME,
+            VK_LEFT,
+            0x26, // Up
+            VK_RIGHT,
+            0x28, // Down
+            0x10, // Shift
+            0x11, // Ctrl
+            0x12, // Alt
+        ];
+        return !ALLOW.contains(&vk);
+    }
+    false
+}
+
 /// ランタイムがないとき（または初期化に失敗したとき）にペインへ表示する案内。
 pub fn guidance_text(reason: &str) -> String {
     format!(
@@ -163,6 +247,40 @@ mod tests {
     use super::*;
 
     const SRC: &str = "data:text/html;charset=utf-8,%3Chtml%3E";
+
+    #[test]
+    fn patch_script_passes_document_only_as_string_literal() {
+        let html = "<p>a</p>'); alert(1); ('\u{2028}</script>";
+        let s = patch_script(html).unwrap();
+        // 文書は JSON 文字列として最後の引数に 1 つだけ入る。
+        let literal = serde_json::to_string(html).unwrap();
+        assert!(s.ends_with(&format!("({literal})")));
+        assert_eq!(s.matches(&literal).count(), 1);
+        assert!(patch_succeeded("\"ok\""));
+        assert!(!patch_succeeded("\"no\""));
+        assert!(!patch_succeeded("null"));
+    }
+
+    #[test]
+    fn browser_keys_except_find_and_copy_are_blocked() {
+        // 検索・コピー・全選択・移動は通す。
+        for vk in *b"FGCA" {
+            assert!(!blocks_browser_key(vk as u32, true, false));
+        }
+        assert!(!blocks_browser_key(0x72, false, false)); // F3
+        assert!(!blocks_browser_key(0x1B, false, false)); // Esc
+        assert!(!blocks_browser_key(0x28, false, false)); // Down
+        assert!(!blocks_browser_key(0x73, false, true)); // Alt+F4
+
+        // 再読み込み・印刷・保存・ソース・開発者ツール・戻るは止める。
+        for vk in *b"RPSUIJ" {
+            assert!(blocks_browser_key(vk as u32, true, false));
+        }
+        assert!(blocks_browser_key(0x74, false, false)); // F5
+        assert!(blocks_browser_key(0x7B, false, false)); // F12
+        assert!(blocks_browser_key(0x25, false, true)); // Alt+Left
+        assert!(blocks_browser_key(0xA6, false, false)); // BrowserBack
+    }
 
     #[test]
     fn our_navigation_is_allowed_once_flagged() {
@@ -289,6 +407,15 @@ mod tests {
         ] {
             assert_eq!(parse_scroll_result(bad), None, "{bad}");
         }
+    }
+
+    #[test]
+    fn scroll_to_line_script_only_interpolates_the_number() {
+        let a = scroll_to_line_script(7);
+        let b = scroll_to_line_script(123456);
+        assert!(a.ends_with("})(7)"));
+        assert_eq!(a.replace("(7)", "(123456)"), b);
+        assert!(!a.contains("http"));
     }
 
     #[test]

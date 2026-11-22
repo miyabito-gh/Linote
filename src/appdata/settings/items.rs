@@ -10,8 +10,9 @@
 use crate::text::Eol;
 
 use super::{
-    new_file_encoding_name, parse_new_file_encoding, ExternalChangeMode, Settings, ThemeMode,
-    WrapMode, FONT_SIZE_MAX, FONT_SIZE_MIN, WRAP_COLUMN_MAX, WRAP_COLUMN_MIN,
+    new_file_encoding_name, parse_new_file_encoding, ExternalChangeMode, PreviewWidth, Settings,
+    ThemeMode, WrapMode, FONT_SIZE_MAX, FONT_SIZE_MIN, PREVIEW_DELAYS_MS, PREVIEW_FONT_SIZE_MAX,
+    PREVIEW_FONT_SIZE_MIN, WRAP_COLUMN_MAX, WRAP_COLUMN_MIN,
 };
 
 /// 選択肢 1 つ（設定ファイルでの値と、画面の表示）。
@@ -154,7 +155,7 @@ const EXTERNAL_CHANGE_CHOICES: &[Choice] = &[
     },
     Choice {
         value: "reload_if_clean",
-        label: "未保存の変更がなければ自動で読み直す",
+        label: "未保存の変更がなければ自動で反映",
     },
 ];
 
@@ -441,6 +442,123 @@ static VIEW_ITEMS: &[Item] = &[
     check_item!("view.auto_indent", "自動インデント", view.auto_indent),
 ];
 
+const PREVIEW_WIDTH_CHOICES: &[Choice] = &[
+    Choice {
+        value: "standard",
+        label: "標準（読みやすい幅）",
+    },
+    Choice {
+        value: "full",
+        label: "ウィンドウ幅いっぱい",
+    },
+];
+
+/// 更新までの待ち時間の選択肢（[`PREVIEW_DELAYS_MS`] と同じ順）。
+const PREVIEW_DELAY_CHOICES: &[Choice] = &[
+    Choice {
+        value: "100",
+        label: "0.1 秒",
+    },
+    Choice {
+        value: "250",
+        label: "0.25 秒",
+    },
+    Choice {
+        value: "500",
+        label: "0.5 秒",
+    },
+    Choice {
+        value: "1000",
+        label: "1 秒",
+    },
+];
+
+static PREVIEW_ITEMS: &[Item] = &[
+    check_item!(
+        "preview.line_breaks",
+        "改行をそのまま改行として表示（行末の空白 2 つが不要）",
+        preview.line_breaks
+    ),
+    Item {
+        id: "preview.body_font",
+        label: "本文のフォント",
+        kind: ItemKind::Font,
+        get: |s| ItemValue::Font(s.preview.body_font.clone(), s.preview.font_size),
+        set: |s, v| {
+            if let ItemValue::Font(name, size) = v {
+                s.preview.body_font = name.clone();
+                s.preview.font_size = (*size).clamp(PREVIEW_FONT_SIZE_MIN, PREVIEW_FONT_SIZE_MAX);
+            }
+        },
+    },
+    // 書体の項目の後に置く（数値欄の編集中の値を優先する）。
+    Item {
+        id: "preview.font_size",
+        label: "文字サイズ（pt）",
+        kind: ItemKind::Number {
+            min: PREVIEW_FONT_SIZE_MIN as i64,
+            max: PREVIEW_FONT_SIZE_MAX as i64,
+        },
+        get: |s| ItemValue::Number(i64::from(s.preview.font_size)),
+        set: |s, v| {
+            if let ItemValue::Number(n) = v {
+                s.preview.font_size =
+                    (*n).clamp(PREVIEW_FONT_SIZE_MIN as i64, PREVIEW_FONT_SIZE_MAX as i64) as u32;
+            }
+        },
+    },
+    Item {
+        id: "preview.code_font",
+        label: "コードのフォント（大きさは本文に合わせる）",
+        kind: ItemKind::Font,
+        get: |s| ItemValue::Font(s.preview.code_font.clone(), s.preview.font_size),
+        set: |s, v| {
+            // 大きさは本文に合わせるので、選んだ大きさは使わない。
+            if let ItemValue::Font(name, _) = v {
+                s.preview.code_font = name.clone();
+            }
+        },
+    },
+    Item {
+        id: "preview.width",
+        label: "本文の幅",
+        kind: ItemKind::Choice(PREVIEW_WIDTH_CHOICES),
+        get: |s| ItemValue::Text(s.preview.width.name().to_owned()),
+        set: |s, v| {
+            if let Some(w) = text(v).and_then(PreviewWidth::from_name) {
+                s.preview.width = w;
+            }
+        },
+    },
+    Item {
+        id: "preview.delay_ms",
+        label: "更新までの待ち時間",
+        kind: ItemKind::Choice(PREVIEW_DELAY_CHOICES),
+        get: |s| {
+            // 設定ファイルの任意の値は、近い選択肢として見せる。
+            let nearest = PREVIEW_DELAYS_MS
+                .iter()
+                .min_by_key(|d| d.abs_diff(s.preview.delay_ms))
+                .copied()
+                .unwrap_or(250);
+            ItemValue::Text(nearest.to_string())
+        },
+        set: |s, v| {
+            if let Some(n) = text(v).and_then(|t| t.parse::<u32>().ok()) {
+                if PREVIEW_DELAYS_MS.contains(&n) {
+                    s.preview.delay_ms = n;
+                }
+            }
+        },
+    },
+    check_item!("preview.toc", "見出しの目次を先頭に表示", preview.toc),
+    check_item!(
+        "preview.follow_cursor",
+        "編集位置に合わせてスクロール",
+        preview.follow_cursor
+    ),
+];
+
 /// 設定画面のページ。左の一覧はこの順に並ぶ。ページや項目を足すにはここに書き足す。
 static PAGES: &[Page] = &[
     Page {
@@ -460,6 +578,12 @@ static PAGES: &[Page] = &[
         title: "表示",
         kind: PageKind::Items,
         items: VIEW_ITEMS,
+    },
+    Page {
+        id: "preview",
+        title: "プレビュー",
+        kind: PageKind::Items,
+        items: PREVIEW_ITEMS,
     },
     Page {
         id: "keys",

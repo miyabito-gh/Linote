@@ -103,6 +103,8 @@ pub struct PreviewStyle {
     pub code_fonts: Vec<String>,
     /// 本文の文字の大きさ（CSS ピクセル）。
     pub font_size_px: f32,
+    /// 本文の幅をウィンドウ幅いっぱいにする（false は読みやすい幅）。
+    pub full_width: bool,
 }
 
 impl Default for PreviewStyle {
@@ -112,6 +114,7 @@ impl Default for PreviewStyle {
             body_fonts: Vec::new(),
             code_fonts: Vec::new(),
             font_size_px: 15.0,
+            full_width: false,
         }
     }
 }
@@ -184,6 +187,7 @@ fn build_css(style: &PreviewStyle) -> String {
     let body_font = font_family(&style.body_fonts, "sans-serif", DEFAULT_BODY_FONTS);
     let code_font = font_family(&style.code_fonts, "monospace", DEFAULT_CODE_FONTS);
     let scheme = if p.dark { "dark" } else { "light" };
+    let max_width = if style.full_width { "none" } else { "52em" };
     format!(
         r#":root {{
   color-scheme: {scheme};
@@ -198,7 +202,7 @@ body {{
   overflow-wrap: anywhere; word-break: normal;
   -webkit-text-size-adjust: 100%;
 }}
-.markdown-body {{ max-width: 52em; margin: 0 auto; }}
+.markdown-body {{ max-width: {max_width}; margin: 0 auto; }}
 .markdown-body > :first-child {{ margin-top: 0; }}
 p, ul, ol, dl, table, pre, blockquote, .footnote-definition {{ margin: 0 0 1em; }}
 h1, h2, h3, h4, h5, h6 {{ margin: 1.6em 0 0.6em; line-height: 1.3; font-weight: 600; }}
@@ -237,6 +241,18 @@ sup.footnote-reference {{ font-size: 0.75em; }}
 .footnote-definition {{ font-size: 0.9em; color: var(--muted); }}
 .footnote-definition > p {{ display: inline; }}
 .footnote-definition-label {{ margin-right: 0.4em; }}
+.toc {{ margin: 0 0 1.6em; padding: 0.6em 1em; border: 1px solid var(--border); border-radius: 6px; font-size: 0.9em; line-height: 1.6; }}
+.toc ul {{ margin: 0; padding: 0; list-style: none; }}
+.toc li {{ margin: 0; color: var(--muted); }}
+.toc li + li {{ margin-top: 0; }}
+.toc a {{ color: var(--muted); }}
+.toc a:hover {{ color: var(--link); }}
+.toc-l2 {{ padding-left: 1.2em; }}
+.toc-l3 {{ padding-left: 2.4em; }}
+.toc-l4 {{ padding-left: 3.6em; }}
+.toc-l5 {{ padding-left: 4.8em; }}
+.toc-l6 {{ padding-left: 6em; }}
+.src-line {{ display: block; height: 0; margin: 0; padding: 0; }}
 ::selection {{ background: color-mix(in srgb, var(--link) 35%, transparent); }}
 "#,
         bg = p.background.to_css(),
@@ -246,6 +262,7 @@ sup.footnote-reference {{ font-size: 0.75em; }}
         surface = p.surface.to_css(),
         link = p.link.to_css(),
         accent = p.accent.to_css(),
+        max_width = max_width,
     )
 }
 
@@ -322,6 +339,19 @@ mod tests {
         assert!(css.contains("font-family: \"游ゴシック\", \"x  body  background urlhttpsevil  stylescript\", sans-serif;"), "{css}");
         assert!(css.contains("\"Cascadia Code\", monospace"));
         assert!(!css.contains("</style>") && !css.contains("url("));
+    }
+
+    #[test]
+    fn full_width_and_font_size_reach_the_css() {
+        assert!(Stylesheet::default().css().contains("max-width: 52em;"));
+        let style = PreviewStyle {
+            full_width: true,
+            font_size_px: 24.0,
+            ..PreviewStyle::default()
+        };
+        let css = Stylesheet::new(&style).css().to_owned();
+        assert!(css.contains("max-width: none;"));
+        assert!(css.contains("font-size: 24px;"));
     }
 
     #[test]

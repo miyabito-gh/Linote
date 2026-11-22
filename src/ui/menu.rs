@@ -199,8 +199,10 @@ static MENUS: &[MenuDef] = &[
             Item::Cmd(CommandId::new("file.save_as")),
             Item::Cmd(CommandId::new("file.save_as_memo")),
             Item::Cmd(CommandId::new("file.save_all")),
+            Item::Cmd(CommandId::new("file.retry_save")),
             Item::Separator,
             Item::Cmd(CommandId::new("file.reload")),
+            Item::Cmd(CommandId::new("file.open_saved_copy")),
             Item::Sub(
                 "文字コードを指定して開き直す(&E)",
                 &[
@@ -305,6 +307,9 @@ static MENUS: &[MenuDef] = &[
             Item::Cmd(CommandId::new("file.close_others")),
             Item::Cmd(CommandId::new("file.close_all")),
             Item::Cmd(CommandId::new("file.reopen_closed")),
+            Item::Separator,
+            Item::Cmd(CommandId::new("file.restore_documents")),
+            Item::Cmd(CommandId::new("file.retry_recovery")),
             Item::Separator,
             Item::Cmd(CommandId::new("app.settings")),
             Item::Separator,
@@ -472,6 +477,8 @@ static MENUS: &[MenuDef] = &[
                 ],
             ),
             Item::Separator,
+            Item::Cmd(CommandId::new("view.tab_list")),
+            Item::Separator,
             Item::Cmd(CommandId::new("view.preview_pane")),
             Item::Cmd(CommandId::new("view.preview_window")),
         ],
@@ -481,6 +488,7 @@ static MENUS: &[MenuDef] = &[
         items: &[
             Item::Cmd(CommandId::new("memo.open_panel")),
             Item::Cmd(CommandId::new("memo.rename")),
+            Item::Cmd(CommandId::new("memo.open_original")),
             Item::Separator,
             Item::Cmd(CommandId::new("clipboard.new_tab")),
         ],

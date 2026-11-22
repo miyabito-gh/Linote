@@ -55,11 +55,12 @@ fn keys_and_menu() -> Check {
         let key = |s: &str| app.keymap().command_for(&KeyChord::parse(s).unwrap());
         for (chord, command) in [
             ("Ctrl+F", "search.find"),
-            ("Ctrl+H", "search.replace"),
             ("F3", "search.find_next"),
             ("Shift+F3", "search.find_prev"),
             ("Ctrl+Shift+F", "search.grep"),
-            ("Ctrl+Shift+P", "view.preview_pane"),
+            ("Ctrl+R", "search.replace"),
+            ("Ctrl+Shift+V", "view.preview_pane"),
+            ("Ctrl+Shift+H", "view.preview_window"),
         ] {
             check!(key(chord) == Some(CommandId::new(command)), "{chord}");
         }

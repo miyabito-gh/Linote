@@ -14,6 +14,7 @@
 //! 属性の値（リンクの `title`、言語名、脚注名）はそこでエスケープされる。
 
 use std::fmt::Write as _;
+use std::ops::Range;
 
 use pulldown_cmark::{html, CodeBlockKind, CowStr, Event, LinkType, Options, Parser, Tag, TagEnd};
 
@@ -37,12 +38,35 @@ fn options() -> Options {
         | Options::ENABLE_GFM
 }
 
-/// Markdown を HTML 断片（`<body>` の中身）に変換する。
+/// 変換の選択（設定の `preview` から作る）。既定は CommonMark どおり。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RenderOptions {
+    /// 段落の中の改行をそのまま改行（`<br>`）にする。オフなら CommonMark どおり
+    /// 空白につなげる（改行にするには行末に空白 2 つか `\`）。
+    pub line_breaks: bool,
+    /// 見出しに `id`（`h-1`, `h-2`…）を付け、先頭に見出しの目次（`<nav class="toc">`）を置く。
+    pub toc: bool,
+    /// 最上位のブロックの前に、元の行番号の目印（`<span class="src-line" data-line="N">`）を
+    /// 置く（編集位置に合わせたスクロール用。N は 0 始まり）。
+    pub source_lines: bool,
+}
+
+/// Markdown を HTML 断片（`<body>` の中身）に変換する（既定の選択）。
 ///
 /// - 入力が上限（`limits.max_bytes`、なければ [`DEFAULT_MAX_INPUT_BYTES`]）を超えたら
 ///   [`Error::LimitExceeded`]。
 /// - `cancel` が合図されたら [`Error::Cancelled`]。
 pub fn render_body(markdown: &str, cancel: &CancelToken, limits: Limits) -> Result<String> {
+    render_body_with(markdown, cancel, limits, RenderOptions::default())
+}
+
+/// [`render_body`] の選択つき。
+pub fn render_body_with(
+    markdown: &str,
+    cancel: &CancelToken,
+    limits: Limits,
+    render_options: RenderOptions,
+) -> Result<String> {
     let limit = limits.max_bytes.unwrap_or(DEFAULT_MAX_INPUT_BYTES);
     if markdown.len() as u64 > limit {
         return Err(Error::LimitExceeded {
@@ -51,16 +75,46 @@ pub fn render_body(markdown: &str, cancel: &CancelToken, limits: Limits) -> Resu
         });
     }
     cancel.check()?;
-    let parser = Parser::new_ext(markdown, options());
+    let parser = Parser::new_ext(markdown, options()).into_offset_iter();
     cancel.check()?;
     let mut events = SafeEvents::new(parser, cancel);
+    events.line_breaks = render_options.line_breaks;
+    events.collect_toc = render_options.toc;
+    if render_options.source_lines {
+        // 行番号は、改行（LF）の位置から二分探索で引く。
+        events.newlines = Some(
+            markdown
+                .bytes()
+                .enumerate()
+                .filter_map(|(i, b)| (b == 0x0a).then_some(i))
+                .collect(),
+        );
+    }
     // 出力はおおむね入力より少し大きい。
     let mut out = String::with_capacity(markdown.len() + markdown.len() / 2 + 64);
     html::push_html(&mut out, &mut events);
     if events.cancelled {
         return Err(Error::Cancelled);
     }
+    if render_options.toc && !events.toc.is_empty() {
+        out.insert_str(0, &toc_html(&events.toc));
+    }
     Ok(out)
+}
+
+/// 見出しの目次の HTML。項目は（レベル, 文字）で、リンク先は見出しの `h-N`（N は 1 から）。
+fn toc_html(headings: &[(u8, usize, String)]) -> String {
+    let mut s = String::from("<nav class=\"toc\"><ul>");
+    for (level, n, text) in headings {
+        let _ = write!(s, "<li class=\"toc-l{level}\"><a href=\"#h-{n}\">");
+        escape_attr(&mut s, text);
+        s.push_str("</a></li>");
+    }
+    s.push_str(
+        "</ul></nav>
+",
+    );
+    s
 }
 
 /// 画像を閉じるときに出す終わりのタグ。
@@ -82,9 +136,23 @@ struct SafeEvents<'a, 'c, I> {
     links: Vec<bool>,
     /// 開いている画像ごとの閉じ方。
     images: Vec<ImageClose>,
+    /// 段落の中の改行を `<br>` にする（[`RenderOptions::line_breaks`]）。
+    line_breaks: bool,
+    /// 見出しを集めて `id` を付ける（[`RenderOptions::toc`]）。
+    collect_toc: bool,
+    /// 集めた見出し（レベル, 番号, 文字）。
+    toc: Vec<(u8, usize, String)>,
+    /// 集めている最中の見出し（レベル, 番号, 文字）。
+    heading: Option<(u8, usize, String)>,
+    /// 見出しに振った番号（`h-N` の N）。
+    heading_seq: usize,
+    /// 行番号の目印を出すときの、LF の位置の表（[`RenderOptions::source_lines`]）。
+    newlines: Option<Vec<usize>>,
+    /// 入れ子の深さ（最上位のブロックの前かどうかの判定）。
+    depth: usize,
 }
 
-impl<'a, 'c, I: Iterator<Item = Event<'a>>> SafeEvents<'a, 'c, I> {
+impl<'a, 'c, I: Iterator<Item = (Event<'a>, Range<usize>)>> SafeEvents<'a, 'c, I> {
     fn new(inner: I, cancel: &'c CancelToken) -> Self {
         Self {
             inner,
@@ -94,6 +162,13 @@ impl<'a, 'c, I: Iterator<Item = Event<'a>>> SafeEvents<'a, 'c, I> {
             queue: Vec::new(),
             links: Vec::new(),
             images: Vec::new(),
+            line_breaks: false,
+            collect_toc: false,
+            toc: Vec::new(),
+            heading: None,
+            heading_seq: 0,
+            newlines: None,
+            depth: 0,
         }
     }
 
@@ -108,6 +183,7 @@ impl<'a, 'c, I: Iterator<Item = Event<'a>>> SafeEvents<'a, 'c, I> {
 
     fn transform(&mut self, event: Event<'a>) -> Event<'a> {
         match event {
+            Event::SoftBreak if self.line_breaks => Event::HardBreak,
             // 生の HTML は文字として出す。
             Event::Html(text) | Event::InlineHtml(text) => Event::Text(text),
             Event::Start(Tag::HtmlBlock) => markup("<pre class=\"raw-html\"><code>"),
@@ -178,13 +254,31 @@ impl<'a, 'c, I: Iterator<Item = Event<'a>>> SafeEvents<'a, 'c, I> {
                 _ => markup("</span>"),
             },
 
-            // 見出しの属性は有効にしていないが、届いても捨てる。
-            Event::Start(Tag::Heading { level, .. }) => Event::Start(Tag::Heading {
-                level,
-                id: None,
-                classes: Vec::new(),
-                attrs: Vec::new(),
-            }),
+            // 見出しの属性は有効にしていないが、届いても捨てる。目次では `h-N` を付ける。
+            Event::Start(Tag::Heading { level, .. }) => {
+                let id = if self.collect_toc {
+                    self.heading_seq += 1;
+                    self.heading = Some((level as u8, self.heading_seq, String::new()));
+                    Some(CowStr::from(format!("h-{}", self.heading_seq)))
+                } else {
+                    None
+                };
+                Event::Start(Tag::Heading {
+                    level,
+                    id,
+                    classes: Vec::new(),
+                    attrs: Vec::new(),
+                })
+            }
+            Event::End(TagEnd::Heading(level)) => {
+                if let Some((lv, n, text)) = self.heading.take() {
+                    let text = text.trim().to_owned();
+                    if !text.is_empty() {
+                        self.toc.push((lv, n, text));
+                    }
+                }
+                Event::End(TagEnd::Heading(level))
+            }
             // コードブロックの言語名は `class` に入る（エスケープされる）。
             // 空白以降（`rust,ignore` の後の情報など）は捨てる。
             Event::Start(Tag::CodeBlock(CodeBlockKind::Fenced(info))) => {
@@ -205,7 +299,7 @@ impl<'a, 'c, I: Iterator<Item = Event<'a>>> SafeEvents<'a, 'c, I> {
     }
 }
 
-impl<'a, I: Iterator<Item = Event<'a>>> Iterator for SafeEvents<'a, '_, I> {
+impl<'a, I: Iterator<Item = (Event<'a>, Range<usize>)>> Iterator for SafeEvents<'a, '_, I> {
     type Item = Event<'a>;
 
     fn next(&mut self) -> Option<Event<'a>> {
@@ -223,8 +317,37 @@ impl<'a, I: Iterator<Item = Event<'a>>> Iterator for SafeEvents<'a, '_, I> {
                 return None;
             }
         }
-        let event = self.inner.next()?;
-        Some(self.transform(event))
+        let (event, range) = self.inner.next()?;
+        // 最上位のブロックの前に、行番号の目印を置く。
+        let marker = match (&self.newlines, self.depth, &event) {
+            (Some(newlines), 0, Event::Start(_) | Event::Rule) => {
+                let line = newlines.partition_point(|&p| p < range.start);
+                Some(format!(
+                    "<span class=\"src-line\" data-line=\"{line}\"></span>"
+                ))
+            }
+            _ => None,
+        };
+        match &event {
+            Event::Start(_) => self.depth += 1,
+            Event::End(_) => self.depth = self.depth.saturating_sub(1),
+            _ => {}
+        }
+        let out = self.transform(event);
+        if let Some((_, _, text)) = self.heading.as_mut() {
+            match &out {
+                Event::Text(t) | Event::Code(t) => text.push_str(t),
+                Event::SoftBreak | Event::HardBreak => text.push(' '),
+                _ => {}
+            }
+        }
+        match marker {
+            Some(m) => {
+                self.queue.push(out);
+                Some(markup_owned(m))
+            }
+            None => Some(out),
+        }
     }
 }
 
@@ -263,6 +386,94 @@ mod tests {
 
     fn render(md: &str) -> String {
         render_body(md, &CancelToken::new(), Limits::UNLIMITED).unwrap()
+    }
+
+    #[test]
+    fn line_breaks_option_turns_soft_breaks_into_br() {
+        let md = "一行目\n二行目\n\n```\na\nb\n```\n";
+        // 既定は CommonMark どおり（改行は空白につながる）。
+        let plain = render(md);
+        assert!(plain.contains("<p>一行目\n二行目</p>"), "{plain}");
+        let opts = RenderOptions {
+            line_breaks: true,
+            ..RenderOptions::default()
+        };
+        let html = render_body_with(md, &CancelToken::new(), Limits::UNLIMITED, opts).unwrap();
+        assert!(html.contains("<p>一行目<br />\n二行目</p>"), "{html}");
+        // コードブロックの中は変えない。
+        assert!(html.contains("<code>a\nb\n</code>"), "{html}");
+    }
+
+    fn render_with(md: &str, opts: RenderOptions) -> String {
+        render_body_with(md, &CancelToken::new(), Limits::UNLIMITED, opts).unwrap()
+    }
+
+    #[test]
+    fn toc_adds_ids_and_escapes_heading_text() {
+        let md = "# A <b> & `c`
+
+text
+
+## 二つ目
+
+###
+";
+        let opts = RenderOptions {
+            toc: true,
+            ..RenderOptions::default()
+        };
+        let html = render_with(md, opts);
+        assert!(html.starts_with("<nav class=\"toc\"><ul>"), "{html}");
+        assert!(html.contains("<h1 id=\"h-1\">"), "{html}");
+        assert!(html.contains("<h2 id=\"h-2\">"), "{html}");
+        assert!(
+            html.contains("<li class=\"toc-l1\"><a href=\"#h-1\">A &lt;b&gt; &amp; c</a></li>"),
+            "{html}"
+        );
+        assert!(html.contains("<li class=\"toc-l2\"><a href=\"#h-2\">二つ目</a>"));
+        // 空の見出しは目次に載せない。
+        assert_eq!(html.matches("<li ").count(), 2, "{html}");
+        // 見出しがなければ目次も出さない。目次をオフなら id も付けない。
+        assert!(!render_with(
+            "text
+", opts
+        )
+        .contains("toc"));
+        assert!(!render(md).contains("id=\"h-"));
+    }
+
+    #[test]
+    fn source_line_markers_only_before_top_level_blocks() {
+        let md = "# T
+
+para
+more
+
+- a
+- b
+
+> q
+
+```
+code
+```
+
+---
+";
+        let opts = RenderOptions {
+            source_lines: true,
+            ..RenderOptions::default()
+        };
+        let html = render_with(md, opts);
+        let lines: Vec<&str> = html
+            .split("data-line=\"")
+            .skip(1)
+            .map(|r| r.split('"').next().unwrap())
+            .collect();
+        assert_eq!(lines, ["0", "2", "5", "8", "10", "14"], "{html}");
+        assert!(html.starts_with("<span class=\"src-line\" data-line=\"0\"></span>"));
+        assert!(html.contains("</span>\n<h1>T</h1>"), "{html}");
+        assert!(!render(md).contains("src-line"));
     }
 
     #[test]
@@ -467,7 +678,7 @@ mod tests {
         // 変換の途中で中止される場合（反復子の中での確認）。
         let md = "- item\n".repeat(10_000);
         let token = CancelToken::new();
-        let parser = Parser::new_ext(&md, options());
+        let parser = Parser::new_ext(&md, options()).into_offset_iter();
         let mut events = SafeEvents::new(parser, &token);
         for _ in 0..10 {
             events.next();

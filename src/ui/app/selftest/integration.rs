@@ -258,11 +258,14 @@ fn unmappable_and_external_change(ctx: &Ctx) -> Check {
         "? に置き換えた内容"
     );
 
-    // 外部で書き換えられると、上書きせず、別名保存を案内する。
+    // 外部で書き換えられた内容は、編集中のタブを保ったまま別タブで確認できる。
     std::fs::write(&path, b"changed outside, longer than before").map_err(|e| e.to_string())?;
     let outside = std::fs::read(&path).map_err(|e| e.to_string())?;
     step(|app| app.with_text(id, |ed| ed.set_text("編集した内容\r\n")))?.map_err(super::e2s)?;
-    ctx.prompts.confirm.borrow_mut().push_back(false);
+    ctx.prompts
+        .save_conflict
+        .borrow_mut()
+        .push_back(crate::ui::dialogs::SaveConflictChoice::OpenSavedCopy);
     cmd("file.save", Value::Null)?;
     check!(
         step(|app| app.state(id).unwrap().has_external_change())?,
@@ -272,10 +275,54 @@ fn unmappable_and_external_change(ctx: &Ctx) -> Check {
         std::fs::read(&path).map_err(|e| e.to_string())? == outside,
         "外部変更を上書きした"
     );
-    // 上書き保存はできず、別名では保存できる。
+    wait("外部変更の確認タブ", |app| {
+        app.active_id()
+            .and_then(|active| app.state(active))
+            .is_some_and(|s| matches!(s.kind(), DocumentKind::SavedCopy(source) if *source == id))
+    })?;
+    step(|app| -> Check {
+        let copy = app.active_id().unwrap();
+        let state = app.state(copy).unwrap();
+        check!(
+            state.is_read_only() && !state.is_dirty(),
+            "確認タブが変更可能"
+        );
+        check!(state.path().is_none(), "確認タブが元ファイルを所有");
+        check!(
+            !state
+                .capabilities()
+                .contains(crate::document::Capability::SaveAs),
+            "確認タブが保存可能"
+        );
+        check!(
+            text_of(app, copy) == "changed outside, longer than before",
+            "確認タブの本文"
+        );
+        check!(
+            app.state(id).unwrap().is_dirty() && text_of(app, id) == "編集した内容\r\n",
+            "編集していた内容が変わった"
+        );
+        app.close_document(copy, false).map_err(super::e2s)?;
+        app.activate(id).map_err(super::e2s)
+    })??;
+
+    // 元の名前での保存は拒否される。案内を残し、保存先を選び直せる。
+    ctx.prompts
+        .save_conflict
+        .borrow_mut()
+        .push_back(crate::ui::dialogs::SaveConflictChoice::SaveAs);
+    ctx.prompts.save.borrow_mut().push_back(Some(path.clone()));
+    cmd("file.save", Value::Null)?;
+    wait("元ファイルへの別名保存を拒否", |app| {
+        app.can_retry_failed_save()
+    })?;
+    check!(
+        std::fs::read(&path).map_err(|e| e.to_string())? == outside,
+        "別名保存で元のファイルを上書きした"
+    );
     let other = ctx.dir.join("other.txt");
     ctx.prompts.save.borrow_mut().push_back(Some(other.clone()));
-    cmd("file.save_as", Value::Null)?;
+    cmd("file.retry_save", Value::Null)?;
     wait("別名で保存", |app| {
         app.state(id)
             .is_some_and(|s| s.path() == Some(other.as_path()) && !s.is_dirty())
@@ -293,6 +340,10 @@ fn unmappable_and_external_change(ctx: &Ctx) -> Check {
     check!(
         !step(|app| app.state(id).unwrap().has_external_change())?,
         "別名保存で外部変更が解消する"
+    );
+    check!(
+        !step(|app| app.can_retry_failed_save())?,
+        "保存後に失敗の案内が残った"
     );
     check!(
         std::fs::read(&path).map_err(|e| e.to_string())? == outside,
@@ -521,17 +572,28 @@ fn recovery(ctx: &Ctx) -> Check {
         Ok(())
     };
     make_orphan("孤児", "復元された\r\n本文")?;
+    let prompts_before_scan = ctx.prompts.shown.borrow().len();
+    step(|app| app.start_recovery_scan())?;
+    wait("起動時の復元候補の通知", |app| {
+        app.has_recovery_candidates()
+    })?;
+    check!(
+        ctx.prompts.shown.borrow().len() == prompts_before_scan,
+        "起動時の復元の確認が出た"
+    );
     let report = store.scan().map_err(|e| e.to_string())?;
     check!(
         report.candidates.len() == 1,
         "候補の数 {}",
         report.candidates.len()
     );
+    drop(report);
     ctx.prompts
         .restore
         .borrow_mut()
         .push_back(RestoreChoice::Restore);
-    step(|app| app.offer_restore(report))?;
+    step(|app| app.open_recovery_candidates())?;
+    wait("孤児の復元", |app| find_title(app, "孤児").is_some())?;
     let restored = step(|app| find_title(app, "孤児"))?.ok_or("復元された文書がない")?;
     step(|app| -> Check {
         let d = app.document(restored).unwrap();
@@ -553,19 +615,25 @@ fn recovery(ctx: &Ctx) -> Check {
 
     // 断ると破棄される。「あとで」なら残る。
     make_orphan("破棄する", "不要")?;
-    let report = store.scan().map_err(|e| e.to_string())?;
     ctx.prompts
         .restore
         .borrow_mut()
         .push_back(RestoreChoice::Later);
-    step(|app| app.offer_restore(report))?;
+    step(|app| app.open_recovery_candidates())?;
+    wait("復元候補をあとで開く", |app| {
+        app.can_open_recovery_candidates()
+    })?;
     let report = store.scan().map_err(|e| e.to_string())?;
     check!(report.candidates.len() == 1, "あとでなら残る");
+    drop(report);
     ctx.prompts
         .restore
         .borrow_mut()
         .push_back(RestoreChoice::Discard);
-    step(|app| app.offer_restore(report))?;
+    step(|app| app.open_recovery_candidates())?;
+    wait("復元候補の破棄", |app| {
+        app.can_open_recovery_candidates()
+    })?;
     let report = store.scan().map_err(|e| e.to_string())?;
     check!(report.candidates.is_empty(), "破棄したのに残っている");
     check!(
@@ -649,6 +717,54 @@ fn memos(ctx: &Ctx) -> Check {
         store.load(&memo.id).map_err(|e| e.to_string())?.body == "closing body",
         "閉じる前に保存される"
     );
+    // 外で更新されたあとに保存すると、元の内容と自分の編集をそれぞれ残す。
+    let current = store.load(&memo.id).map_err(super::e2s)?;
+    let id = step(|app| app.open_memo(current.clone()))?.map_err(super::e2s)?;
+    store
+        .save_or_fork(&current.id, current.version, "external edit")
+        .map_err(super::e2s)?;
+    step(|app| app.with_text(id, |ed| ed.set_text("local edit")))?.map_err(super::e2s)?;
+    cmd("file.save", Value::Null)?;
+    let fork = step(|app| {
+        let tab = app.document(id).unwrap().memo.as_ref().unwrap();
+        tab.id().clone()
+    })?;
+    check!(fork != current.id, "競合時の保存先が別のメモになる");
+    let saved = store.load(&fork).map_err(super::e2s)?;
+    check!(
+        saved.body == "local edit",
+        "編集中の内容を別のメモに保存する"
+    );
+    step(|app| -> Check {
+        check!(
+            app.document(id).unwrap().title == saved.name,
+            "保存先をタブ名に表示する"
+        );
+        check!(
+            app.persistent_memo_status()
+                .is_some_and(|(s, _)| s.contains(saved.name.as_str())),
+            "競合を保存先の名前で知らせる"
+        );
+        Ok(())
+    })??;
+    cmd("memo.open_original", Value::Null)?;
+    wait("競合前のメモを開く", |app| {
+        app.active_id()
+            .and_then(|active| app.document(active))
+            .and_then(|doc| doc.memo.as_ref())
+            .is_some_and(|tab| tab.id() == &current.id)
+    })?;
+    let original = step(|app| app.active_id().unwrap())?;
+    check!(
+        step(|app| text_of(app, original))? == "external edit",
+        "元の内容が残る"
+    );
+    check!(
+        step(|app| text_of(app, id))? == "local edit",
+        "編集中の内容が残る"
+    );
+    step(|app| app.close_document(original, false))?.map_err(super::e2s)?;
+    step(|app| app.close_document(id, false))?.map_err(super::e2s)?;
     // 小窓は初めて開くときに作り、もう一度で閉じる。
     cmd("memo.open_panel", Value::Null)?;
     check!(step(|app| app.memo_panel_visible())?, "小窓が開く");
@@ -846,12 +962,16 @@ fn lossy_recovery_and_failed_save(ctx: &Ctx) -> Check {
         .map_err(|_| "復元枠が使用中")?
         .release_keeping_data();
     step(|app| app.close_document(id, true))?.map_err(super::e2s)?;
-    let report = store.scan().map_err(|e| e.to_string())?;
     ctx.prompts
         .restore
         .borrow_mut()
         .push_back(RestoreChoice::Restore);
-    step(|app| app.offer_restore(report))?;
+    step(|app| app.open_recovery_candidates())?;
+    wait("不正バイト文書の復元", |app| {
+        app.docs
+            .iter()
+            .any(|d| d.state.path() == Some(source.as_path()))
+    })?;
     let restored = step(|app| {
         app.docs
             .iter()

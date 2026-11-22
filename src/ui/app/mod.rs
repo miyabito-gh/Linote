@@ -43,6 +43,7 @@ pub mod selftest;
 mod session;
 mod settingsops;
 mod tabextras;
+mod tablist;
 mod tabops;
 mod tabwheel;
 mod viewopts;
@@ -311,6 +312,9 @@ pub struct App {
     active: Option<usize>,
     tabs: TabBar,
     status: StatusBar,
+    status_temporary: bool,
+    recovery_ui: recover::RecoveryUi,
+    save_failures: HashMap<DocumentId, fileio::FailedSave>,
     theme_mode: ThemeMode,
     theme: Theme,
     dpi: u32,
@@ -374,6 +378,7 @@ pub struct App {
     exit_discard: HashMap<DocumentId, Version>,
     /// 読み込み中のパス（二重に開かない）。
     opening: HashSet<PathBuf>,
+    opening_saved_copies: HashSet<DocumentId>,
     autosave_timer: bool,
     clipboard_counter: u32,
     /// 起動時に分かった問題（表示する前にまとめて知らせる）。
@@ -382,8 +387,8 @@ pub struct App {
     tab_drag: Option<TabDrag>,
     /// タブにマウスを置いたときの案内（吹き出し）。
     tab_tip: TabTip,
-    /// 案内を出そうとしているタブ（マウスが乗っているタブ）。
-    tip_for: Option<usize>,
+    /// 案内を出そうとしているタブか一覧ボタン。
+    tip_for: Option<TabHit>,
     /// 別ウィンドウへの移動で、受け取りを待っているもの（U4）。
     handoffs: Vec<tabops::PendingHandoff>,
     handoff_timer: bool,
@@ -394,8 +399,8 @@ pub struct App {
     restore: session::RestoreState,
     /// 閉じたタブの履歴（その起動の間だけ。V2）。
     closed_tabs: tabextras::ClosedTabs,
-    /// 文書が 0 件のときの案内の、クリックできる行（矩形, 最近使ったファイルの番号）。
-    empty_links: Vec<(RECT, usize)>,
+    /// 文書が 0 件のときの案内の、クリックできる行と操作。
+    empty_links: Vec<(RECT, emptyview::EmptyAction)>,
     /// Alt を使った操作のあと、Alt を離してもメニューを有効にしない（V1）。
     alt: altkey::AltTracker,
     /// 統合側が差し込む処理。
@@ -499,7 +504,7 @@ pub(crate) fn dispatch(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> 
         windows::Win32::UI::WindowsAndMessaging::WM_CONTEXTMENU
             if is_our_editor(HWND(wparam.0 as *mut _)) =>
         {
-            with_app(|app| app.show_editor_menu());
+            with_app(|app| app.show_editor_menu(lparam));
             Some(LRESULT(0))
         }
         WM_CLOSE => {
@@ -719,6 +724,9 @@ impl App {
             active: None,
             tabs: TabBar::new(),
             status: StatusBar::new(),
+            status_temporary: false,
+            recovery_ui: recover::RecoveryUi::default(),
+            save_failures: HashMap::new(),
             theme_mode,
             theme,
             dpi,
@@ -763,6 +771,7 @@ impl App {
             preview: None,
             exit_discard: HashMap::new(),
             opening: HashSet::new(),
+            opening_saved_copies: HashSet::new(),
             autosave_timer: false,
             clipboard_counter: 0,
             startup_notes: Vec::new(),
@@ -895,6 +904,7 @@ impl App {
         let mut brace = false;
         let mut zoom = false;
         let mut clear_highlight = false;
+        let mut caret_moved = false;
         let mut changed_docs: Vec<DocumentId> = Vec::new();
         for (doc, event) in events {
             let Some(i) = self
@@ -936,6 +946,7 @@ impl App {
                 EditorEvent::UpdateUi { selection, .. } => {
                     status_changed |= is_active;
                     brace |= is_active && selection;
+                    caret_moved |= is_active && selection;
                 }
                 EditorEvent::CharAdded { ch } => {
                     if is_active
@@ -966,6 +977,9 @@ impl App {
         }
         if status_changed {
             self.refresh_status();
+        }
+        if caret_moved {
+            self.preview_caret_moved();
         }
         for &id in &changed_docs {
             self.note_change(id);
@@ -1253,6 +1267,7 @@ impl App {
             }
         }
         self.active = Some(i);
+        self.refresh_persistent_status();
         // 切り替えで届いた通知（表示の更新）を反映する。
         self.sync();
         self.refresh_tabs();
@@ -1319,6 +1334,9 @@ impl App {
                 self.active = Some(a - 1);
             }
         }
+        self.save_failures.remove(&id);
+        self.clear_recovery_failure(id);
+        self.refresh_persistent_status();
         self.edits.retain(|s| s.doc != id);
         self.close_big(id);
         self.preview_document_closed(id);
@@ -1511,11 +1529,37 @@ impl App {
 
     /// 短い状態表示を出す（数秒で消える）。
     pub fn set_status(&mut self, message: &str, kind: MessageKind) {
+        self.status_temporary = true;
         self.status.set_message(Some((message.to_owned(), kind)));
         self.invalidate(self.layout.status);
         // SAFETY: 自分のウィンドウのタイマー。
         unsafe {
             SetTimer(Some(self.hwnd), TIMER_STATUS, STATUS_MESSAGE_MS, None);
+        }
+    }
+
+    fn persistent_status(&self) -> Option<(CommandId, (String, MessageKind))> {
+        let recovery = self.persistent_recovery_status();
+        if self.has_recovery_failures() {
+            if let Some(message) = recovery {
+                return Some((CommandId::new("file.retry_recovery"), message));
+            }
+        }
+        if let Some(message) = self.persistent_save_status() {
+            return Some((CommandId::new("file.retry_save"), message));
+        }
+        if let Some(message) = recovery {
+            return Some((CommandId::new("file.restore_documents"), message));
+        }
+        self.persistent_memo_status()
+            .map(|message| (CommandId::new("memo.open_original"), message))
+    }
+
+    fn refresh_persistent_status(&mut self) {
+        if !self.status_temporary {
+            self.status
+                .set_message(self.persistent_status().map(|(_, message)| message));
+            self.invalidate(self.layout.status);
         }
     }
 
@@ -1735,8 +1779,8 @@ impl App {
                 unsafe {
                     let _ = KillTimer(Some(self.hwnd), TIMER_STATUS);
                 }
-                self.status.set_message(None);
-                self.invalidate(self.layout.status);
+                self.status_temporary = false;
+                self.refresh_persistent_status();
                 Some(LRESULT(0))
             }
             WM_SETTINGCHANGE => {
@@ -1853,7 +1897,9 @@ impl App {
                 Some(LRESULT(0))
             }
             WM_SETCURSOR => {
-                if (lparam.0 & 0xFFFF) as u32 == HTCLIENT && self.cursor_over_empty_link() {
+                if (lparam.0 & 0xFFFF) as u32 == HTCLIENT
+                    && (self.cursor_over_empty_link() || self.cursor_over_status_action())
+                {
                     // SAFETY: 標準のカーソル。
                     unsafe {
                         if let Ok(c) = LoadCursorW(None, windows::Win32::UI::WindowsAndMessaging::IDC_HAND) {
@@ -1888,6 +1934,22 @@ impl App {
             let _ = ScreenToClient(self.hwnd, &mut p);
         }
         window::contains(&s, p.x, p.y)
+    }
+
+    fn cursor_over_status_action(&self) -> bool {
+        if self.status_temporary
+            || !self.settings.view.status_bar
+            || self.status.message().is_none()
+        {
+            return false;
+        }
+        let mut p = windows::Win32::Foundation::POINT::default();
+        // SAFETY: カーソル位置を自分のクライアント座標に変換する。
+        unsafe {
+            let _ = GetCursorPos(&mut p);
+            let _ = ScreenToClient(self.hwnd, &mut p);
+        }
+        self.status.hit_test(p.x, p.y) == Some(StatusSegment::Message)
     }
 
     fn on_mouse_move(&mut self, x: i32, y: i32) {
@@ -1931,7 +1993,8 @@ impl App {
     /// マウスが乗っているタブが替わったら、案内を隠して、出すまでの待ちを始め直す。
     fn track_tab_tip(&mut self, hit: Option<TabHit>) {
         let tab = match hit {
-            Some(TabHit::Tab(i) | TabHit::Close(i)) => Some(i),
+            Some(TabHit::Tab(i) | TabHit::Close(i)) => Some(TabHit::Tab(i)),
+            Some(TabHit::List) => Some(TabHit::List),
             _ => None,
         };
         if tab == self.tip_for {
@@ -1963,17 +2026,18 @@ impl App {
         unsafe {
             let _ = KillTimer(Some(self.hwnd), TIMER_TAB_TIP);
         }
-        let Some(i) = self.tip_for else { return };
-        let on_tab = matches!(
-            self.tabs.hover(),
-            Some(TabHit::Tab(h) | TabHit::Close(h)) if h == i
-        );
-        let (Some(rect), Some(text)) = (self.tabs.tab_rect(i), self.tab_hint(i)) else {
+        let (rect, text) = match (self.tip_for, self.tabs.hover()) {
+            (Some(TabHit::Tab(i)), Some(TabHit::Tab(h) | TabHit::Close(h))) if h == i => {
+                (self.tabs.tab_rect(i), self.tab_hint(i))
+            }
+            (Some(TabHit::List), Some(TabHit::List)) => {
+                (self.tabs.list_button_rect(), Some("タブ一覧".into()))
+            }
+            _ => return,
+        };
+        let (Some(rect), Some(text)) = (rect, text) else {
             return;
         };
-        if !on_tab {
-            return;
-        }
         let mut tl = windows::Win32::Foundation::POINT {
             x: rect.left,
             y: rect.top,
@@ -2002,6 +2066,7 @@ impl App {
         let d = self.docs.get(i)?;
         Some(match d.state.kind() {
             DocumentKind::Memo(_) => "メモ（自動保存）".to_owned(),
+            DocumentKind::SavedCopy(_) => "ファイルに保存されている内容（読み取り専用）".to_owned(),
             _ => match d.state.path() {
                 Some(p) => p.display().to_string(),
                 None => "未保存（保存先なし）".to_owned(),
@@ -2023,12 +2088,16 @@ impl App {
             }
             return;
         }
-        // 文書 0 件の案内の、最近使ったファイル。
-        if let Some(n) = self.empty_link_at(x, y) {
-            self.run_command(
-                crate::ui::menu::ID_FILE_OPEN_RECENT,
-                serde_json::json!({ "index": n }),
-            );
+        if let Some(action) = self.empty_link_at(x, y) {
+            let (command, args) = match action {
+                emptyview::EmptyAction::New => (CommandId::new("file.new"), Value::Null),
+                emptyview::EmptyAction::Open => (CommandId::new("file.open"), Value::Null),
+                emptyview::EmptyAction::Recent(n) => (
+                    crate::ui::menu::ID_FILE_OPEN_RECENT,
+                    serde_json::json!({ "index": n }),
+                ),
+            };
+            self.run_command(command, args);
             return;
         }
         match self.tabs.hit_test(x, y) {
@@ -2052,6 +2121,7 @@ impl App {
             Some(TabHit::New) => {
                 self.run_command(CommandId::new("file.new"), Value::Null);
             }
+            Some(TabHit::List) => self.show_tab_list(),
             Some(TabHit::Empty) | None => {
                 if let Some(seg) = self
                     .settings
@@ -2074,6 +2144,12 @@ impl App {
     /// その場に出し、位置は「行へ移動」を開く。
     fn on_status_click(&mut self, seg: StatusSegment, x: i32, y: i32) {
         let command = match seg {
+            StatusSegment::Message if !self.status_temporary => {
+                if let Some((command, _)) = self.persistent_status() {
+                    self.run_command(command, Value::Null);
+                }
+                return;
+            }
             StatusSegment::Encoding => "file.save_encoding",
             StatusSegment::Eol => "file.save_eol",
             StatusSegment::Language => "view.language",

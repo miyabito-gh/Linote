@@ -1,5 +1,7 @@
 //! プレビューの別ウィンドウ。右ペインと同じ文書・同じスタイルを [`PreviewPane`] で表示する。
-//! メインウィンドウの所有ウィンドウなので、メインウィンドウと一緒に閉じる。
+//! メインウィンドウとは独立したトップレベルのウィンドウ（所有ウィンドウにしない）。所有にすると
+//! 常に本体より前面に出て、本体の最小化に連れて隠れるため。タスクバーにも別に並ぶ。
+//! 本体の終了時は `ui::app` の後始末（`preview_teardown`）で破棄する。
 //! 閉じるボタンは破棄せず隠す（次に開くときに WebView2 を作り直さない）。
 
 use std::cell::{Cell, RefCell};
@@ -13,7 +15,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect, GetWindowLongPtrW,
     IsWindowVisible, LoadCursorW, RegisterClassExW, SetForegroundWindow, SetWindowLongPtrW,
     SetWindowTextW, ShowWindow, CW_USEDEFAULT, GWLP_USERDATA, IDC_ARROW, SW_HIDE, SW_SHOW,
-    WM_CLOSE, WM_NCDESTROY, WM_SETFOCUS, WM_SIZE, WNDCLASSEXW, WS_CLIPCHILDREN,
+    WM_CLOSE, WM_NCDESTROY, WM_SETFOCUS, WM_SIZE, WNDCLASSEXW, WS_CLIPCHILDREN, WS_EX_APPWINDOW,
     WS_OVERLAPPEDWINDOW,
 };
 
@@ -40,12 +42,7 @@ pub struct PreviewWindow {
 impl PreviewWindow {
     /// ウィンドウを作る（まだ表示しない）。中のペインの作成が WebView2 の初期化を始めるので、
     /// 「別ウィンドウで開く」操作の中で呼ぶこと。
-    pub fn create(
-        host: &PreviewHost,
-        owner: HWND,
-        title: &str,
-        palette: &PreviewPalette,
-    ) -> Result<Self> {
+    pub fn create(host: &PreviewHost, title: &str, palette: &PreviewPalette) -> Result<Self> {
         register_class()?;
         let inner = Rc::new(WinInner {
             hwnd: Cell::new(HWND::default()),
@@ -53,10 +50,10 @@ impl PreviewWindow {
             on_closed: RefCell::new(None),
         });
         let title_w = to_wide(title);
-        // SAFETY: クラスは登録済み。owner は呼び出し側が渡した有効なウィンドウ。
+        // SAFETY: クラスは登録済み。親・所有者なしのトップレベルウィンドウ。
         let hwnd = unsafe {
             CreateWindowExW(
-                Default::default(),
+                WS_EX_APPWINDOW,
                 CLASS,
                 PCWSTR(title_w.as_ptr()),
                 WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
@@ -64,7 +61,7 @@ impl PreviewWindow {
                 CW_USEDEFAULT,
                 900,
                 700,
-                Some(owner),
+                None,
                 None,
                 GetModuleHandleW(None).ok().map(Into::into),
                 None,
@@ -127,6 +124,12 @@ impl PreviewWindow {
         }
     }
 
+    pub fn scroll_to_line(&self, line: u32) {
+        if let Some(p) = self.pane() {
+            p.scroll_to_line(line);
+        }
+    }
+
     pub fn set_palette(&self, palette: &PreviewPalette) {
         set_dark_title_bar(self.hwnd(), palette.dark);
         if let Some(p) = self.pane() {
@@ -164,7 +167,9 @@ impl PreviewWindow {
 
     /// ペインごと破棄する。
     pub fn destroy(&self) {
-        if let Some(p) = self.inner.pane.borrow_mut().take() {
+        // 借用を外してから破棄する（破棄の途中で届くメッセージが `pane` を読む）。
+        let pane = self.inner.pane.borrow_mut().take();
+        if let Some(p) = pane {
             p.destroy();
         }
         // SAFETY: 有効なウィンドウ（破棄済みなら失敗するだけ）。

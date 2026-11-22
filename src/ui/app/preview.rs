@@ -16,10 +16,11 @@ use std::time::{Duration, Instant};
 
 use windows::Win32::UI::WindowsAndMessaging::{KillTimer, SetTimer};
 
+use crate::appdata::settings::{PreviewSettings, PreviewWidth};
 use crate::core::{DocStamp, DocumentId, Limits, Result, WorkerPool};
 use crate::markdown::{
-    compose_document, notice_body, spawn_render, PreviewPalette, PreviewScheduler, PreviewUpdate,
-    Rgb, Stylesheet, DEFAULT_MAX_INPUT_BYTES,
+    compose_document, notice_body, spawn_render, PreviewPalette, PreviewScheduler, PreviewStyle,
+    PreviewUpdate, RenderOptions, Rgb, Stylesheet, DEFAULT_MAX_INPUT_BYTES,
 };
 use crate::ui::preview::{PaneStatus, PreviewHost, PreviewPane, PreviewWindow};
 use crate::ui::statusbar::MessageKind;
@@ -42,6 +43,35 @@ pub(super) struct PreviewState {
     /// 最後に変換した本文（`<body>` の中身）。テーマの変更で組み直すために持つ。
     pub body: Option<Arc<str>>,
     pub timer: bool,
+    /// 編集位置への追従で最後に送った行（同じ行では送り直さない）。
+    pub last_follow_line: Option<(DocumentId, u32)>,
+}
+
+/// 設定と配色からプレビューの見た目を作る。
+fn preview_style(settings: &PreviewSettings, palette: PreviewPalette) -> PreviewStyle {
+    let one = |name: &str| {
+        if name.is_empty() {
+            Vec::new()
+        } else {
+            vec![name.to_owned()]
+        }
+    };
+    PreviewStyle {
+        palette,
+        body_fonts: one(&settings.body_font),
+        code_fonts: one(&settings.code_font),
+        // pt を CSS ピクセルにする（既定の 11 pt は従来の 15 px）。
+        font_size_px: (settings.font_size as f32 * 4.0 / 3.0).round(),
+        full_width: settings.width == PreviewWidth::Full,
+    }
+}
+
+fn render_options(settings: &PreviewSettings) -> RenderOptions {
+    RenderOptions {
+        line_breaks: settings.line_breaks,
+        toc: settings.toc,
+        source_lines: settings.follow_cursor,
+    }
 }
 
 /// 文書がプレビューの対象か。本文を Scintilla で編集している文書すべて（無題、任意の拡張子、
@@ -92,18 +122,17 @@ impl App {
     /// プレビューの状態（初めてなら作る。ここでは WebView2 に何もしない）。
     fn preview_state(&mut self) -> &mut PreviewState {
         let palette = palette_for(&self.theme);
+        let settings = &self.settings.preview;
         self.preview.get_or_insert_with(|| PreviewState {
             host: PreviewHost::new(),
             pane: None,
             window: None,
-            scheduler: PreviewScheduler::default(),
-            stylesheet: Stylesheet::new(&crate::markdown::PreviewStyle {
-                palette,
-                ..Default::default()
-            }),
+            scheduler: PreviewScheduler::new(Duration::from_millis(u64::from(settings.delay_ms))),
+            stylesheet: Stylesheet::new(&preview_style(settings, palette)),
             target: None,
             body: None,
             timer: false,
+            last_follow_line: None,
         })
     }
 
@@ -221,13 +250,12 @@ impl App {
             return Ok(());
         };
         let palette = palette_for(&self.theme);
-        let hwnd = self.hwnd;
         let title = self
             .document(id)
             .map(|d| format!("プレビュー - {}", d.title))
             .unwrap_or_else(|| "プレビュー".to_owned());
         let host = self.preview_state().host.clone();
-        let window = PreviewWindow::create(&host, hwnd, &title, &palette)?;
+        let window = PreviewWindow::create(&host, &title, &palette)?;
         let sender = self.sender();
         window.set_on_closed(move || {
             sender.send(UiMessage::Run(Box::new(|app| {
@@ -518,6 +546,7 @@ impl App {
             ticket,
             text,
             limits,
+            render_options(&self.settings.preview),
             self.sender(),
             |update| UiMessage::Run(Box::new(move |app: &mut App| app.on_preview_update(update))),
         );
@@ -575,10 +604,7 @@ impl App {
         let Some(p) = self.preview.as_mut() else {
             return;
         };
-        p.stylesheet = Stylesheet::new(&crate::markdown::PreviewStyle {
-            palette: palette.clone(),
-            ..Default::default()
-        });
+        p.stylesheet = Stylesheet::new(&preview_style(&self.settings.preview, palette.clone()));
         if let Some(pane) = &p.pane {
             pane.set_palette(&palette);
         }
@@ -587,6 +613,56 @@ impl App {
         }
         if let Some(id) = p.target {
             self.show_preview_body(id);
+        }
+    }
+
+    /// プレビューの設定（改行の扱い、文字、幅など）が変わった。見た目と待ち時間を組み直し、
+    /// 表示中なら変換し直す。
+    pub(super) fn preview_settings_changed(&mut self) {
+        let palette = palette_for(&self.theme);
+        let settings = self.settings.preview.clone();
+        let Some(p) = self.preview.as_mut() else {
+            return;
+        };
+        p.stylesheet = Stylesheet::new(&preview_style(&settings, palette));
+        p.scheduler
+            .set_base_delay(Duration::from_millis(u64::from(settings.delay_ms)));
+        p.last_follow_line = None;
+        let Some(id) = p.target else {
+            return;
+        };
+        // 同じ版でも変換し直す。
+        p.scheduler.invalidate_shown();
+        self.preview_retarget(id);
+    }
+
+    /// 編集欄のカーソルが動いた（[`App::sync`] から）。設定が有効で、アクティブな文書が
+    /// プレビュー中なら、カーソルの行に合わせてプレビューをスクロールする。
+    pub(super) fn preview_caret_moved(&mut self) {
+        if !self.settings.preview.follow_cursor {
+            return;
+        }
+        let Some(id) = self.active_id() else { return };
+        let Some(p) = self.preview.as_ref() else {
+            return;
+        };
+        if p.target != Some(id) || (p.pane.is_none() && p.window.is_none()) {
+            return;
+        }
+        let caret = self.editor.selection().caret;
+        let line = u32::try_from(self.editor.line_from_position(caret)).unwrap_or(u32::MAX);
+        let Some(p) = self.preview.as_mut() else {
+            return;
+        };
+        if p.last_follow_line == Some((id, line)) {
+            return;
+        }
+        p.last_follow_line = Some((id, line));
+        if let Some(pane) = &p.pane {
+            pane.scroll_to_line(line);
+        }
+        if let Some(w) = &p.window {
+            w.scroll_to_line(line);
         }
     }
 
