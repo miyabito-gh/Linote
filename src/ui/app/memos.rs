@@ -11,7 +11,7 @@
 
 use std::rc::Rc;
 
-use crate::core::{DocumentId, Error, MemoId, Result, Version};
+use crate::core::{DocumentId, Error, MemoId, Result, Version, WorkerPool};
 use crate::document::{DocumentKind, DocumentState};
 use crate::memo::{Memo, MemoStore, MemoTab, SaveOutcome};
 use crate::ui::editor::Language;
@@ -196,6 +196,61 @@ impl App {
         Ok(id)
     }
 
+    pub(super) fn can_open_original_memo(&self, id: DocumentId) -> bool {
+        self.document(id)
+            .and_then(|doc| doc.memo.as_ref())
+            .is_some_and(|tab| tab.original_id().is_some())
+    }
+
+    pub(super) fn persistent_memo_status(&self) -> Option<(String, MessageKind)> {
+        let doc = self.document(self.active_id()?)?;
+        doc.memo.as_ref()?.original_id()?;
+        Some((
+            format!(
+                "競合があったため「{}」に保存しました。クリックで元のメモを開く",
+                doc.title
+            ),
+            MessageKind::Warning,
+        ))
+    }
+
+    pub(super) fn open_original_memo(&mut self, id: DocumentId) -> Result<()> {
+        let original = self
+            .document(id)
+            .and_then(|doc| doc.memo.as_ref()?.original_id())
+            .cloned()
+            .ok_or_else(|| Error::unsupported("競合前のメモはありません"))?;
+        if let Some(doc) = self
+            .docs
+            .iter()
+            .find(|d| d.memo.as_ref().is_some_and(|t| t.id() == &original))
+        {
+            return self.activate(doc.id());
+        }
+        let store = self
+            .memo_store()
+            .ok_or_else(|| Error::unavailable("メモ", "データの保存場所がありません"))?;
+        let sender = self.sender();
+        WorkerPool::global().spawn(move || {
+            let result = store.load(&original);
+            sender.send(UiMessage::Run(Box::new(move |app| {
+                if let Err(e) = result.and_then(|memo| app.open_memo(memo)) {
+                    app.report_failure("元のメモを開けませんでした", &e);
+                }
+            })));
+        });
+        Ok(())
+    }
+
+    fn note_memo_fork(&mut self, id: DocumentId, name: String) {
+        let _ = self.set_title(id, name);
+        self.sync_memo_panel_open_ids();
+        if let Some(panel) = self.memo_panel.filter(|p| p.is_visible()) {
+            panel.refresh();
+        }
+        self.refresh_persistent_status();
+    }
+
     /// 入力が落ち着いたメモを、ワーカーで保存する。
     pub(super) fn autosave_memo(&mut self, id: DocumentId) {
         let Some(store) = self.memo_store() else {
@@ -241,14 +296,7 @@ impl App {
                 let _ = self.record_saved(id, version, None, None);
                 if let Some(f) = finished {
                     if let Some(forked) = f.forked {
-                        let _ = self.set_title(id, forked.name.clone());
-                        self.set_status(
-                            &format!(
-                                "別のウィンドウで更新されていたため、「{}」として保存しました",
-                                forked.name
-                            ),
-                            MessageKind::Warning,
-                        );
+                        self.note_memo_fork(id, forked.name);
                     }
                     if f.resave {
                         self.autosave_memo(id);
@@ -310,11 +358,12 @@ impl App {
         };
         match store.save_or_fork(&memo_id, expected, &text) {
             Ok(outcome) => {
-                if let Some(t) = self.docs[i].memo.as_mut() {
-                    t.finish(&outcome);
-                }
+                let finished = self.docs[i].memo.as_mut().map(|t| t.finish(&outcome));
                 self.docs[i].pending = None;
                 let _ = self.record_saved(id, stamp.version, None, None);
+                if let Some(forked) = finished.and_then(|f| f.forked) {
+                    self.note_memo_fork(id, forked.name);
+                }
                 true
             }
             Err(e) => {
@@ -445,6 +494,7 @@ impl App {
             if let Some(slot) = self.docs[i].slot.take() {
                 super::recover::discard_slot(slot);
             }
+            self.clear_recovery_failure(id);
             self.docs[i].pending = None;
             self.docs[i].savepoint_valid = true;
             self.with_text(id, |ed| ed.set_save_point())?;

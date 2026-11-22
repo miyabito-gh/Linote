@@ -21,6 +21,7 @@ use super::{Memo, SaveOutcome};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemoTab {
     id: MemoId,
+    original: Option<MemoId>,
     store_version: Version,
     in_flight: bool,
     pending: bool,
@@ -39,6 +40,7 @@ impl MemoTab {
     pub fn opened(memo: &Memo) -> Self {
         Self {
             id: memo.id.clone(),
+            original: None,
             store_version: memo.version,
             in_flight: false,
             pending: false,
@@ -47,6 +49,11 @@ impl MemoTab {
 
     pub fn id(&self) -> &MemoId {
         &self.id
+    }
+
+    /// 競合でこのタブが別のメモに切り替わる直前の保存先。
+    pub fn original_id(&self) -> Option<&MemoId> {
+        self.original.as_ref()
     }
 
     pub fn store_version(&self) -> Version {
@@ -72,7 +79,7 @@ impl MemoTab {
                 None
             }
             SaveOutcome::Forked { memo, .. } => {
-                self.id = memo.id.clone();
+                self.original = Some(std::mem::replace(&mut self.id, memo.id.clone()));
                 self.store_version = memo.version;
                 Some(memo.clone())
             }
@@ -140,6 +147,7 @@ mod tests {
         });
         assert_eq!(f.forked.as_ref(), Some(&other));
         assert_eq!(tab.id(), &other.id);
+        assert_eq!(tab.original_id(), Some(&m.id));
         assert!(!f.resave);
     }
 

@@ -19,7 +19,8 @@
 //! - 配色は [`MemoPanel::set_theme`]（テーマ切り替えのたびに呼ぶ）、DPI が変わったら
 //!   [`MemoPanel::set_dpi`]。
 //!
-//! キー操作: 検索欄で ↑↓ で一覧を選び、Enter で開く。Esc で閉じる。一覧のダブルクリックでも開く。
+//! キー操作: 検索欄で ↑↓ で一覧を選び、Enter で開く。メモがまだなければ Enter で作る。
+//! Esc で閉じる。一覧のダブルクリックでも開く。
 
 use std::collections::HashSet;
 use std::rc::Rc;
@@ -82,6 +83,8 @@ const MAX_PREVIEW_CHARS: usize = 20_000;
 const PANE_MIN_INNER_DIP: i32 = 640;
 
 const EN_CHANGE: u32 = 0x0300;
+const BS_DEFPUSHBUTTON: u32 = 0x0001;
+const BM_SETSTYLE: u32 = 0x00F4;
 /// 検索結果の一覧に載せる最大件数。
 const MAX_RESULTS: u64 = 500;
 
@@ -111,6 +114,8 @@ enum Msg {
     },
     /// メモを読んだ（`close` なら、開いたあと小窓を閉じる）。
     Loaded { result: Result<Memo>, close: bool },
+    /// 新規メモの作成が終わった。
+    Created(Result<Memo>),
     /// 右の本文に出すメモを読んだ。
     Preview { seq: u64, result: Result<Memo> },
 }
@@ -134,6 +139,9 @@ struct State {
     list_brush: HBRUSH,
     theme: Theme,
     hits: Vec<MemoHit>,
+    /// 検索語のない一覧が空と確定したら、新規メモを既定の操作にする。
+    new_default: bool,
+    creating: bool,
     /// 内容を見せるか（見せるなら、広い窓は右の本文、狭い窓は 2 行目の冒頭）。
     show_content: bool,
     /// 右の本文の欄を出している（`show_content` かつ、窓が十分に広い）。
@@ -397,7 +405,7 @@ impl MemoPanel {
         with_state(self.hwnd, |s| {
             s.theme = theme.clone();
             s.rebuild_brushes();
-            set_dark_title_bar(s.hwnd, s.theme.dark);
+            s.apply_control_theme();
             s.repaint();
         });
     }
@@ -502,10 +510,50 @@ impl State {
                 self.edit,
                 self.list,
                 self.button,
+                self.delete_button,
                 self.toggle,
                 self.preview,
+                self.empty,
             ] {
                 let _ = InvalidateRect(Some(h), None, true);
+            }
+        }
+    }
+
+    fn apply_control_theme(&self) {
+        use windows::Win32::UI::Controls::SetWindowTheme;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            GWL_EXSTYLE, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOSIZE,
+        };
+        set_dark_title_bar(self.hwnd, self.theme.dark);
+        let theme = if self.theme.dark {
+            w!("DarkMode_Explorer")
+        } else {
+            PCWSTR::null()
+        };
+        // SAFETY: The handles are our native edit and list children.
+        unsafe {
+            for hwnd in [self.edit, self.list, self.preview] {
+                let _ = SetWindowTheme(hwnd, theme, PCWSTR::null());
+                let previous = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+                let edge = WS_EX_CLIENTEDGE.0 as isize;
+                let next = if self.theme.dark {
+                    previous & !edge
+                } else {
+                    previous | edge
+                };
+                if next != previous {
+                    SetWindowLongPtrW(hwnd, GWL_EXSTYLE, next);
+                    let _ = SetWindowPos(
+                        hwnd,
+                        None,
+                        0,
+                        0,
+                        0,
+                        0,
+                        SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+                    );
+                }
             }
         }
     }
@@ -676,6 +724,7 @@ impl State {
 
     /// 検索を作業スレッドで始める（前の検索は中止する）。結果は世代で照合する。
     fn start_search(&mut self) {
+        self.set_new_default(false);
         if let Some(c) = self.cancel.take() {
             c.cancel();
         }
@@ -740,8 +789,25 @@ impl State {
             }
         }
         self.hits = hits;
+        self.set_new_default(self.hits.is_empty() && self.terms.is_empty());
         self.update_empty();
         self.schedule_preview();
+    }
+
+    fn set_new_default(&mut self, enabled: bool) {
+        if self.new_default == enabled {
+            return;
+        }
+        self.new_default = enabled;
+        let style = if enabled {
+            BS_DEFPUSHBUTTON
+        } else {
+            BS_PUSHBUTTON as u32
+        };
+        // SAFETY: 自分のボタン。既定の操作を示す枠だけを変える。
+        unsafe {
+            SendMessageW(self.button, BM_SETSTYLE, WPARAM(style as usize), LPARAM(1));
+        }
     }
 
     /// 一覧が空なら、一覧の代わりに案内を出す。削除は選択があるときだけ。
@@ -749,8 +815,8 @@ impl State {
         let empty = self.hits.is_empty();
         let text = if !empty {
             ""
-        } else if self.query().trim().is_empty() {
-            "メモはまだありません。\n「新規メモ」で作成できます。"
+        } else if self.new_default {
+            "メモはまだありません。\n「新規メモ」または Enter で作成できます。"
         } else {
             "一致するメモはありません。\n「新規メモ」で、この名前のメモを作成できます。"
         };
@@ -992,6 +1058,11 @@ impl State {
                 TIMER_PREVIEW_LOAD,
             );
             let _ = SetWindowTextW(self.preview, w!(""));
+            let _ = windows::Win32::UI::Controls::ShowScrollBar(
+                self.preview,
+                windows::Win32::UI::WindowsAndMessaging::SB_VERT,
+                false,
+            );
         }
     }
 
@@ -1036,6 +1107,11 @@ impl State {
         // SAFETY: 自分の子ウィンドウ。文字列は NUL 終端でコピーされる。
         unsafe {
             let _ = SetWindowTextW(self.preview, PCWSTR(wide.as_ptr()));
+            let _ = windows::Win32::UI::Controls::ShowScrollBar(
+                self.preview,
+                windows::Win32::UI::WindowsAndMessaging::SB_VERT,
+                !body.is_empty(),
+            );
         }
         let (start, end) = self.first_match_range(&text).unwrap_or((0, 0));
         // SAFETY: 自分の子ウィンドウ（読み取り専用の編集欄）。
@@ -1063,7 +1139,15 @@ impl State {
     }
 
     /// 新しいメモを作って開く。検索欄に文字があればそれを名前にする。
-    fn create_new(&self) {
+    fn create_new(&mut self) {
+        if self.creating {
+            return;
+        }
+        self.creating = true;
+        // SAFETY: 自分のボタン。保存中に連続して発行しない。
+        unsafe {
+            let _ = EnableWindow(self.button, false);
+        }
         let query = self.query();
         let name = if query.trim().is_empty() {
             "無題のメモ".to_owned()
@@ -1073,11 +1157,7 @@ impl State {
         let store = self.store.clone();
         let tx = self.tx.clone();
         WorkerPool::global().spawn(move || {
-            // 新しいメモは、そのまま書き始められるよう小窓を閉じる。
-            tx.send(Msg::Loaded {
-                result: store.create(&name, ""),
-                close: true,
-            });
+            tx.send(Msg::Created(store.create(&name, "")));
         });
     }
 
@@ -1105,6 +1185,21 @@ impl State {
                     }
                 }
                 Msg::Loaded { result: Err(e), .. } => self.emit(PanelEvent::Failed(e)),
+                Msg::Created(result) => {
+                    self.creating = false;
+                    // SAFETY: 自分のボタン。
+                    unsafe {
+                        let _ = EnableWindow(self.button, true);
+                    }
+                    match result {
+                        Ok(memo) => {
+                            self.emit(PanelEvent::Open(memo));
+                            // 新しいメモは、そのまま書き始められるよう小窓を閉じる。
+                            self.close_panel();
+                        }
+                        Err(e) => self.emit(PanelEvent::Failed(e)),
+                    }
+                }
                 Msg::Preview { seq, result } => {
                     // 選択が替わって古くなった結果は捨てる。
                     if seq != self.preview_seq || !self.pane_visible {
@@ -1235,6 +1330,8 @@ extern "system" fn panel_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPAR
                 list_brush: HBRUSH::default(),
                 theme,
                 hits: Vec::new(),
+                new_default: false,
+                creating: false,
                 show_content: true,
                 pane_visible: false,
                 two_line: false,
@@ -1267,7 +1364,7 @@ extern "system" fn panel_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPAR
                 SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(state) as isize);
             }
             with_state(hwnd, |s| {
-                set_dark_title_bar(hwnd, s.theme.dark);
+                s.apply_control_theme();
                 s.layout();
             });
             LRESULT(0)
@@ -1307,6 +1404,26 @@ extern "system" fn panel_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPAR
                 with_state(hwnd, |s| s.draw_item(d));
             }
             LRESULT(1)
+        }
+        windows::Win32::UI::WindowsAndMessaging::WM_NOTIFY if lparam.0 != 0 => {
+            // SAFETY: WM_NOTIFY のヘッダーはメッセージの処理中に有効。
+            let header = unsafe { &*(lparam.0 as *const windows::Win32::UI::Controls::NMHDR) };
+            if matches!(header.idFrom, ID_NEW | ID_DELETE | ID_TOGGLE)
+                && header.code == windows::Win32::UI::Controls::NM_CUSTOMDRAW
+            {
+                // SAFETY: 対象の BUTTON が送った NM_CUSTOMDRAW の構造体。
+                let draw =
+                    unsafe { &*(lparam.0 as *const windows::Win32::UI::Controls::NMCUSTOMDRAW) };
+                if with_state(hwnd, |s| {
+                    crate::ui::dialogs::draw_dark_button(&s.theme, draw)
+                })
+                .unwrap_or(false)
+                {
+                    return LRESULT(windows::Win32::UI::Controls::CDRF_SKIPDEFAULT as isize);
+                }
+            }
+            // SAFETY: 既定の処理。
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
         WM_CTLCOLOREDIT | WM_CTLCOLORLISTBOX | WM_CTLCOLORSTATIC_ => {
             let brush = with_state(hwnd, |s| {
@@ -1404,7 +1521,13 @@ extern "system" fn key_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
             // Enter: 開いても小窓は残す（続けて別のメモを開ける）。Ctrl+Enter: 開いて閉じる。
             // SAFETY: キーの状態を読むだけ。
             let ctrl = unsafe { GetKeyState(i32::from(VK_CONTROL.0)) } < 0;
-            with_state(parent, |s| s.open_selected(ctrl));
+            with_state(parent, |s| {
+                if s.new_default && !ctrl {
+                    s.create_new();
+                } else {
+                    s.open_selected(ctrl);
+                }
+            });
             true
         }
         WM_KEYDOWN if key == VK_F4.0 => {
