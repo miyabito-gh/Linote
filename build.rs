@@ -78,7 +78,7 @@ fn embed_manifest() {
         return;
     }
     let out = std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap()).join("linote_res.o");
-    let windres = std::env::var("WINDRES").unwrap_or_else(|_| "x86_64-w64-mingw32-windres".into());
+    let windres = find_windres();
     let status = std::process::Command::new(windres)
         .args([
             "--input",
@@ -93,4 +93,29 @@ fn embed_manifest() {
         .expect("run windres");
     assert!(status.success(), "windres failed");
     println!("cargo:rustc-link-arg-bins={}", out.display());
+}
+
+/// windres の実行ファイルを決める。優先順位:
+/// 1. 環境変数 `WINDRES`（明示指定）
+/// 2. 接頭辞付き `x86_64-w64-mingw32-windres`（Debian/Ubuntu のクロスツールチェーン。普段の経路）
+/// 3. 接頭辞なし `windres`（MSYS2 の mingw64 など、接頭辞付きの別名を持たない環境）
+fn find_windres() -> String {
+    if let Ok(w) = std::env::var("WINDRES") {
+        if !w.is_empty() {
+            return w;
+        }
+    }
+    for name in ["x86_64-w64-mingw32-windres", "windres"] {
+        let ok = std::process::Command::new(name)
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+        if ok {
+            return name.into();
+        }
+    }
+    // どれも見つからない場合は従来の名前で実行し、「run windres」の失敗として表に出す。
+    "x86_64-w64-mingw32-windres".into()
 }
