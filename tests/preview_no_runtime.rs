@@ -110,7 +110,7 @@ fn host_is_lazy_and_pane_reports_unavailable_without_runtime() {
     pane.destroy(); // 二重の破棄も安全。
 
     // 別ウィンドウ（同じホストを共有）。
-    let win = PreviewWindow::create(&host, parent, "プレビュー", &palette).unwrap();
+    let win = PreviewWindow::create(&host, "プレビュー", &palette).unwrap();
     win.set_document(
         DocumentId::allocate(),
         Arc::from("<html><body>z</body></html>"),

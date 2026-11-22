@@ -14,7 +14,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use super::render::render_body;
+use super::render::{render_body_with, RenderOptions};
 use crate::core::{
     CancelToken, DocStamp, DocumentId, Error, Limits, UiSender, Version, WorkerPool,
 };
@@ -73,6 +73,11 @@ impl PreviewScheduler {
             running: None,
             shown: None,
         }
+    }
+
+    /// 基本の待ち時間を替える（設定の変更。次の予定から効く）。
+    pub fn set_base_delay(&mut self, delay: Duration) {
+        self.base_delay = delay;
     }
 
     /// 文書の大きさに応じた待ち時間。大きな文書では入力中に何度も変換しないよう、
@@ -190,6 +195,7 @@ pub fn spawn_render<M, F>(
     ticket: RenderTicket,
     text: String,
     limits: Limits,
+    options: RenderOptions,
     sender: UiSender<M>,
     wrap: F,
 ) where
@@ -200,7 +206,7 @@ pub fn spawn_render<M, F>(
         if ticket.cancel.is_cancelled() {
             return;
         }
-        let result = render_body(&text, &ticket.cancel, limits).map(Arc::<str>::from);
+        let result = render_body_with(&text, &ticket.cancel, limits, options).map(Arc::<str>::from);
         drop(text);
         if matches!(&result, Err(e) if e.is_cancelled()) {
             return;
@@ -249,6 +255,15 @@ mod tests {
         assert_eq!(s.delay_for(1000), Duration::from_millis(250));
         assert_eq!(s.delay_for(3 << 20), Duration::from_millis(550));
         assert_eq!(s.delay_for(1 << 30), PreviewScheduler::MAX_DELAY);
+    }
+
+    #[test]
+    fn base_delay_can_be_changed() {
+        let mut s = PreviewScheduler::default();
+        s.set_base_delay(Duration::from_millis(1000));
+        assert_eq!(s.delay_for(10), Duration::from_millis(1000));
+        s.set_base_delay(Duration::from_millis(100));
+        assert_eq!(s.delay_for(10), Duration::from_millis(100));
     }
 
     #[test]
@@ -369,6 +384,7 @@ mod tests {
             first,
             "# old".into(),
             Limits::UNLIMITED,
+            RenderOptions::default(),
             tx.clone(),
             |u| u,
         );
@@ -379,6 +395,7 @@ mod tests {
             ticket,
             "# 新しい\n\n<b>x</b>".into(),
             Limits::UNLIMITED,
+            RenderOptions::default(),
             tx,
             |u| u,
         );

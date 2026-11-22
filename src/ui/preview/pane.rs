@@ -15,8 +15,8 @@ use std::sync::Arc;
 use webview2_com::take_pwstr;
 use webview2_com::Microsoft::Web::WebView2::Win32::*;
 use webview2_com::{
-    CreateCoreWebView2ControllerCompletedHandler, ExecuteScriptCompletedHandler,
-    NavigationCompletedEventHandler, NavigationStartingEventHandler,
+    AcceleratorKeyPressedEventHandler, CreateCoreWebView2ControllerCompletedHandler,
+    ExecuteScriptCompletedHandler, NavigationCompletedEventHandler, NavigationStartingEventHandler,
     NewWindowRequestedEventHandler, WebResourceRequestedEventHandler,
 };
 use windows::core::{w, Interface, BOOL, PCWSTR, PWSTR};
@@ -28,6 +28,7 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::System::Com::IStream;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_CONTROL, VK_MENU};
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect, GetWindowLongPtrW, LoadCursorW,
@@ -38,8 +39,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use super::host::PreviewHost;
 use super::policy::{
-    decide_navigation, fits_navigate_to_string, guidance_text, navigation_failed_notice_html,
-    oversize_notice_html, parse_scroll_result, scroll_restore_script, NavDecision, ScrollPos,
+    blocks_browser_key, decide_navigation, fits_navigate_to_string, guidance_text,
+    navigation_failed_notice_html, oversize_notice_html, parse_scroll_result, patch_script,
+    patch_succeeded, scroll_restore_script, scroll_to_line_script, NavDecision, ScrollPos,
     SCROLL_CAPTURE_SCRIPT,
 };
 use crate::core::{DocumentId, Error, Result};
@@ -93,6 +95,8 @@ struct PaneInner {
     failure_notice: Cell<bool>,
     /// 次の読み込みが終わったら戻すスクロール位置。
     restore: Cell<Option<ScrollPos>>,
+    /// その場での差し替え（[`patch_script`]）が失敗した。以後は読み込み直す従来の方法を使う。
+    patch_fallback: Cell<bool>,
     palette: RefCell<PreviewPalette>,
     on_status: RefCell<Option<StatusCallback>>,
 }
@@ -132,6 +136,7 @@ impl PreviewPane {
             capture_gen: Cell::new(0),
             failure_notice: Cell::new(false),
             restore: Cell::new(None),
+            patch_fallback: Cell::new(false),
             palette: RefCell::new(palette.clone()),
             on_status: RefCell::new(None),
         });
@@ -242,6 +247,21 @@ impl PreviewPane {
         }
     }
 
+    /// 元の行（0 始まり）に対応する位置までスクロールする（編集位置への追従）。
+    pub fn scroll_to_line(&self, line: u32) {
+        if self.inner.destroyed.get() {
+            return;
+        }
+        let webview = self.inner.webview.borrow().clone();
+        let Some(wv) = webview else { return };
+        let handler = ExecuteScriptCompletedHandler::create(Box::new(|_, _| Ok(())));
+        let script = to_wide(&scroll_to_line_script(line));
+        // SAFETY: 有効な WebView。文字列は NUL 終端で呼び出しの間有効。
+        unsafe {
+            let _ = wv.ExecuteScript(PCWSTR(script.as_ptr()), &handler);
+        }
+    }
+
     /// WebView にフォーカスを移す。
     pub fn focus(&self) {
         let controller = self.inner.controller.borrow().clone();
@@ -281,7 +301,10 @@ impl PaneInner {
 
     fn close_controller(&self) {
         self.webview.borrow_mut().take();
-        if let Some(c) = self.controller.borrow_mut().take() {
+        // 借用を外してから閉じる（Close の中でフォーカスのメッセージが来て、ウィンドウ
+        // プロシージャが `controller` を読むことがある）。
+        let controller = self.controller.borrow_mut().take();
+        if let Some(c) = controller {
             // SAFETY: 有効なコントローラー。閉じると WebView2 のプロセスとの接続が切れる。
             unsafe {
                 let _ = c.Close();
@@ -293,6 +316,25 @@ impl PaneInner {
         let controller = self.controller.borrow().clone();
         let Some(c) = controller else { return };
         let bg = self.palette.borrow().background;
+        // WebView2 自身の部品（ページ内検索のバー、スクロールバー）の明暗をアプリのテーマに
+        // 合わせる（既定は Windows の設定に従い、アプリのテーマと食い違う）。古い版では何もしない。
+        let dark = self.palette.borrow().dark;
+        let webview = self.webview.borrow().clone();
+        if let Some(profile) = webview
+            .and_then(|w| w.cast::<ICoreWebView2_13>().ok())
+            // SAFETY: 有効な WebView。
+            .and_then(|w| unsafe { w.Profile() }.ok())
+        {
+            let scheme = if dark {
+                COREWEBVIEW2_PREFERRED_COLOR_SCHEME_DARK
+            } else {
+                COREWEBVIEW2_PREFERRED_COLOR_SCHEME_LIGHT
+            };
+            // SAFETY: 有効なプロファイル。
+            unsafe {
+                let _ = profile.SetPreferredColorScheme(scheme);
+            }
+        }
         if let Ok(c2) = c.cast::<ICoreWebView2Controller2>() {
             // SAFETY: 有効なコントローラー。
             unsafe {
@@ -352,13 +394,65 @@ impl PaneInner {
         if !same_document {
             this.restore.set(None);
         } else if !this.navigating.get() && this.restore.get().is_none() {
-            // 表示し終わっている同じ文書の更新。いまの位置を読んでから替える。
+            // 表示し終わっている同じ文書の更新。まず読み込み直さずにその場で差し替える
+            // （ちらつかない）。できなければ、いまの位置を読んでから読み込み直す。
             // （読み込み中なら、前に読んだ位置がまだ `restore` にあるので、それを使う。）
+            if !this.patch_fallback.get()
+                && fits_navigate_to_string(&doc)
+                && Self::patch_in_place(this, key, &doc)
+            {
+                return;
+            }
             if Self::capture_scroll(this, key) {
                 return;
             }
         }
         this.navigate_now();
+    }
+
+    /// 同じ文書の新しい内容を、読み込み直さずに差し替え始める。始められなければ `false`。
+    /// 完了を待つ間は `capturing` を使う（その間に届いた更新は、完了後にまとめて表示する）。
+    fn patch_in_place(this: &Rc<PaneInner>, key: Option<DocumentId>, doc: &Arc<str>) -> bool {
+        let webview = this.webview.borrow().clone();
+        let Some(wv) = webview else { return false };
+        let Some(key) = key else { return false };
+        let Some(script) = patch_script(doc) else {
+            return false;
+        };
+        let weak = Rc::downgrade(this);
+        let generation = this.capture_gen.get();
+        let patched = doc.clone();
+        let handler = ExecuteScriptCompletedHandler::create(Box::new(move |hr, json| {
+            let Some(inner) = weak.upgrade() else {
+                return Ok(());
+            };
+            if inner.capture_gen.get() != generation {
+                return Ok(());
+            }
+            inner.capturing.set(None);
+            if inner.destroyed.get() {
+                return Ok(());
+            }
+            if hr.is_ok() && patch_succeeded(&json) {
+                *inner.shown.borrow_mut() = Some(patched.clone());
+                inner.shown_key.set(Some(key));
+            } else {
+                // 差し替えられなかった。以後は読み込み直す（次の navigate で位置を読んでから）。
+                inner.patch_fallback.set(true);
+            }
+            PaneInner::navigate(&inner);
+            Ok(())
+        }));
+        let script = to_wide(&script);
+        this.capturing.set(Some(key));
+        this.capture_started.set(Some(std::time::Instant::now()));
+        // SAFETY: 有効な WebView。文字列は NUL 終端で呼び出しの間有効。
+        let r = unsafe { wv.ExecuteScript(PCWSTR(script.as_ptr()), &handler) };
+        if r.is_err() {
+            this.capturing.set(None);
+            return false;
+        }
+        true
     }
 
     /// スクロール位置を読み始める。始められなければ `false`。
@@ -555,8 +649,32 @@ fn configure(
         let _ = settings.SetAreDefaultScriptDialogsEnabled(false);
         let _ = settings.SetIsStatusBarEnabled(false);
         let _ = settings.SetIsZoomControlEnabled(false);
+        // ページ内検索（Ctrl+F、F3）を使えるよう、ブラウザーのショートカットを有効にする。
+        // 検索以外のブラウザーの機能（再読み込み、印刷、開発者ツールなど）は
+        // AcceleratorKeyPressed で止める。止める仕組みを登録できたときだけ有効にする。
+        let keys = AcceleratorKeyPressedEventHandler::create(Box::new(|_s, args| {
+            let Some(args) = args else { return Ok(()) };
+            let mut kind = COREWEBVIEW2_KEY_EVENT_KIND::default();
+            let mut vk = 0u32;
+            args.KeyEventKind(&mut kind)?;
+            args.VirtualKey(&mut vk)?;
+            if kind == COREWEBVIEW2_KEY_EVENT_KIND_KEY_DOWN
+                || kind == COREWEBVIEW2_KEY_EVENT_KIND_SYSTEM_KEY_DOWN
+            {
+                let ctrl = GetKeyState(i32::from(VK_CONTROL.0)) < 0;
+                let alt = GetKeyState(i32::from(VK_MENU.0)) < 0;
+                if blocks_browser_key(vk, ctrl, alt) {
+                    args.SetHandled(true)?;
+                }
+            }
+            Ok(())
+        }));
+        let mut key_token = 0i64;
+        let keys_filtered = controller
+            .add_AcceleratorKeyPressed(&keys, &mut key_token)
+            .is_ok();
         if let Ok(s) = settings.cast::<ICoreWebView2Settings3>() {
-            let _ = s.SetAreBrowserAcceleratorKeysEnabled(false);
+            let _ = s.SetAreBrowserAcceleratorKeysEnabled(keys_filtered);
         }
         if let Ok(s) = settings.cast::<ICoreWebView2Settings4>() {
             let _ = s.SetIsPasswordAutosaveEnabled(false);

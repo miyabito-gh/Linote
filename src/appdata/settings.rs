@@ -466,6 +466,142 @@ impl SaveSettings {
     }
 }
 
+/// プレビューの文字サイズ（pt）の範囲と既定。
+pub const PREVIEW_FONT_SIZE_MIN: u32 = 8;
+pub const PREVIEW_FONT_SIZE_MAX: u32 = 36;
+pub const PREVIEW_FONT_SIZE_DEFAULT: u32 = 11;
+/// 更新までの待ち時間（ミリ秒）の既定。
+pub const PREVIEW_DELAY_DEFAULT_MS: u32 = 250;
+/// 更新までの待ち時間の選択肢（ミリ秒）。
+pub const PREVIEW_DELAYS_MS: [u32; 4] = [100, 250, 500, 1000];
+
+/// プレビューの本文の幅。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PreviewWidth {
+    /// 読みやすい幅（既定）。
+    #[default]
+    Standard,
+    /// ウィンドウ幅いっぱい。
+    Full,
+}
+
+impl PreviewWidth {
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Standard => "standard",
+            Self::Full => "full",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "standard" => Some(Self::Standard),
+            "full" => Some(Self::Full),
+            _ => None,
+        }
+    }
+}
+
+/// Markdown プレビューの設定（`settings.json` の `preview`）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreviewSettings {
+    /// 段落の中の改行をそのまま改行として表示する（行末の空白 2 つが要らない）。
+    pub line_breaks: bool,
+    /// 文字サイズ（pt）。
+    pub font_size: u32,
+    /// 本文の書体（空は既定）。
+    pub body_font: String,
+    /// コードの書体（空は既定）。
+    pub code_font: String,
+    /// 本文の幅。
+    pub width: PreviewWidth,
+    /// 更新までの待ち時間（ミリ秒）。
+    pub delay_ms: u32,
+    /// 見出しの目次を先頭に表示する。
+    pub toc: bool,
+    /// 編集位置に合わせてプレビューをスクロールする。
+    pub follow_cursor: bool,
+}
+
+impl Default for PreviewSettings {
+    fn default() -> Self {
+        PreviewSettings {
+            line_breaks: false,
+            font_size: PREVIEW_FONT_SIZE_DEFAULT,
+            body_font: String::new(),
+            code_font: String::new(),
+            width: PreviewWidth::Standard,
+            delay_ms: PREVIEW_DELAY_DEFAULT_MS,
+            toc: false,
+            follow_cursor: false,
+        }
+    }
+}
+
+impl PreviewSettings {
+    const KEYS: [&'static str; 8] = [
+        "line_breaks",
+        "font_size",
+        "body_font",
+        "code_font",
+        "width",
+        "delay_ms",
+        "toc",
+        "follow_cursor",
+    ];
+
+    fn from_value(map: &Map<String, Value>) -> Self {
+        let d = PreviewSettings::default();
+        let flag = |k: &str| map.get(k).and_then(Value::as_bool).unwrap_or(false);
+        let text = |k: &str| {
+            map.get(k)
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .trim()
+                .to_owned()
+        };
+        PreviewSettings {
+            line_breaks: flag("line_breaks"),
+            font_size: map
+                .get("font_size")
+                .and_then(Value::as_u64)
+                .map_or(d.font_size, |n| {
+                    n.clamp(
+                        u64::from(PREVIEW_FONT_SIZE_MIN),
+                        u64::from(PREVIEW_FONT_SIZE_MAX),
+                    ) as u32
+                }),
+            body_font: text("body_font"),
+            code_font: text("code_font"),
+            width: map
+                .get("width")
+                .and_then(Value::as_str)
+                .and_then(PreviewWidth::from_name)
+                .unwrap_or_default(),
+            delay_ms: map
+                .get("delay_ms")
+                .and_then(Value::as_u64)
+                .map_or(d.delay_ms, |n| n.clamp(50, 5000) as u32),
+            toc: flag("toc"),
+            follow_cursor: flag("follow_cursor"),
+        }
+    }
+
+    /// 知らない項目（新しい版が足したもの）は `base` から保つ。
+    fn to_value(&self, base: Option<&Value>) -> Value {
+        let mut map = base.and_then(Value::as_object).cloned().unwrap_or_default();
+        map.insert("line_breaks".into(), self.line_breaks.into());
+        map.insert("font_size".into(), self.font_size.into());
+        map.insert("body_font".into(), self.body_font.clone().into());
+        map.insert("code_font".into(), self.code_font.clone().into());
+        map.insert("width".into(), self.width.name().into());
+        map.insert("delay_ms".into(), self.delay_ms.into());
+        map.insert("toc".into(), self.toc.into());
+        map.insert("follow_cursor".into(), self.follow_cursor.into());
+        Value::Object(map)
+    }
+}
+
 /// ファイルの外部変更を見つけたときの動作。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum ExternalChangeMode {
@@ -767,6 +903,7 @@ pub struct SettingsChanges {
     pub search_history: bool,
     pub window: bool,
     pub memo_panel: bool,
+    pub preview: bool,
     pub mcp: bool,
     /// 知らない項目（`version` を含む）。
     pub other: bool,
@@ -796,6 +933,7 @@ impl SettingsChanges {
             (self.external_change, "外部変更時の動作"),
             (self.grep, "Grep の絞り込み"),
             (self.search_history, "検索履歴"),
+            (self.preview, "プレビュー"),
             (self.mcp, "MCP"),
         ]
         .into_iter()
@@ -836,6 +974,8 @@ pub struct Settings {
     pub memo_panel: MemoPanelSettings,
     /// 検索・置換・Grep の履歴。
     pub search_history: SearchHistory,
+    /// Markdown プレビューの設定。
+    pub preview: PreviewSettings,
     /// このプログラムが知らない項目。読み込んだまま書き戻す。
     extra: Map<String, Value>,
 }
@@ -859,6 +999,7 @@ impl Default for Settings {
             window: None,
             memo_panel: MemoPanelSettings::default(),
             search_history: SearchHistory::default(),
+            preview: PreviewSettings::default(),
             extra: Map::new(),
         }
     }
@@ -999,6 +1140,15 @@ impl Settings {
                 }
             }
         }
+        if let Some(Value::Object(mut pv)) = map.remove("preview") {
+            settings.preview = PreviewSettings::from_value(&pv);
+            for key in PreviewSettings::KEYS {
+                pv.remove(key);
+            }
+            if !pv.is_empty() {
+                settings.extra.insert("preview".into(), Value::Object(pv));
+            }
+        }
         if let Some(mcp) = map.remove("mcp") {
             let Value::Object(mut mcp) = mcp else {
                 return Err(corrupt("mcp がオブジェクトではありません"));
@@ -1067,6 +1217,8 @@ impl Settings {
         map.insert("memo_panel".into(), panel);
         let history = self.search_history.to_value(map.get("search_history"));
         map.insert("search_history".into(), history);
+        let preview = self.preview.to_value(map.get("preview"));
+        map.insert("preview".into(), preview);
         let mcp = map
             .entry("mcp")
             .or_insert_with(|| Value::Object(Map::new()));
@@ -1097,6 +1249,7 @@ impl Settings {
             search_history: self.search_history != other.search_history,
             window: self.window != other.window,
             memo_panel: self.memo_panel != other.memo_panel,
+            preview: self.preview != other.preview,
             mcp: self.mcp_enabled != other.mcp_enabled,
             other: self.extra != other.extra,
         }
@@ -1147,6 +1300,37 @@ impl Settings {
 mod tests {
     use super::*;
     use crate::command::CommandId;
+
+    #[test]
+    fn preview_settings_round_trip_and_keep_unknown_keys() {
+        let s = Settings::from_json(r#"{"preview":{"line_breaks":true,"future":1}}"#).unwrap();
+        assert!(s.preview.line_breaks);
+        let back: Value = serde_json::from_str(&s.to_json()).unwrap();
+        assert_eq!(back["preview"]["line_breaks"], Value::Bool(true));
+        assert_eq!(back["preview"]["future"], Value::from(1));
+        let mut t = s.clone();
+        t.preview.line_breaks = false;
+        let changes = s.diff(&t);
+        assert!(changes.preview && !changes.view);
+        assert!(!Settings::from_json("{}").unwrap().preview.line_breaks);
+    }
+
+    #[test]
+    fn preview_new_keys_round_trip_defaults_and_clamp() {
+        let d = Settings::from_json("{}").unwrap().preview;
+        assert_eq!(d, PreviewSettings::default());
+        assert_eq!((d.font_size, d.delay_ms), (11, 250));
+        assert_eq!(d.width, PreviewWidth::Standard);
+        let json = r#"{"preview":{"font_size":99,"body_font":"Yu Gothic","code_font":"Consolas","width":"full","delay_ms":500,"toc":true,"follow_cursor":true}}"#;
+        let s = Settings::from_json(json).unwrap();
+        assert_eq!(s.preview.font_size, PREVIEW_FONT_SIZE_MAX);
+        assert_eq!(s.preview.width, PreviewWidth::Full);
+        let back = Settings::from_json(&s.to_json()).unwrap();
+        assert_eq!(back.preview, s.preview);
+        let low = Settings::from_json(r#"{"preview":{"font_size":1,"width":"x"}}"#).unwrap();
+        assert_eq!(low.preview.font_size, PREVIEW_FONT_SIZE_MIN);
+        assert_eq!(low.preview.width, PreviewWidth::Standard);
+    }
 
     #[test]
     fn empty_object_gives_defaults() {

@@ -34,7 +34,7 @@ mod schedule;
 mod style;
 mod url;
 
-pub use render::{render_body, DEFAULT_MAX_INPUT_BYTES};
+pub use render::{render_body, render_body_with, RenderOptions, DEFAULT_MAX_INPUT_BYTES};
 pub use schedule::{spawn_render, PreviewScheduler, PreviewUpdate, RenderTicket};
 pub use style::{
     compose_document, PreviewPalette, PreviewStyle, Rgb, Stylesheet, CONTENT_SECURITY_POLICY,

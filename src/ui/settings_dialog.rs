@@ -786,40 +786,71 @@ fn apply(dlg: HWND, state: &mut State<'_>) -> bool {
     true
 }
 
-fn choose_font(dlg: HWND, state: &mut State<'_>) {
+/// 書体の項目（`view.font` と `preview.*_font`）を、選択ダイアログで変える。
+fn choose_font(dlg: HWND, state: &mut State<'_>, item: &Item) {
     use crate::ui::dialogs::{Prompts, Win32Prompts};
-    let v = &state.working.view;
-    let current = if v.font.is_empty() {
+    let ItemValue::Font(name, size) = item.get(&state.working) else {
+        return;
+    };
+    let current = if name.is_empty() {
         crate::ui::editor::default_font_name().to_owned()
     } else {
-        v.font.clone()
+        name
     };
-    // 数値欄で編集中のサイズも、まだ適用していなくても初期値として使う。
-    let points = item_control(dlg, "view.font_size")
+    // 数値欄で編集中のサイズも、まだ適用していなくても初期値として使う
+    // （本文の書体だけが、対応する数値欄を持つ。コードの書体は本文の大きさに合わせる）。
+    let size_id = match item.id {
+        "view.font" => Some("view.font_size"),
+        "preview.body_font" | "preview.code_font" => Some("preview.font_size"),
+        _ => None,
+    };
+    let points = size_id
+        .and_then(|id| item_control(dlg, id))
         .map(get_text)
         .and_then(|s| s.parse::<u32>().ok())
         .filter(|n| {
             (crate::appdata::settings::FONT_SIZE_MIN..=crate::appdata::settings::FONT_SIZE_MAX)
                 .contains(n)
         })
-        .unwrap_or(v.font_size);
+        .unwrap_or(size);
     if let Some((name, size)) = Win32Prompts.choose_font(dlg, &current, points) {
-        state.working.view.font = name;
-        state.working.view.font_size = size;
+        item.set(&mut state.working, &ItemValue::Font(name, size));
         refresh_font_controls(dlg, state);
     }
 }
 
+/// 既定に戻すボタン。
+fn reset_font(dlg: HWND, state: &mut State<'_>, item: &Item) {
+    let size = if item.id == "view.font" {
+        crate::appdata::settings::ViewSettings::default().font_size
+    } else {
+        crate::appdata::settings::PreviewSettings::default().font_size
+    };
+    item.set(&mut state.working, &ItemValue::Font(String::new(), size));
+    refresh_font_controls(dlg, state);
+}
+
 /// 選択・既定ボタンで変えたフォントだけを更新し、ほかの項目の編集中の値を保つ。
 fn refresh_font_controls(dlg: HWND, state: &State<'_>) {
-    if let Some(ctl) = item_control(dlg, "view.font") {
-        set_text(
-            ctl,
-            &font_label(&state.working.view.font, state.working.view.font_size),
-        );
+    for (_, item) in state.items.iter() {
+        if item.kind != ItemKind::Font {
+            continue;
+        }
+        if let (Some(ctl), ItemValue::Font(name, size)) =
+            (item_control(dlg, item.id), item.get(&state.working))
+        {
+            set_text(ctl, &font_label(&name, size));
+        }
     }
-    if let Some(ctl) = item_control(dlg, "view.font_size") {
-        set_text(ctl, &state.working.view.font_size.to_string());
+    for id in ["view.font_size", "preview.font_size"] {
+        let Some(ctl) = item_control(dlg, id) else {
+            continue;
+        };
+        if let Some((_, item)) = state.items.iter().find(|(_, i)| i.id == id) {
+            if let ItemValue::Number(n) = item.get(&state.working) {
+                set_text(ctl, &n.to_string());
+            }
+        }
     }
 }
 
@@ -1372,12 +1403,9 @@ unsafe extern "system" fn dialog_proc(
                         continue;
                     }
                     if id == control_id(index, SUB_FONT_CHOOSE) {
-                        choose_font(dlg, state);
+                        choose_font(dlg, state, item);
                     } else if id == control_id(index, SUB_FONT_DEFAULT) {
-                        let d = crate::appdata::settings::ViewSettings::default();
-                        state.working.view.font = d.font;
-                        state.working.view.font_size = d.font_size;
-                        refresh_font_controls(dlg, state);
+                        reset_font(dlg, state, item);
                     }
                 }
                 1

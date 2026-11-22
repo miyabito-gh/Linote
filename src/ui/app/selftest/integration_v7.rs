@@ -57,7 +57,7 @@ fn automatic_reload(ctx: &Ctx) -> Check {
         );
         check!(
             app.status_message()
-                .is_some_and(|s| s.contains("ディスクから読み直しました")),
+                .is_some_and(|s| s.contains("ファイルの変更を反映しました")),
             "読み直しの通知"
         );
         Ok(())
