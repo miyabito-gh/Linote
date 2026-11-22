@@ -11,3 +11,4 @@
   - 今回の変更に対する動作確認の完了状況は不明。
   - リポジトリ外のトップフォルダ `spec.md` と `docs/spec.md` のハッシュ不一致は未解決。トップフォルダ側は変更していない。
 - 2026-11-22 フォルダ統一: リポジトリを Linote\linote から Linote 直下へ引き上げ（linote.exe と test-data は Rust\_archive\Linote-stray-2026-11-22 へ退避、トップレベル spec.md は現状のまま残置）
+- 2026-11-22: 仕様書の正本を docs/spec.md に確定。プロジェクト直下に残っていた spec.md は docs/spec.md 初版（2026-11-14 コミット dae4d53）とバイト単位で一致する残骸だったため、Rust\_archive\Linote-stray-2026-11-22\ へ退避した。
