@@ -1,4 +1,11 @@
-﻿# STATUS
+# STATUS
+
+## main への取り込み（2026-11-22）
+
+- `fix/build-scintilla-cstdint` を `main` へ取り込んだ。マージコミットは `7d618767e5df9d42d9bf9a9a111a9e8cff5aa137`。基点の `wip/linote-recovery-preview` の保全内容も含む。
+- マージ後の `main` で、Windows ホストの `C:\msys64\mingw64\bin` を PATH に追加し、`WINDRES` 未指定で `cargo check` が成功した。
+
+## 保全時の記録
 
 - ブランチ: `wip/linote-recovery-preview`
 - 基点: `762dcbe`（main）
