@@ -30,12 +30,12 @@ use std::ffi::{c_char, CString};
 use std::sync::OnceLock;
 
 use windows::core::{w, PCWSTR};
-use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, WPARAM};
+use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    EnumFontFamiliesExW, GetDC, ReleaseDC, DEFAULT_CHARSET, LOGFONTW, TEXTMETRICW,
+    ClientToScreen, EnumFontFamiliesExW, GetDC, ReleaseDC, DEFAULT_CHARSET, LOGFONTW, TEXTMETRICW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DestroyWindow, SendMessageW, HMENU, WINDOW_EX_STYLE, WS_CHILD,
+    CreateWindowExW, DestroyWindow, GetClientRect, SendMessageW, HMENU, WINDOW_EX_STYLE, WS_CHILD,
     WS_CLIPSIBLINGS, WS_HSCROLL, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
 };
 
@@ -620,6 +620,29 @@ impl Editor {
 
     pub fn scroll_caret(&self) {
         self.send(SCI_SCROLLCARET, 0, 0);
+    }
+
+    /// キーボードで開くメニューの位置。キャレットの行の下を画面座標にする。
+    pub(crate) fn caret_menu_anchor(&self) -> Option<POINT> {
+        let caret = self.selection().caret;
+        let line = self.line_from_position(caret);
+        let x = self.send(SCI_POINTXFROMPOSITION, 0, caret as isize) as i32;
+        let y = self.send(SCI_POINTYFROMPOSITION, 0, caret as isize) as i32;
+        let line_height = self.send(SCI_TEXTHEIGHT, line as usize, 0) as i32;
+        let mut client = RECT::default();
+        // SAFETY: 自分の編集欄のサイズを調べ、点を画面座標へ変換する。
+        unsafe {
+            GetClientRect(self.hwnd, &mut client).ok()?;
+            if client.right <= client.left || client.bottom <= client.top {
+                return None;
+            }
+            let mut p = POINT {
+                x: x.clamp(client.left, client.right - 1),
+                y: y.saturating_add(line_height)
+                    .clamp(client.top, client.bottom - 1),
+            };
+            ClientToScreen(self.hwnd, &mut p).as_bool().then_some(p)
+        }
     }
 
     // ---------------------------------------------------------------- Undo・保存位置

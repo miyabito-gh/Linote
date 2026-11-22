@@ -57,13 +57,15 @@ edit_command!(
     EDIT_UPPERCASE,
     "edit.uppercase",
     "大文字にする",
-    "選択範囲を大文字にする。"
+    "選択範囲を大文字にする。",
+    "Ctrl+Shift+U"
 );
 edit_command!(
     EDIT_LOWERCASE,
     "edit.lowercase",
     "小文字にする",
-    "選択範囲を小文字にする。"
+    "選択範囲を小文字にする。",
+    "Ctrl+U"
 );
 edit_command!(
     EDIT_TRIM_TRAILING,
@@ -87,7 +89,8 @@ edit_command!(
     EDIT_INSERT_DATETIME,
     "edit.insert_datetime",
     "日時を挿入",
-    "現在のローカル日時（2026-11-14 09:05 の形式）をカーソル位置に挿入する（選択は置き換える）。"
+    "現在のローカル日時（2026-11-14 09:05 の形式）をカーソル位置に挿入する（選択は置き換える）。",
+    "F5"
 );
 
 edit_command!(
