@@ -1,5 +1,15 @@
 # STATUS
 
+## テスト失敗の調査（2026-11-25）
+
+- 実行方法（Windows ホスト）: `C:\msys64\mingw64\bin` を PATH に置き、`.cargo/config.toml` の `runner = "wine64"` を環境変数 `CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUNNER=C:/msys64/usr/bin/env.exe` で上書きして `cargo test --no-fail-fast`（`env.exe` は渡された EXE をそのまま起動するだけ）。
+- 「検索パネルのスクロールバー検証」（`tests/search_panel.rs` の `panel_greps_opens_hits_and_disables_replace`、旧 232 行目の `WS_VSCROLL` の検証）: 作業前の HEAD `04fe8bf` で再現（`left: 0, right: 0`）。
+  - 原因: テスト側のタイミング依存。検索・置換の用途では `set_status` は `WM_PANEL_FIT` を投函するだけで、状態欄の配置とスクロールバーの表示切り替え（`ShowScrollBar`）は投函の処理時に行われる。テストは直前の短い状態文（巨大モードの案内）の配置で `WS_VSCROLL` が外れた状態のまま、メッセージを処理せずにスタイルを読んでいた。実装は投函の処理後に正しくスクロールバーを出すので、実装の不具合ではない。
+  - 修正: `set_status` の後にメッセージを処理しながら `WS_VSCROLL` が付くのを待つ（`pump`、上限 10 秒）よう変更。実装（`src/ui/find.rs`）は無変更。
+- 「自動保存待ち」: 再現しなかった。GUI 自己テスト（`tests/ui_selftest.rs`、`selftest` の「メモの自動保存」の待ち合わせ）を単体で 3 回、全体の中で 4 回実行し、すべて成功。`tests/memo_store.rs`・`tests/recovery_process.rs` も全回成功。根拠がないため変更していない。
+  - 参考: 全コアに空ループの負荷をかけた状態で GUI 自己テストを 1 回実行すると、別の待ち合わせ「プレビューの初期化の結果」が 10 秒の上限でタイムアウトした（自動保存の待ちではない）。自己テストの待ち合わせ（`pump_until`、10 秒）は高負荷時に落ちうる。
+- 結果: 修正後、`cargo test --no-fail-fast` 全体を 3 回連続で実行し、すべて成功（15 のテスト対象すべて ok）。`tests/search_panel.rs` 単体も 3 回連続で成功。`cargo fmt --check`／`cargo clippy -D warnings` の既知失敗は対象外で未確認。
+
 ## main への取り込み（2026-11-22）
 
 - `fix/build-scintilla-cstdint` を `main` へ取り込んだ。マージコミットは `7d618767e5df9d42d9bf9a9a111a9e8cff5aa137`。基点の `wip/linote-recovery-preview` の保全内容も含む。
