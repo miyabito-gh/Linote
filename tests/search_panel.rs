@@ -218,6 +218,21 @@ fn panel_greps_opens_hits_and_disables_replace() {
     // A multi-line error must retain all text, with a scrollable viewport.
     let long_status = "長い検索エラーと対象ファイルの説明 ".repeat(40);
     panel.set_status(&long_status, true);
+    // 検索・置換の用途では、状態欄の配置（スクロールバーの表示切り替えを含む）は
+    // WM_PANEL_FIT の投函で後から行われる。それより前の短い状態文の配置で
+    // スクロールバーが隠れていることがあるので、投函を処理してから確かめる。
+    let status_has_vscroll = || unsafe {
+        let status = windows::Win32::UI::WindowsAndMessaging::GetDlgItem(Some(hwnd), 213).unwrap();
+        let style = windows::Win32::UI::WindowsAndMessaging::GetWindowLongPtrW(
+            status,
+            windows::Win32::UI::WindowsAndMessaging::GWL_STYLE,
+        ) as u32;
+        style & windows::Win32::UI::WindowsAndMessaging::WS_VSCROLL.0 != 0
+    };
+    assert!(
+        pump(status_has_vscroll),
+        "長い状態文ではスクロールバーが出る"
+    );
     unsafe {
         let status = windows::Win32::UI::WindowsAndMessaging::GetDlgItem(Some(hwnd), 213).unwrap();
         assert!(SendMessageW(status, 0x00BA /* EM_GETLINECOUNT */, None, None).0 > 1);
@@ -225,14 +240,6 @@ fn panel_greps_opens_hits_and_disables_replace() {
         let len = windows::Win32::UI::WindowsAndMessaging::GetWindowTextW(status, &mut text).max(0)
             as usize;
         assert_eq!(String::from_utf16_lossy(&text[..len]), long_status);
-        let style = windows::Win32::UI::WindowsAndMessaging::GetWindowLongPtrW(
-            status,
-            windows::Win32::UI::WindowsAndMessaging::GWL_STYLE,
-        ) as u32;
-        assert_ne!(
-            style & windows::Win32::UI::WindowsAndMessaging::WS_VSCROLL.0,
-            0
-        );
         SendMessageW(
             status,
             windows::Win32::UI::WindowsAndMessaging::WM_KEYDOWN,
